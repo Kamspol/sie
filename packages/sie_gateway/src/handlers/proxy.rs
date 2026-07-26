@@ -31,7 +31,7 @@ use crate::state::pool_manager::{normalize_pool_name, PoolManager, DEFAULT_POOL_
 use crate::state::worker_registry::{QueueRoute, WorkerRegistry};
 use crate::types::AuditEntry;
 
-use super::models::{extract_bearer_token, mask_token};
+use crate::middleware::auth::{extract_bearer_token, mask_token};
 
 const GATEWAY_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_PROXY_BODY: usize = 16 * 1024 * 1024;

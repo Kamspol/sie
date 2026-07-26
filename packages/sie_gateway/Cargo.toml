@@ -1,6 +1,6 @@
 [package]
 name = "sie-gateway"
-version = "0.6.23"
+version = "0.6.24"
 edition = "2021"
 publish = false
 
@@ -79,6 +79,8 @@ utoipa = "5.4.0"
 # versions, so bumping requires updating all five lines.
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+# Shared OTLP transport/proxy/resource/propagation plumbing (#2339).
+sie-telemetry = { path = "../sie_telemetry", features = ["http-propagation"] }
 # `grpc-tonic` keeps the historical in-cluster/Helm OTLP/gRPC path; `http-proto`
 # + `reqwest-blocking-client` add the OTLP/HTTP `http/protobuf` exporter the
 # MANAGED Modal collector needs (it publishes only OTLP/HTTP :4318, behind

@@ -13,7 +13,7 @@ from sie_server.api.helpers import (
     ResponseBuilder,
     oom_retry_after_from_registry,
 )
-from sie_server.api.options import resolve_runtime_options
+from sie_server.api.options import resolve_runtime_options_with_profile
 from sie_server.api.serialization import MsgPackResponse
 from sie_server.api.validation import validate_machine_profile_header
 from sie_server.config.model import ModelConfig
@@ -256,7 +256,7 @@ async def encode(
         # Resolve profile and merge runtime options
         request_options = params.options if params else None
         profile_name = request_options.get("profile") if request_options else None
-        options = resolve_runtime_options(config, request_options, span)
+        options, selected_profile = resolve_runtime_options_with_profile(config, request_options, span)
 
         # Extract is_query from options (moved from top-level param to options)
         is_query = bool(options.get("is_query", False))
@@ -324,7 +324,7 @@ async def encode(
             adapter_output_types, output_types = resolve_encode_output_types(
                 config,
                 params.output_types if params else None,
-                request_options,
+                selected_profile,
                 options,
             )
         except ValueError as e:

@@ -338,7 +338,15 @@ fn apply_gateway_openapi_overrides(value: &mut Value) {
         .as_object_mut()
         .expect("OpenAPI paths should be an object");
 
-    for path in ["/healthz", "/readyz", "/openapi.json", "/docs"] {
+    // Auth-exempt paths get an empty per-operation `security` array: the
+    // shared probe pair plus the spec-documented doc routes (the Redoc JS
+    // asset is exempt in `middleware::auth` too but has no spec entry).
+    let auth_exempt_doc_paths = ["/openapi.json", "/docs"];
+    for path in crate::middleware::auth::PROBE_PATHS
+        .iter()
+        .copied()
+        .chain(auth_exempt_doc_paths)
+    {
         if let Some(operation) = paths
             .get_mut(path)
             .and_then(|path_item| path_item.get_mut("get"))

@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.6.24
+
+- chore(main): release 0.6.24
+- test(config): document tokenizer dependency coverage
+- fix(models): declare tokenizer dependencies
+- fix(quality): stabilize scoped PR quality runs
+- perf(server): cache MUVERA projection state
+- feat(server): pinnable LoRA adapter revisions in lora_paths (#2113)
+- fix(quality): restore Mixedbread query expansion
+- fix(models): restore AnswerAI 512-token document length
+- fix(telemetry): enforce the parity guards in CI; sweep the sie_config redaction twin; char-safe mask_token (#2339)
+- chore(rust): scope the workspace to the public crates; managed gateway keeps its own lock (#2339)
+- chore(docker): build the audio-prep wheel stage at the workspace root (#2339)
+- refactor(telemetry): extract shared sie-telemetry crate; migrate gateway, sidecar, worker (#2339)
+- ci(workspace): repoint lock regeneration, caches, coverage, bake and release paths at the root lock/target (#2339)
+- chore(docker): build gateway + sidecar images at the workspace root (#2339)
+- chore(deny): one cargo-deny sweep over the workspace (#2339)
+- chore(rust): introduce a Cargo workspace over gateway, cloud gateway, sidecar, audio-prep (#2339)
+- refactor(sdk): shared redaction helpers; drop the api_key log-field footgun (#2339)
+- refactor(gateway): single-source bearer parsing, token masking, probe paths (#2339)
+- fix(quality): close post-review concurrency gaps
+- test(quality): lock governed MUVERA similarities
+- fix(adapter): prefer emitted NeMo token width
+- fix(quality): restore GTE MUVERA similarity
+- fix(quality): align NeMo ColEmbed token width
+- fix(quality): restore ColBERTv2 document window
+- fix(quality): restore governed ColBERT recipes
+- fix(quality): align ColBERT recipes with checkpoints
+- fix(server): harden ColBERT-family inference
+- fix(quality): use trained ColBERT markers
+- fix(server): enforce profile output capabilities
+- fix(quality): address review and adapter regressions
+- fix(quality): make nightly eval failures actionable
+- fix(vision): restore Marqo retrieval quality
+- fix(retrieval): restore faithful ColBERT recipes
+- fix(serving): enforce profile-aware encode outputs
+- fix(quality): close standing nightly model gaps
+
 ## v0.6.23
 
 - chore(main): release 0.6.23

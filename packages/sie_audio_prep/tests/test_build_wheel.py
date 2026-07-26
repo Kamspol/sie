@@ -34,10 +34,11 @@ def test_portable_worker_wheel_tag_is_validated(tmp_path: Path) -> None:
 
 
 def test_wheel_cache_digest_includes_build_toolchain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    crate = tmp_path / "sie_audio_prep"
+    crate = tmp_path / "packages" / "sie_audio_prep"
     (crate / "src").mkdir(parents=True)
     (crate / "Cargo.toml").write_text("[package]\nname = 'test'\n")
-    (crate / "Cargo.lock").write_text("version = 4\n")
+    # Workspace-root lock, one level above packages/<crate> (#2339).
+    (tmp_path / "Cargo.lock").write_text("version = 4\n")
     (crate / "pyproject.toml").write_text("[build-system]\n")
     (crate / "src" / "lib.rs").write_text("pub fn test() {}\n")
 
@@ -117,11 +118,21 @@ def test_optional_build_skips_when_toolchain_missing(
     monkeypatch.setattr(audio_prep_wheel.shutil, "which", lambda name: None)
     project_root = tmp_path / "project"
     (project_root / "packages" / "sie_audio_prep" / "src").mkdir(parents=True)
+    # Workspace-root lock (#2339): the digest fails loudly without it.
+    (project_root / "Cargo.lock").write_text("version = 4\n")
 
     assert audio_prep_wheel.build_audio_prep_wheel(project_root, required=False) is None
     assert "skipped: uvx and zig not on PATH" in capsys.readouterr().err
     with pytest.raises(RuntimeError, match="required to build portable"):
         audio_prep_wheel.build_audio_prep_wheel(project_root)
+
+
+def test_missing_workspace_lock_fails_loudly(tmp_path: Path) -> None:
+    crate = tmp_path / "packages" / "sie_audio_prep"
+    (crate / "src").mkdir(parents=True)
+    (crate / "Cargo.toml").write_text("[package]\nname = 'test'\n")
+    with pytest.raises(RuntimeError, match=r"workspace Cargo\.lock not found"):
+        audio_prep_wheel._source_digest(crate)
 
 
 def test_optional_build_skips_on_non_linux(

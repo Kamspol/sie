@@ -284,3 +284,7 @@ tmp/
 b6_results.json
 # Raw dev-cloud load-test reports are local artifacts, not source-controlled baselines.
 packages/sie_cloud/bench/results/dev-us-*/
+
+# Personal mise overrides (per-developer toolchain tweaks, e.g. rustup
+# component naming differences across rustup versions).
+mise.local.toml

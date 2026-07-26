@@ -17,7 +17,7 @@ from sie_server.core.encode_pipeline import EncodePipeline, resolve_encode_outpu
 from sie_server.core.oom import is_oom_error
 from sie_server.core.prepared import AudioPayload, AudioPreparedItem, ExtractPreparedItem
 from sie_server.core.registry import ModelRegistry
-from sie_server.core.runtime_options import merge_runtime_options
+from sie_server.core.runtime_options import merge_runtime_options, merge_runtime_options_with_profile
 from sie_server.core.score_cost import build_score_prepared_items_timed
 from sie_server.core.timing import RequestTiming
 from sie_server.core.worker.handlers.extract import ExtractHandler
@@ -888,7 +888,10 @@ class QueueExecutor:
         # actually reads; add more fields here if it grows.
         groups: dict[tuple, list[EncodeBatchItem]] = {}
         for bi in items:
-            output_types = tuple(bi.output_types or ["dense"])
+            # Preserve an explicit empty list so the shared output validator
+            # rejects it just like the HTTP ingress. Only an absent value
+            # receives the public dense default.
+            output_types = tuple(bi.output_types) if bi.output_types is not None else ("dense",)
             options_key = msgpack.packb(bi.options, use_bin_type=True) if bi.options else b""
             key = (
                 output_types,
@@ -957,11 +960,11 @@ class QueueExecutor:
                 # path (#1489). An unknown profile name raises ValueError, which
                 # the surrounding except turns into per-item failures.
                 request_options = options
-                options = merge_runtime_options(config, request_options)
+                options, selected_profile = merge_runtime_options_with_profile(config, request_options)
                 adapter_output_types, output_types = resolve_encode_output_types(
                     config,
                     output_types,
-                    request_options,
+                    selected_profile,
                     options,
                 )
                 formatted_outputs, timing = await EncodePipeline.run_encode(
