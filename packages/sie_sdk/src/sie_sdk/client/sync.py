@@ -2200,7 +2200,9 @@ class SIEClient:
                 timeout is NOT retried here: generation is non-idempotent
                 and a 504 is a post-publish timeout, so retrying could
                 double-bill an inference. A ``504`` is surfaced as a
-                terminal :class:`ServerError`.
+                terminal :class:`ServerError`. Pass ``False`` to surface
+                pre-execution provisioning and model-loading responses without
+                retrying them.
             provision_timeout_s: Maximum time to wait for capacity.
 
         Returns:
@@ -2318,7 +2320,7 @@ class SIEClient:
                     time.sleep(actual_delay)
                     continue
 
-                if error_code == MODEL_LOADING_ERROR_CODE:
+                if error_code == MODEL_LOADING_ERROR_CODE and wait_for_capacity:
                     elapsed = time.monotonic() - start_time
                     if elapsed >= timeout:
                         msg = f"Model loading timeout after {elapsed:.1f}s for '{model}'"
@@ -2350,7 +2352,8 @@ class SIEClient:
             # surface it as a terminal ServerError instead (same reasoning as
             # the mid-flight transport-error block above). The pre-execution
             # 503 MODEL_LOADING / PROVISIONING retries above remain because
-            # those fire *before* any generation can have started.
+            # those fire *before* any generation can have started and the
+            # caller has opted into capacity waiting.
             if response.status_code == HTTP_GATEWAY_TIMEOUT:
                 msg = (
                     "Gateway timed out (504) after the generate request was published to the "

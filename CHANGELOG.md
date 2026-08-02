@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.6.26
+
+- chore(release): refresh locks and generated sources
+- chore(main): release 0.6.26
+- fix(cloud): keep prod generation warm and scope spans
+- test(sdk): pin one-shot provisioning
+- fix(cloud): make generation smoke single shot
+- refactor(workspace): split public and private Python projects
+- fix(gateway): preserve grammar-safe FP8 profiles
+- feat(model-catalog): add H100 FP8 generation profiles
+- feat(quality-eval): governed first-baseline mode for official_recipe
+
 ## v0.6.25
 
 - chore(main): release 0.6.25

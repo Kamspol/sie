@@ -10,7 +10,7 @@ use rmp_serde;
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 use crate::endpoint::InferenceEndpoint;
 use crate::http_error::{
@@ -2037,7 +2037,7 @@ async fn resolve_routing(
 
 pub(crate) async fn proxy_request(
     State(state): State<Arc<AppState>>,
-    mut req: Request,
+    req: Request,
     endpoint: &str,
 ) -> Response {
     // SDK version skew detection
@@ -2065,8 +2065,6 @@ pub(crate) async fn proxy_request(
     } else {
         None
     };
-    let _proxy_span_guard = proxy_span.as_ref().map(|span| span.enter());
-
     // #1500: non-generation endpoints (encode / score / extract /
     // embeddings) do not open a billed gateway span, but the
     // queue-publish path still needs the inbound W3C context so
@@ -2076,15 +2074,40 @@ pub(crate) async fn proxy_request(
     // context here and scope it over the publish future via
     // `with_context` (Send- and thread-hop-safe, unlike attaching a
     // `!Send` `ContextGuard` across the handler's awaits). The generation
-    // branch already establishes the context via its proxy span.
-    // Borrow `proxy_span` (don't move it) — `_proxy_span_guard` holds a
-    // live borrow of it via `span.enter()` for the rest of the handler.
+    // branch establishes the context through the poll-scoped proxy span
+    // instrumentation below.
     let inbound_publish_cx = if proxy_span.is_some() {
         None
     } else {
         Some(managed_request_parent(&req))
     };
+    let proxy_span = proxy_span.unwrap_or_else(tracing::Span::none);
 
+    // `Span::enter()` guards must never live across `.await`: Tokio may resume
+    // the task on another worker, stranding tracing-opentelemetry's context
+    // guard in the first worker's TLS until thread teardown. Instrumenting the
+    // future enters and exits the span around each poll instead.
+    async move {
+        proxy_request_inner(
+            state,
+            req,
+            endpoint,
+            provisioning_surface,
+            inbound_publish_cx,
+        )
+        .await
+    }
+    .instrument(proxy_span)
+    .await
+}
+
+async fn proxy_request_inner(
+    state: Arc<AppState>,
+    mut req: Request,
+    endpoint: &str,
+    provisioning_surface: ProvisioningSurface,
+    inbound_publish_cx: Option<opentelemetry::Context>,
+) -> Response {
     // Native generation routing depends on request intent (default vs grammar),
     // including in the no-policy OSS composition where grammar selects a
     // profile-qualified model. Inspect the bounded body once before worker
@@ -2405,7 +2428,6 @@ pub(crate) async fn proxy_request(
     // `.await`s and tokio thread hops — and the future stays `Send`, unlike
     // holding a `!Send` `ContextGuard` across awaits.
     use opentelemetry::trace::FutureExt;
-    use tracing::Instrument;
     let cls = crate::endpoint::InferenceEndpoint::from_label(endpoint);
     match inbound_publish_cx {
         Some(inbound_cx)
@@ -6698,9 +6720,9 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
         .cloned();
 
     // M5: extract the inbound W3C trace context and open a
-    // gateway-side span as its child. The span stays active for the
-    // rest of the handler so `publish_generate_streaming` picks up
-    // *this* span's context when it calls
+    // gateway-side span as its child. Poll-scoped instrumentation keeps
+    // the span current while the handler runs so `publish_generate_streaming`
+    // picks up *this* span's context when it calls
     // `inject_current_context` to populate the work envelope.
     //
     // When no `traceparent` header is present the extracted context
@@ -6721,8 +6743,19 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
         use tracing_opentelemetry::OpenTelemetrySpanExt;
         let _ = chat_span.set_parent(parent_cx);
     }
-    let _chat_span_guard = chat_span.enter();
+    // Poll-scoped instrumentation is thread-hop-safe. A guard returned by
+    // `Span::enter()` must not cross the handler's awaits because Tokio may
+    // resume the future on a different worker thread.
+    async move { proxy_chat_inner(state, req, metric_labels_slot).await }
+        .instrument(chat_span)
+        .await
+}
 
+async fn proxy_chat_inner(
+    state: Arc<AppState>,
+    req: Request,
+    metric_labels_slot: Option<telemetry::MetricLabelsSlot>,
+) -> Response {
     let max_chat_body = compat_request_body_limit("/v1/chat/completions");
     let hdr = req.headers().clone();
     let (parts, body) = req.into_parts(); // keep extensions (caller identity) for the #1841 gate
@@ -13422,6 +13455,56 @@ mod tests {
             !should_trace_proxy_request("unknown"),
             "unknown endpoints must fail closed to the non-generation hot path"
         );
+    }
+
+    /// Handler spans must be entered around each future poll, never by a guard
+    /// whose lifetime crosses an await. A cross-await guard can be created on
+    /// one Tokio worker and dropped on another, leaving the OpenTelemetry
+    /// context guard in the first worker's TLS until thread teardown.
+    #[test]
+    fn async_proxy_spans_are_poll_scoped() {
+        let source = include_str!("proxy.rs");
+        let forbidden_enter = [".en", "ter()"].concat();
+
+        for (handler_start, handler_end, span_name, guard_parts) in [
+            (
+                "pub(crate) async fn proxy_request(",
+                "\nasync fn proxy_request_inner(",
+                "proxy_span",
+                ["_proxy_span_", "guard"],
+            ),
+            (
+                "pub async fn proxy_chat(",
+                "\nasync fn proxy_chat_inner(",
+                "chat_span",
+                ["_chat_span_", "guard"],
+            ),
+        ] {
+            let start = source
+                .find(handler_start)
+                .unwrap_or_else(|| panic!("handler start not found: {handler_start}"));
+            let end = source[start..]
+                .find(handler_end)
+                .map(|offset| start + offset)
+                .unwrap_or_else(|| panic!("handler end not found: {handler_end}"));
+            let handler = &source[start..end];
+            let compact = handler.split_whitespace().collect::<Vec<_>>().join(" ");
+            let expected_tail = format!("}} .instrument({span_name}) .await }}");
+            let forbidden_guard = guard_parts.concat();
+
+            assert!(
+                compact.ends_with(&expected_tail),
+                "{handler_start} must instrument the complete handler remainder with {span_name}"
+            );
+            assert!(
+                !handler.contains(&forbidden_enter),
+                "{handler_start} must not hold a span entry guard across awaits"
+            );
+            assert!(
+                !handler.contains(&forbidden_guard),
+                "{handler_start} retained the old cross-await span guard"
+            );
+        }
     }
 
     #[test]
@@ -22647,6 +22730,7 @@ mod tests {
             max_output_tokens: None,
             grammar_capabilities: None,
             grammar_profile: None,
+            profile_parents: std::collections::HashMap::new(),
             tools_supported: None,
             code: false,
             sql: false,
