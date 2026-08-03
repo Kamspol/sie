@@ -1,0 +1,17 @@
+{
+  "entities": [
+    {
+      "text": "7 months ago",
+      "label": "time period",
+      "score": 0.73681640625,
+      "start": 48,
+      "end": 60,
+      "bbox": null
+    }
+  ],
+  "relations": [],
+  "classifications": [],
+  "objects": [],
+  "id": "cms-l1851-entities_case_2",
+  "model": "urchade/gliner_multi-v2.1"
+}
