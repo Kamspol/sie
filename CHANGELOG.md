@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.6.27
+
+- chore(release): refresh locks and generated sources
+- chore(main): release 0.6.27
+- fix(server): constrain SGLang compatibility paths
+- fix(server): preserve LightOn SGLang compatibility
+- fix(server): keep Qwen3-VL reranker batches working on transformers 5.3
+- fix(generation): pair long-context qwen image bounds
+- fix(generation): preserve qwen vision bounds
+- fix(generation): validate high-context thinking profiles
+- test(generation): align grammar backend expectations
+- fix(generation): align direct backend output limits
+- fix(generation): use compatible Qwen 27B grammar backend
+- fix(generation): use compatible Qwen 35B grammar backend
+- feat(generation): add hardware-specific context profiles
+- fix(generation): preserve Gemma reasoning boundaries
+- fix(generation): fit Gemma 256k KV cache on H100
+- fix(sdk): retry pre-execution SSE capacity errors
+- fix(generation): reserve Gemma long-context workspace
+- feat(generation): add 256k profile candidates
+- feat(generation): add strict Responses API parity
+- fix(generation): hide split Gemma thinking boundary
+- fix(generation): reject overflowing runtime numerics
+- fix(generation): handle family-specific reasoning boundaries
+- fix(generation): unblock cold model startup
+- fix(server): align Gemma xgrammar dependency
+- feat(server): complete generative model serving
+- fix(server): enforce Qwen fast image bounds
+- test(server): align vision profile contracts
+- fix(server): bound Qwen visual context
+- fix(server): replace stale root playground with redirect to Swagger docs
+- fix(server): pin docling to its artifact revision and stop OCR gating load
+- fix(colbert): honor transformers-5 rope_parameters when serving on the 4.x bundle
+- fix(cloud): close connector review gaps
+- fix(cloud): close connector review findings
+- fix(clients): send connector repair idempotency header
+- fix(cloud): address connector runtime review findings
+- test(cloud): prove public postgres connector lifecycle
+- feat(clients): expose recovery-bound connector repair
+- feat(cloud): add direct connector inference
+- feat(gateway): expose immutable execution evidence
+- feat(clients): add connector plan controls
+- feat(cloud): add connector plan schema policy
+- feat(cloud): add connector plan guardrails
+- fix(models): complete mLateOn serving recipe
+- fix(server): preprocess native extract images
+- feat(models): onboard lightonai/mLateOn (scaffolded)
+- fix(sidecar): harden local generation cancellation
+- test(server): shorten local ingest socket paths
+- fix(sidecar): reserve cancel request bytes
+- feat(server): add bounded local-ingest generation client
+- fix(sidecar): harden local generation streaming
+- feat(sidecar): stream generation over local ingest
+- feat(models): onboard ibm-granite/granite-embedding-97m-multilingual-r2 (scaffolded)
+
 ## v0.6.26
 
 - chore(release): refresh locks and generated sources

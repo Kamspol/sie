@@ -94,10 +94,21 @@ _GENERATION_RUNTIME_KEYS = frozenset(
 _GENERATION_SAMPLING_KEYS = {
     "temperature": "temperature",
     "top_p": "top_p",
+    "frequency_penalty": "frequency_penalty",
     "presence_penalty": "presence_penalty",
     "top_k": "top_k",
     "min_new_tokens": "min_tokens",
+    "seed": "seed",
 }
+
+
+def _is_finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
 
 
 def apply_generation_runtime_options(
@@ -165,18 +176,20 @@ def apply_generation_runtime_options(
         if unknown_sampling:
             raise ValueError(f"unsupported generation sampling option(s): {sorted(unknown_sampling)}")
         for key, value in sampling.items():
-            numeric = isinstance(value, int | float) and not isinstance(value, bool)
-            valid = numeric and math.isfinite(float(value))
+            if key == "seed":
+                valid = isinstance(value, int) and not isinstance(value, bool) and -(1 << 63) <= value <= (1 << 63) - 1
+            else:
+                valid = _is_finite_number(value)
             if key == "temperature":
                 valid = valid and value >= 0
             elif key == "top_p":
                 valid = valid and 0 < value <= 1
-            elif key == "presence_penalty":
+            elif key in {"frequency_penalty", "presence_penalty"}:
                 valid = valid and -2 <= value <= 2
             elif key == "top_k":
-                valid = isinstance(value, int) and not isinstance(value, bool) and value >= 1
+                valid = valid and isinstance(value, int) and not isinstance(value, bool) and value >= 1
             elif key == "min_new_tokens":
-                valid = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                valid = valid and isinstance(value, int) and not isinstance(value, bool) and value >= 0
             if not valid:
                 raise ValueError(f"'options.default_sampling.{key}' has an invalid value")
 
@@ -204,12 +217,7 @@ def apply_generation_runtime_options(
 
     for key in ("first_chunk_timeout_s", "inter_chunk_timeout_s", "overall_timeout_s"):
         value = runtime.get(key)
-        if value is not None and (
-            isinstance(value, bool)
-            or not isinstance(value, int | float)
-            or not math.isfinite(float(value))
-            or value <= 0
-        ):
+        if value is not None and (not _is_finite_number(value) or value <= 0):
             raise ValueError(f"'options.{key}' must be a positive number")
 
     return result

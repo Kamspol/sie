@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from typing import Any, Self
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sie_sdk import SIEAsyncClient
@@ -253,6 +253,46 @@ async def test_async_stream_chat_retries_503_provisioning_then_streams() -> None
     ]
     assert [c["choices"][0]["delta"].get("content") for c in out] == ["ok"]
     assert session.post.call_count == 2
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_async_stream_chat_retries_first_sse_model_loading_then_streams() -> None:
+    loading = {
+        "error": {"code": "MODEL_LOADING", "message": "loading"},
+    }
+    s200_loading = _FakeRaw(status=200, line_bytes=_sse_bytes(loading))
+    s200_ok = _FakeRaw(status=200, line_bytes=_sse_bytes(_chat_chunk("ok", finish="stop")))
+    client = SIEAsyncClient("http://localhost:8080")
+    session = _patch_session(client, post_side_effect=[s200_loading, s200_ok])
+
+    with patch("sie_sdk.client.async_.asyncio.sleep"):
+        out = [
+            c
+            async for c in client.stream_chat_completions(
+                "m", [{"role": "user", "content": "hi"}], provision_timeout_s=5.0
+            )
+        ]
+
+    assert [c["choices"][0]["delta"].get("content") for c in out] == ["ok"]
+    assert session.post.call_count == 2
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_async_stream_chat_does_not_retry_sse_model_loading_after_output() -> None:
+    loading = {"error": {"code": "MODEL_LOADING", "message": "loading"}}
+    partial_then_loading = _FakeRaw(
+        status=200,
+        line_bytes=_sse_bytes(_chat_chunk("partial"), loading),
+    )
+    client = SIEAsyncClient("http://localhost:8080")
+    session = _patch_session(client, post_returns=partial_then_loading)
+
+    with pytest.raises(ServerError, match="loading"):
+        _ = [c async for c in client.stream_chat_completions("m", [{"role": "user", "content": "hi"}])]
+
+    assert session.post.call_count == 1
     await client.close()
 
 

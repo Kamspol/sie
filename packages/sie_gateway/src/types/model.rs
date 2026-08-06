@@ -19,6 +19,11 @@ pub struct ModelInfoExtras {
     /// when the model has no ``generate`` task or the field was not
     /// set.
     pub max_output_tokens: Option<u32>,
+    /// Per-profile overrides of ``tasks.generate.max_output_tokens``.
+    /// Values are inheritance-resolved from ``profiles.<name>`` so request
+    /// admission can use the concrete route's cap without widening the bare
+    /// model or sibling variants.
+    pub profile_max_output_tokens: HashMap<String, u32>,
     /// ``tasks.generate.capabilities.grammar`` from the
     /// model YAML — the list of grammar ``kind`` strings the model
     /// supports (e.g. ``["json_schema", "regex"]``). Gateway rejects
@@ -240,6 +245,37 @@ impl ModelInfoExtras {
                     .profile_parents
                     .insert(profile_name.to_string(), parent_name.to_string());
             }
+
+            fn resolve_profile_output_cap(
+                profiles: &serde_yaml::Mapping,
+                profile_name: &str,
+                seen: &mut HashSet<String>,
+            ) -> Option<u32> {
+                if !seen.insert(profile_name.to_string()) {
+                    return None;
+                }
+                let profile = profiles.get(profile_name)?.as_mapping()?;
+                if let Some(cap) = profile
+                    .get("max_output_tokens")
+                    .and_then(serde_yaml::Value::as_u64)
+                    .filter(|value| *value > 0)
+                    .and_then(|value| u32::try_from(value).ok())
+                {
+                    return Some(cap);
+                }
+                let parent = profile.get("extends").and_then(serde_yaml::Value::as_str)?;
+                resolve_profile_output_cap(profiles, parent, seen)
+            }
+
+            for profile_name in profiles.keys().filter_map(serde_yaml::Value::as_str) {
+                if let Some(cap) =
+                    resolve_profile_output_cap(profiles, profile_name, &mut HashSet::new())
+                {
+                    extras
+                        .profile_max_output_tokens
+                        .insert(profile_name.to_string(), cap);
+                }
+            }
         }
 
         // Multi-LoRA: collect the served-names declared per profile and
@@ -306,6 +342,7 @@ impl ModelInfoExtras {
                 max_sequence_length: config.max_sequence_length,
                 revision: None,
                 max_output_tokens: None,
+                profile_max_output_tokens: HashMap::new(),
                 grammar_capabilities: None,
                 grammar_profile: None,
                 profile_parents: HashMap::new(),
@@ -363,6 +400,8 @@ pub struct ProfileConfig {
     #[serde(default)]
     pub compute_precision: Option<String>,
     #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
     pub adapter_options: Option<serde_json::Value>,
     #[serde(default)]
     pub extends: Option<String>,
@@ -371,6 +410,13 @@ pub struct ProfileConfig {
 #[derive(Debug, Clone)]
 pub struct ModelEntry {
     pub name: String,
+    /// Canonical catalog model id shared by the bare route and every explicit
+    /// profile variant. This remains available for profile-only catalogs where
+    /// the bare route is intentionally absent from the registry snapshot.
+    pub canonical_base_model: String,
+    /// Canonical catalog profile represented by this route (`default` for the
+    /// bare model, otherwise the explicit `base-model:profile` suffix).
+    pub canonical_profile: String,
     pub pool: Option<String>,
     pub bundles: Vec<String>,
     pub adapter_modules: HashSet<String>,
@@ -380,6 +426,17 @@ pub struct ModelEntry {
 }
 
 impl ModelEntry {
+    /// Effective output-token cap for this concrete route. A profile override
+    /// takes precedence only for that route; otherwise the model-level cap is
+    /// retained as the worker-authoritative fallback.
+    pub fn effective_max_output_tokens(&self) -> Option<u32> {
+        self.info_extras
+            .profile_max_output_tokens
+            .get(&self.canonical_profile)
+            .copied()
+            .or(self.info_extras.max_output_tokens)
+    }
+
     /// JSON shaped like ``sie_server.api.models.ModelInfo`` for HTTP clients.
     pub fn to_model_info_value(&self, loaded: bool) -> Value {
         let state = if loaded { "loaded" } else { "available" };
@@ -519,6 +576,7 @@ mod tests {
     #[test]
     fn test_canonical_profile_basic() {
         let profile = ProfileConfig {
+            max_output_tokens: None,
             adapter_path: Some("module:Adapter".into()),
             max_batch_tokens: Some(4096),
             compute_precision: Some("float16".into()),
@@ -535,6 +593,7 @@ mod tests {
     #[test]
     fn test_canonical_profile_strips_null_only_options() {
         let profile = ProfileConfig {
+            max_output_tokens: None,
             adapter_path: Some("mod:A".into()),
             max_batch_tokens: None,
             compute_precision: None,
@@ -548,6 +607,7 @@ mod tests {
     #[test]
     fn test_canonical_profile_strips_false_only_options() {
         let profile = ProfileConfig {
+            max_output_tokens: None,
             adapter_path: Some("mod:A".into()),
             max_batch_tokens: None,
             compute_precision: None,
@@ -562,6 +622,7 @@ mod tests {
     fn test_canonical_profile_keeps_meaningful_options() {
         let opts = serde_json::json!({"batch_size": 32, "key": null});
         let profile = ProfileConfig {
+            max_output_tokens: None,
             adapter_path: Some("mod:A".into()),
             max_batch_tokens: None,
             compute_precision: None,
@@ -575,6 +636,7 @@ mod tests {
     #[test]
     fn test_canonical_profile_drops_empty_nested_option_maps() {
         let profile = ProfileConfig {
+            max_output_tokens: None,
             adapter_path: Some("mod:A".into()),
             max_batch_tokens: None,
             compute_precision: None,
@@ -610,6 +672,7 @@ mod tests {
 
         let canonicalize = |opts: &serde_json::Value| {
             CanonicalProfile::from_profile(&ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("mod:A".into()),
                 max_batch_tokens: None,
                 compute_precision: None,
@@ -668,6 +731,7 @@ mod tests {
     #[test]
     fn test_canonical_profile_keeps_nonzero_numbers() {
         let profile = ProfileConfig {
+            max_output_tokens: None,
             adapter_path: Some("mod:A".into()),
             max_batch_tokens: None,
             compute_precision: None,
@@ -681,6 +745,7 @@ mod tests {
     #[test]
     fn test_canonical_profile_equality() {
         let p1 = ProfileConfig {
+            max_output_tokens: None,
             adapter_path: Some("mod:A".into()),
             max_batch_tokens: Some(4096),
             compute_precision: None,
@@ -712,6 +777,65 @@ pool: customer-a
             config.profiles["default"].adapter_path,
             Some("module:Adapter".into())
         );
+    }
+
+    #[test]
+    fn test_profile_output_caps_are_inheritance_resolved_and_route_scoped() {
+        let raw: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+sie_id: acme/generator
+tasks:
+  generate:
+    context_length: 262144
+    max_output_tokens: 4096
+profiles:
+  default:
+    adapter_path: module:Adapter
+  long:
+    extends: default
+    max_output_tokens: 32768
+  thinking:
+    extends: long
+  sibling:
+    extends: default
+"#,
+        )
+        .unwrap();
+
+        let extras = ModelInfoExtras::from_yaml_raw(&raw);
+        assert_eq!(extras.max_output_tokens, Some(4096));
+        assert_eq!(extras.profile_max_output_tokens.get("long"), Some(&32768));
+        assert_eq!(
+            extras.profile_max_output_tokens.get("thinking"),
+            Some(&32768)
+        );
+        assert!(!extras.profile_max_output_tokens.contains_key("default"));
+        assert!(!extras.profile_max_output_tokens.contains_key("sibling"));
+    }
+
+    #[test]
+    fn test_model_entry_effective_output_cap_does_not_widen_siblings() {
+        let mut profile_caps = HashMap::new();
+        profile_caps.insert("thinking".to_string(), 81920);
+        let entry = |profile: &str| ModelEntry {
+            name: format!("acme/generator:{profile}"),
+            canonical_base_model: "acme/generator".to_string(),
+            canonical_profile: profile.to_string(),
+            pool: None,
+            bundles: Vec::new(),
+            adapter_modules: HashSet::new(),
+            profile_names: HashSet::new(),
+            profile_configs: HashMap::new(),
+            info_extras: ModelInfoExtras {
+                max_output_tokens: Some(4096),
+                profile_max_output_tokens: profile_caps.clone(),
+                ..ModelInfoExtras::default()
+            },
+        };
+
+        assert_eq!(entry("thinking").effective_max_output_tokens(), Some(81920));
+        assert_eq!(entry("sibling").effective_max_output_tokens(), Some(4096));
+        assert_eq!(entry("default").effective_max_output_tokens(), Some(4096));
     }
 
     #[test]
@@ -1039,6 +1163,8 @@ tasks:
         let info_extras = ModelInfoExtras::from_yaml_raw(&raw);
         let entry = ModelEntry {
             name: "Qwen/Qwen3-4B-Instruct-2507".to_string(),
+            canonical_base_model: "Qwen/Qwen3-4B-Instruct-2507".to_string(),
+            canonical_profile: "default".to_string(),
             pool: None,
             bundles: Vec::new(),
             adapter_modules: HashSet::new(),
@@ -1156,6 +1282,8 @@ profiles:
         let info_extras = ModelInfoExtras::from_yaml_raw(&raw);
         let entry = ModelEntry {
             name: "acme/multi-profile-lora".to_string(),
+            canonical_base_model: "acme/multi-profile-lora".to_string(),
+            canonical_profile: "default".to_string(),
             pool: None,
             bundles: Vec::new(),
             adapter_modules: HashSet::new(),
@@ -1210,6 +1338,8 @@ profiles:
         let info_extras = ModelInfoExtras::from_yaml_raw(&raw);
         let entry = ModelEntry {
             name: "acme/multi-profile-lora".to_string(),
+            canonical_base_model: "acme/multi-profile-lora".to_string(),
+            canonical_profile: "default".to_string(),
             pool: None,
             bundles: Vec::new(),
             adapter_modules: HashSet::new(),

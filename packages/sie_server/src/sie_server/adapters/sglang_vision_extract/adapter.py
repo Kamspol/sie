@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -78,11 +77,6 @@ class SGLangVisionExtractAdapter(SGLangGenerationAdapter):
         startup_timeout_s: float | None = None,
         **kwargs: Any,
     ) -> None:
-        compat_dir = Path(__file__).with_name("_compat")
-        child_env = dict(extra_env or {})
-        inherited_pythonpath = child_env.get("PYTHONPATH", os.environ.get("PYTHONPATH", ""))
-        child_env["PYTHONPATH"] = os.pathsep.join(path for path in (str(compat_dir), inherited_pythonpath) if path)
-
         super().__init__(
             model_name_or_path=str(model_name_or_path),
             max_seq_length=max_seq_length,
@@ -95,7 +89,7 @@ class SGLangVisionExtractAdapter(SGLangGenerationAdapter):
             attention_backend=attention_backend,
             grammar_backend=None,
             extra_launch_args=extra_launch_args,
-            extra_env=child_env,
+            extra_env=extra_env,
             startup_timeout_s=startup_timeout_s,
             **kwargs,
         )
@@ -113,6 +107,10 @@ class SGLangVisionExtractAdapter(SGLangGenerationAdapter):
         self._processor: Any = None
         self._request_loop: asyncio.AbstractEventLoop | None = None
         self._request_loop_thread: threading.Thread | None = None
+
+    def _compat_pythonpath_entries(self) -> tuple[str, ...]:
+        """Prepend the code-owned LightOn hook to the generic SGLang path."""
+        return (str(Path(__file__).with_name("_compat")), *super()._compat_pythonpath_entries())
 
     @classmethod
     def create_for_device(cls, device: str, **kwargs: Any) -> SGLangVisionExtractAdapter:

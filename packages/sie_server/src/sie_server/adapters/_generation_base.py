@@ -17,8 +17,8 @@ from __future__ import annotations
 import gc
 import logging
 from abc import abstractmethod
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Mapping
+from dataclasses import dataclass, replace
 from typing import Any, ClassVar, Literal, cast
 
 from sie_server.adapters._spec import AdapterSpec
@@ -27,6 +27,17 @@ from sie_server.types.grammar import GrammarSpec
 from sie_server.types.inputs import ImageInput
 
 logger = logging.getLogger(__name__)
+
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+_GEMMA_CHANNEL_OPEN = "<" + "|channel" + ">"
+_GEMMA_CHANNEL_CLOSE = "<" + "channel|" + ">"
+
+ReasoningFormat = Literal["qwen3", "gemma4"]
+_REASONING_BOUNDARIES: dict[ReasoningFormat, tuple[str, str]] = {
+    "qwen3": (_THINK_OPEN, _THINK_CLOSE),
+    "gemma4": (_GEMMA_CHANNEL_OPEN + "thought\n", _GEMMA_CHANNEL_CLOSE),
+}
 
 
 # Finish reason values surfaced to gateway / client. ``cancelled`` lands when
@@ -145,6 +156,242 @@ class GenerationResult:
     finish_reason: Literal["stop", "length", "error", "cancelled"]
     prompt_tokens: int
     completion_tokens: int
+
+
+class ThinkingBlockStripper:
+    """Incrementally remove family-specific model reasoning blocks from text.
+
+    SGLang's native ``/generate`` endpoint returns raw decoded text, so its
+    launch-time ``--reasoning-parser`` does not protect SIE's generation
+    stream. Delimiters may be split across arbitrary engine chunks; retain
+    only the longest possible delimiter prefix between calls so neither a
+    partial tag nor its body can escape before the closing tag arrives.
+    """
+
+    __slots__ = ("_buffer", "_close", "_inside", "_open")
+
+    def __init__(self, inside: bool = False, *, reasoning_format: ReasoningFormat = "qwen3") -> None:
+        self._buffer = ""
+        self._inside = inside
+        self._open, self._close = _REASONING_BOUNDARIES[reasoning_format]
+
+    @staticmethod
+    def _delimiter_prefix_length(text: str, delimiters: tuple[str, ...]) -> int:
+        max_len = min(max(map(len, delimiters)) - 1, len(text))
+        for length in range(max_len, 0, -1):
+            suffix = text[-length:]
+            if any(delimiter.startswith(suffix) for delimiter in delimiters):
+                return length
+        return 0
+
+    def feed(self, text: str) -> str:
+        self._buffer += text
+        visible: list[str] = []
+
+        while self._buffer:
+            if self._inside:
+                close_at = self._buffer.find(self._close)
+                if close_at >= 0:
+                    self._buffer = self._buffer[close_at + len(self._close) :]
+                    self._inside = False
+                    continue
+
+                keep = self._delimiter_prefix_length(self._buffer, (self._close,))
+                self._buffer = self._buffer[-keep:] if keep else ""
+                break
+
+            open_at = self._buffer.find(self._open)
+            close_at = self._buffer.find(self._close)
+            matches = [
+                (index, delimiter)
+                for index, delimiter in ((open_at, self._open), (close_at, self._close))
+                if index >= 0
+            ]
+            if matches:
+                marker_at, marker = min(matches, key=lambda match: match[0])
+                visible.append(self._buffer[:marker_at])
+                self._buffer = self._buffer[marker_at + len(marker) :]
+                if marker == self._open:
+                    self._inside = True
+                # A stray closing marker is still hidden, but does not cause
+                # surrounding ordinary answer text to be discarded.
+                continue
+
+            keep = self._delimiter_prefix_length(self._buffer, (self._open, self._close))
+            emit_upto = len(self._buffer) - keep
+            visible.append(self._buffer[:emit_upto])
+            self._buffer = self._buffer[emit_upto:]
+            break
+
+        return "".join(visible)
+
+    @property
+    def inside(self) -> bool:
+        return self._inside
+
+    def finish(self) -> str:
+        """Flush ordinary buffered text, but never truncated private reasoning."""
+        visible = "" if self._inside else self._buffer
+        self._buffer = ""
+        self._inside = False
+        return visible
+
+
+def _strip_complete_thinking_blocks(
+    text: str,
+    *,
+    start_inside: bool = False,
+    reasoning_format: ReasoningFormat = "qwen3",
+) -> str:
+    stripper = ThinkingBlockStripper(inside=start_inside, reasoning_format=reasoning_format)
+    return stripper.feed(text) + stripper.finish()
+
+
+async def suppress_thinking_blocks(
+    chunks: AsyncIterator[GenerationChunk],
+    *,
+    start_inside: bool = False,
+    reasoning_format: ReasoningFormat = "qwen3",
+) -> AsyncIterator[GenerationChunk]:
+    """Hide model reasoning blocks while preserving generation metadata.
+
+    Callers decide whether the resolved model declares the hidden-thinking
+    contract. Both non-thinking and explicit thinking profiles use this wrapper:
+    the profile controls tokenizer/model behavior, never public visibility of
+    the private reasoning channel. Per-choice state keeps interleaved ``n > 1``
+    streams independent, and terminal ``candidates`` are normalized through the
+    same rule. When text is rewritten its token logprobs are omitted because the
+    engine's token list can no longer be faithfully aligned with the visible
+    delta. ``start_inside`` covers chat templates that place the opening
+    reasoning marker in the prompt, so generated text begins with private
+    reasoning and only emits the closing marker. ``reasoning_format`` selects
+    the boundary pair declared by the model's generation backend.
+
+    Closing the wrapper eagerly closes the upstream adapter iterator so client
+    cancellation still reaches SGLang's ``/abort_request`` cleanup.
+    """
+    states: dict[int, ThinkingBlockStripper] = {}
+    emitted_visible_text = False
+    try:
+        async for chunk in chunks:
+            rewritten_candidates = chunk.candidates
+            if chunk.candidates is not None:
+                candidate_items: list[dict[str, Any]] = []
+                for candidate in chunk.candidates:
+                    item = dict(candidate)
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        visible = _strip_complete_thinking_blocks(
+                            text,
+                            start_inside=start_inside,
+                            reasoning_format=reasoning_format,
+                        )
+                        if visible != text:
+                            item["text"] = visible
+                            item["logprobs"] = None
+                    candidate_items.append(item)
+                rewritten_candidates = tuple(candidate_items)
+
+            state = states.setdefault(
+                chunk.choice_index,
+                ThinkingBlockStripper(inside=start_inside, reasoning_format=reasoning_format),
+            )
+            was_inside = state.inside
+            visible_delta = state.feed(chunk.text_delta)
+            text_changed = visible_delta != chunk.text_delta
+            if chunk.done or chunk.finish_reason is not None:
+                visible_delta += state.finish()
+
+            is_first = bool(visible_delta) and not emitted_visible_text
+            emitted_visible_text = emitted_visible_text or bool(visible_delta)
+            rewritten = replace(
+                chunk,
+                text_delta=visible_delta,
+                is_first=is_first,
+                logprobs=None if text_changed or was_inside else chunk.logprobs,
+                candidates=rewritten_candidates,
+            )
+
+            # Reasoning-only engine deltas have no wire-visible information.
+            # Keep terminals, per-choice finish markers, tool/error chunks, and
+            # non-streaming candidate aggregates intact.
+            if (
+                not rewritten.text_delta
+                and not rewritten.done
+                and rewritten.finish_reason is None
+                and rewritten.tool_call_delta is None
+                and rewritten.error_code is None
+                and rewritten.error_message is None
+                and rewritten.logprobs is None
+                and rewritten.candidates is None
+            ):
+                continue
+
+            yield rewritten
+    finally:
+        aclose = getattr(chunks, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+def thinking_blocks_must_be_hidden(config: Any) -> bool:
+    """Return whether the resolved config declares hidden thinking semantics.
+
+    An explicit boolean is materialized for every reasoning-capable Qwen and
+    Gemma 4 variant. ``False`` keeps model reasoning disabled; ``True`` enables
+    it internally. In both cases raw ``<think>`` blocks are never public output.
+    """
+    tasks = getattr(config, "tasks", None)
+    generate = getattr(tasks, "generate", None)
+    kwargs = getattr(generate, "chat_template_kwargs", None)
+    return isinstance(kwargs, dict) and isinstance(kwargs.get("enable_thinking"), bool)
+
+
+def _reasoning_format(value: object) -> ReasoningFormat | None:
+    if value == "gemma4":
+        return "gemma4"
+    if value == "qwen3":
+        return "qwen3"
+    return None
+
+
+def resolve_reasoning_format(config: Any, adapter: Any | None = None) -> ReasoningFormat:
+    """Resolve the model's reasoning boundaries, preferring the loaded adapter."""
+    adapter_format = _reasoning_format(getattr(adapter, "reasoning_parser", None))
+    if adapter_format is not None:
+        return adapter_format
+
+    resolver = getattr(config, "resolve_profile", None)
+    if callable(resolver):
+        try:
+            loadtime = getattr(resolver("default"), "loadtime", None)
+        except (KeyError, ValueError):
+            loadtime = None
+        if isinstance(loadtime, Mapping):
+            configured_format = _reasoning_format(loadtime.get("reasoning_parser"))
+            if configured_format is not None:
+                return configured_format
+    return "qwen3"
+
+
+def reasoning_starts_in_prompt(prompt: str, reasoning_format: ReasoningFormat) -> bool:
+    """Return whether the rendered prompt ends inside a reasoning boundary."""
+    opening, closing = _REASONING_BOUNDARIES[reasoning_format]
+    opening_at = prompt.rfind(opening)
+    if reasoning_format == "gemma4" and prompt.endswith(_GEMMA_CHANNEL_OPEN):
+        # Gemma's template can seed only the channel control token in the
+        # prompt; the model then generates the ``thought\n`` self-label. Treat
+        # that split boundary as open so the reasoning body stays private.
+        opening_at = len(prompt) - len(_GEMMA_CHANNEL_OPEN)
+    return opening_at > prompt.rfind(closing)
+
+
+def thinking_mode_is_enabled(config: Any) -> bool:
+    """Return whether the resolved tokenizer profile enables private reasoning."""
+    tasks = getattr(config, "tasks", None)
+    generate = getattr(tasks, "generate", None)
+    kwargs = getattr(generate, "chat_template_kwargs", None)
+    return isinstance(kwargs, dict) and kwargs.get("enable_thinking") is True
 
 
 async def collect_generation(

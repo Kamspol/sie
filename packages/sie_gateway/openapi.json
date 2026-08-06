@@ -319,7 +319,15 @@
             ]
           },
           "chat_template_kwargs": {
-            "description": "Per-request overrides for kwargs passed to the tokenizer's\n``apply_chat_template`` call. Object whose entries are merged on\ntop of the model YAML's ``chat_template_kwargs`` (the YAML wins\nfor keys present in both — adjust the YAML when a request needs\nto defeat a baked-in default). Typical use: pass\n``{\"enable_thinking\": false}`` to the Qwen3 family to suppress\n``<think>`` reasoning on a per-request basis. Absent → only the\nmodel YAML's defaults apply."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatTemplateKwargs",
+                "description": "Per-request overrides from the bounded tokenizer-template contract.\nOnly ``enable_thinking`` and ``guardian_config.risk_name`` are\naccepted; unknown keys reject with 400 instead of reaching\n``apply_chat_template``. Values are merged under the model YAML's\noperator-owned defaults, which win on conflict."
+              }
+            ]
           },
           "frequency_penalty": {
             "description": "OpenAI ``frequency_penalty`` in ``[-2.0, 2.0]``; out-of-range or\nnon-numeric values yield 400 ``invalid_request``.",
@@ -708,6 +716,31 @@
         ],
         "type": "object"
       },
+      "ChatTemplateKwargs": {
+        "additionalProperties": false,
+        "description": "Bounded tokenizer-template options accepted from a chat request.\n\nUnknown keys are rejected at the gateway instead of being forwarded to a\ntokenizer implementation as arbitrary keyword arguments.",
+        "properties": {
+          "enable_thinking": {
+            "description": "Qwen-family switch controlling whether the template opens a thinking block.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "guardian_config": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GuardianChatTemplateConfig",
+                "description": "Granite Guardian risk selection."
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ClusterSummary": {
         "properties": {
           "gpu_count": {
@@ -747,9 +780,9 @@
             ]
           },
           "max_tokens": {
-            "description": "Positive integer; defaults to 16 (OpenAI's documented default for\ncompletions) when absent.",
-            "format": "int32",
-            "minimum": 0,
+            "description": "Maximum number of generated tokens. Defaults to 16 when absent or null.",
+            "maximum": 4294967295,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
@@ -812,8 +845,10 @@
             ]
           },
           "temperature": {
-            "description": "Sampling temperature. Finite number ``>= 0``.",
+            "description": "Sampling temperature representable by the worker runtime.",
             "format": "float",
+            "maximum": 3.4028234663852886e+38,
+            "minimum": 0,
             "type": [
               "number",
               "null"
@@ -1762,6 +1797,22 @@
         },
         "required": [
           "detail"
+        ],
+        "type": "object"
+      },
+      "GuardianChatTemplateConfig": {
+        "additionalProperties": false,
+        "description": "Bounded Granite Guardian options accepted by ``chat_template_kwargs``.",
+        "properties": {
+          "risk_name": {
+            "description": "Non-empty Granite Guardian risk identifier, at most 128 characters.",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "risk_name"
         ],
         "type": "object"
       },
@@ -3297,16 +3348,18 @@
         "type": "object"
       },
       "ResponsesRequest": {
+        "additionalProperties": false,
         "description": "OpenAI-compatible ``POST /v1/responses`` request (Responses MVP).\n\n**Strict allow-list**: unknown fields reject with 400\n``unsupported_field``. Type-invalid values reject with 400 ``invalid_request``.\n\n**Known-rejected fields**:\n- ``tools`` / ``tool_choice`` — rejected with 400 ``unsupported_field``.\n- ``previous_response_id`` — rejected with 400 ``unsupported_field``\n  (Responses MVP is stateless single-turn).\n- ``reasoning`` — rejected with 400 ``unsupported_field``.\n- ``background`` — rejected with 400 ``unsupported_field``.\n- ``metadata`` — rejected with 400 ``unsupported_field``.\n- ``instructions`` — rejected with 400 ``unsupported_field``.\n- ``stream: true`` — rejected with 400 ``unsupported_field`` (SSE on\n  Responses is deferred; use ``stream: false`` or omit).\n- Multimodal ``image_url`` / ``input_image`` content parts on the array\n  form — rejected with 400 ``unsupported_field``: the Responses surface is\n  text-only. (Vision input is supported on ``/v1/chat/completions``.)",
         "properties": {
           "input": {
-            "description": "Either a string prompt OR an array of `{role, content}` messages (array-input support). Array form: `role` is one of `\"system\" | \"user\" | \"assistant\" | \"developer\"` (\"developer\" normalizes to \"system\"). `content` is a string or an array of text-only content parts; image parts (`image_url` / `input_image`) reject with 400 unsupported_field. The array must not be empty.",
+            "description": "Either a string prompt OR an array of `{role, content}` messages (array-input support). Array form: `role` is one of `\"system\" | \"user\" | \"assistant\" | \"developer\"` (\"developer\" normalizes to \"system\"). `content` is a string or an array of `text`, `input_text`, or `output_text` parts; image parts (`image_url` / `input_image`) reject with 400 unsupported_field. The array must not be empty.",
             "oneOf": [
               {
                 "type": "string"
               },
               {
                 "items": {
+                  "additionalProperties": false,
                   "properties": {
                     "content": {
                       "oneOf": [
@@ -3315,6 +3368,7 @@
                         },
                         {
                           "items": {
+                            "additionalProperties": false,
                             "properties": {
                               "text": {
                                 "type": "string"
@@ -3322,13 +3376,15 @@
                               "type": {
                                 "enum": [
                                   "text",
-                                  "input_text"
+                                  "input_text",
+                                  "output_text"
                                 ],
                                 "type": "string"
                               }
                             },
                             "required": [
-                              "type"
+                              "type",
+                              "text"
                             ],
                             "type": "object"
                           },
@@ -3358,15 +3414,16 @@
             ]
           },
           "max_output_tokens": {
-            "description": "Defaults to 16 (mirroring completions) when absent. Positive integer.",
-            "format": "int32",
-            "minimum": 0,
+            "description": "Maximum number of generated tokens. Defaults to 16 when absent or null.",
+            "maximum": 4294967295,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
             ]
           },
           "model": {
+            "minLength": 1,
             "type": "string"
           },
           "seed": {
@@ -3391,8 +3448,10 @@
             ]
           },
           "temperature": {
-            "description": "Sampling temperature. Finite number ``>= 0``.",
+            "description": "Sampling temperature representable by the worker runtime.",
             "format": "float",
+            "maximum": 3.4028234663852886e+38,
+            "minimum": 0,
             "type": [
               "number",
               "null"
@@ -3686,7 +3745,7 @@
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
     "title": "SIE Gateway",
-    "version": "0.6.26"
+    "version": "0.6.27"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -4312,6 +4371,16 @@
               }
             },
             "description": "Model not found"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request body is too large"
           },
           "500": {
             "content": {
@@ -6831,6 +6900,123 @@
         },
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "created_at": {
+                      "type": "integer"
+                    },
+                    "id": {
+                      "type": "string"
+                    },
+                    "model": {
+                      "type": "string"
+                    },
+                    "object": {
+                      "const": "response",
+                      "type": "string"
+                    },
+                    "output": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "content": {
+                            "items": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "annotations": {
+                                  "items": {
+                                    "type": "object"
+                                  },
+                                  "type": "array"
+                                },
+                                "text": {
+                                  "type": "string"
+                                },
+                                "type": {
+                                  "const": "output_text",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "text",
+                                "annotations"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "role": {
+                            "const": "assistant",
+                            "type": "string"
+                          },
+                          "status": {
+                            "const": "completed",
+                            "type": "string"
+                          },
+                          "type": {
+                            "const": "message",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "type",
+                          "id",
+                          "role",
+                          "status",
+                          "content"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "status": {
+                      "const": "completed",
+                      "type": "string"
+                    },
+                    "usage": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "input_tokens": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "output_tokens": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "total_tokens": {
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "object",
+                    "created_at",
+                    "model",
+                    "status",
+                    "output",
+                    "usage"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
             "description": "Response object",
             "headers": {
               "X-Inference-Time": {
@@ -6943,6 +7129,16 @@
               }
             },
             "description": "Model not found"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request body is too large"
           },
           "500": {
             "content": {

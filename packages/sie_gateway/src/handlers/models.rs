@@ -223,6 +223,8 @@ fn canonical_worker_models(
 fn worker_only_model_info(name: &str, loaded: bool) -> Value {
     ModelEntry {
         name: name.to_string(),
+        canonical_base_model: name.to_string(),
+        canonical_profile: "default".to_string(),
         pool: None,
         bundles: Vec::new(),
         adapter_modules: HashSet::new(),
@@ -235,6 +237,7 @@ fn worker_only_model_info(name: &str, loaded: bool) -> Value {
             max_sequence_length: None,
             revision: None,
             max_output_tokens: None,
+            profile_max_output_tokens: HashMap::new(),
             grammar_capabilities: None,
             grammar_profile: None,
             profile_parents: HashMap::new(),
@@ -355,6 +358,7 @@ mod route_tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -383,6 +387,7 @@ mod route_tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -393,6 +398,7 @@ mod route_tests {
         profiles.insert(
             "candle".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some(
                     "sie_server_rust.adapters.candle:CandleEmbeddingAdapter".to_string(),
                 ),
@@ -423,6 +429,7 @@ mod route_tests {
         profiles.insert(
             "candle".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some(
                     "sie_server_rust.adapters.candle:CandleEmbeddingAdapter".to_string(),
                 ),
@@ -526,6 +533,7 @@ mod route_tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -543,6 +551,7 @@ mod route_tests {
         profiles.insert(
             "a100".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(8192),
                 compute_precision: None,

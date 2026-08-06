@@ -178,6 +178,36 @@ Source: [`lib.rs`](../src/lib.rs), [`dispatcher.rs`](../src/dispatcher.rs),
 [`ipc_client.rs`](../src/ipc_client.rs), and
 [`packages/sie_gateway/src/handlers/proxy.rs`](../../sie_gateway/src/handlers/proxy.rs).
 
+## Local Ingest
+
+Brokerless deployments can select local ingest and send length-prefixed
+MessagePack requests over an owner-only Unix socket. Non-generation work
+enters the same dispatcher, Rust preparation, scheduler, admission, and IPC
+pipeline as queue work. The request digest detects route and payload assembly
+drift between trusted colocated processes; socket permissions provide access
+control.
+
+Generation uses the canonical v0.2 `publish_generate_stream` operation. Rust
+normalizes legacy base64 images to bounded MessagePack binary, validates
+request/attempt identity, contiguous chunk sequence, and terminal ordering,
+and awaits every write through a count- and byte-bounded connection writer.
+The local-ingest reader also enforces fixed in-flight operation and retained
+request-byte budgets per connection. It acquires the declared frame bytes
+before reading the body and stops reading while either budget is exhausted, so
+slow socket writes cannot accumulate unbounded request bodies or tasks. Active
+envelope IDs are unique until their terminal write completes; a duplicate
+closes the connection rather than producing ambiguous multiplexed responses.
+Active generation request IDs are also claimed process-wide because backend
+cancellation is keyed by request ID alone.
+Writes and cancellation drain have finite transport deadlines; they do not
+override generation's gateway-owned semantic deadline (`timeout_ms=0`). A
+`cancel` control request or client disconnect is forwarded through
+`SignalGenerateCancel`. Deployments must map their outer transport onto this
+contract rather than bypassing the sidecar for media or stream handling.
+
+Source: [`local_ingest.rs`](../src/local_ingest.rs) and
+[`dispatcher.rs`](../src/dispatcher.rs).
+
 ## IPC
 
 IPC framing is:

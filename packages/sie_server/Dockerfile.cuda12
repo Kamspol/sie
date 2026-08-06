@@ -121,7 +121,9 @@ RUN echo "import sys; sys.path.insert(0, '/app/bundle-libs')" \
 # Conservative venv cleanup — only things known to be runtime-safe. Keep
 # torch/include (triton JIT compiles against torch C++ headers for
 # sglang/flash-attn custom ops) and keep gcc/libc6-dev at runtime.
-# Main wins: byte-compiled caches, *.a static libs, tests/, RECORD metadata.
+# Main wins: byte-compiled caches, *.a static libs, and tests/. Keep wheel
+# RECORD metadata: native loaders such as tvm_ffi use it to locate packaged
+# shared libraries (including xgrammar's libxgrammar_bindings.so).
 # Runs here (not in builder) so /app/.venv reaches its final form BEFORE
 # bundle divergence, making the runtime COPY cache-hit across bundles.
 RUN set -eux; \
@@ -131,7 +133,6 @@ RUN set -eux; \
     find . -type d -name 'tests' -prune -exec rm -rf {} +; \
     rm -rf torch/test torch/utils/tensorboard torch/utils/bottleneck 2>/dev/null || true; \
     find torch -type f -name '*.a' -delete 2>/dev/null || true; \
-    find . -type f -name 'RECORD' -path '*dist-info*' -delete; \
     # All nvidia-*-cu12 packages are kept — torch._C DT_NEEDED links libcufile,
     # libnccl, and similar; removing any breaks `import torch`.
     find nvidia -type f -name '*.a' -delete 2>/dev/null || true; \
@@ -187,7 +188,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # bundle-libs cleanup (symmetric to the .venv cleanup in base). The .venv
 # tree is already final in the base stage; only the per-bundle tree needs
-# cleanup here.
+# cleanup here. Preserve dist-info RECORD files for runtime native-library
+# discovery.
 RUN set -eux; \
     if [ -d /app/bundle-libs ]; then \
         cd /app/bundle-libs; \
@@ -196,7 +198,6 @@ RUN set -eux; \
         find . -type d -name 'tests' -prune -exec rm -rf {} +; \
         rm -rf torch/test torch/utils/tensorboard torch/utils/bottleneck 2>/dev/null || true; \
         find torch -type f -name '*.a' -delete 2>/dev/null || true; \
-        find . -type f -name 'RECORD' -path '*dist-info*' -delete; \
         find nvidia -type f -name '*.a' -delete 2>/dev/null || true; \
     fi; \
     # Normalize mtimes so rebuilds of the same bundle produce identical layer bytes.

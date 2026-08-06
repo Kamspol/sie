@@ -34,6 +34,9 @@ from sie_server.observability import worker_telemetry as worker_metrics
 from sie_server.processors import streaming as streaming_mod
 from sie_server.processors.streaming import StreamingProcessor, _ValidationError
 
+_GEMMA_OPEN = "<" + "|channel" + ">" + "thought\n"
+_GEMMA_CLOSE = "<" + "channel|" + ">"
+
 
 class _FakeGenAdapter(GenerationAdapter):
     """Yields a scripted sequence of chunks. Optionally blocks before each."""
@@ -533,6 +536,7 @@ def _make_registry_with_chat_config(
     context_length: int = 32768,
     hf_id: str = "test/model",
     hf_revision: str | None = None,
+    reasoning_parser: str | None = None,
 ) -> MagicMock:
     """Variant of :func:`_make_registry` that also fakes ``get_config``.
 
@@ -544,16 +548,74 @@ def _make_registry_with_chat_config(
     registry = _make_registry(adapter)
     config = MagicMock()
     config.hf_id = hf_id
+    config.name = hf_id
     config.hf_revision = hf_revision
     config.weights_path = None
     config.tasks.generate.chat_template_kwargs = chat_template_kwargs or {}
     config.tasks.generate.context_length = context_length
+    profile = MagicMock()
+    profile.loadtime = {"reasoning_parser": reasoning_parser} if reasoning_parser is not None else {}
+    config.resolve_profile.return_value = profile
     registry.get_config.return_value = config
     return registry
 
 
 @pytest.mark.asyncio
-async def test_streaming_processor_renders_chat_template(monkeypatch) -> None:
+@pytest.mark.parametrize("enable_thinking", [False, True])
+@pytest.mark.parametrize("model_id", ["Qwen/Qwen3.5-4B", "google/gemma-4-E2B-it"])
+async def test_streaming_processor_hides_reasoning_for_every_resolved_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    enable_thinking: bool,
+    model_id: str,
+) -> None:
+    nc = AsyncMock()
+    if model_id.startswith("google/gemma"):
+        reasoning_parser = "gemma4"
+        opening, closing = _GEMMA_OPEN, _GEMMA_CLOSE
+    else:
+        reasoning_parser = "qwen3"
+        opening, closing = "<think>", "</think>"
+    reasoning_chunks = (
+        [
+            GenerationChunk(text_delta="private reasoning" + closing[:5], is_first=True),
+            GenerationChunk(text_delta=closing[5:] + "Visible answer"),
+        ]
+        if enable_thinking
+        else [
+            GenerationChunk(text_delta=opening[:5], is_first=True),
+            GenerationChunk(text_delta=opening[5:] + "private reasoning" + closing[:5]),
+            GenerationChunk(text_delta=closing[5:] + "Visible answer"),
+        ]
+    )
+    adapter = _FakeGenAdapter(
+        [
+            *reasoning_chunks,
+            GenerationChunk(text_delta="", done=True, finish_reason="stop", prompt_tokens=1, completion_tokens=8),
+        ]
+    )
+    registry = _make_registry_with_chat_config(
+        adapter,
+        chat_template_kwargs={"enable_thinking": enable_thinking},
+        hf_id=model_id,
+        reasoning_parser=reasoning_parser,
+    )
+    proc = StreamingProcessor(nc=nc, registry=registry, worker_id="w1")
+    monkeypatch.setattr(proc, "_check_context_length", AsyncMock(return_value=None))
+    work_item = _make_work_item()
+    if enable_thinking:
+        monkeypatch.setattr(proc, "_render_chat_template", AsyncMock(return_value="rendered prompt" + opening))
+        work_item = _make_work_item(messages=[{"role": "user", "content": "Hello"}])
+
+    await proc.process(_make_msg(work_item), model_id)
+
+    decoded = _decode_chunks(nc)
+    visible = "".join(chunk.get("text_delta", "") for chunk in decoded)
+    assert visible == "Visible answer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enable_thinking", [False, True])
+async def test_streaming_processor_renders_chat_template(monkeypatch, enable_thinking: bool) -> None:
     """``Messages`` shape → adapter receives the rendered template string."""
     nc = AsyncMock()
     script = [
@@ -574,7 +636,10 @@ async def test_streaming_processor_renders_chat_template(monkeypatch) -> None:
 
     adapter.generate = _capture_generate  # type: ignore[method-assign]
 
-    registry = _make_registry_with_chat_config(adapter, chat_template_kwargs={"enable_thinking": False})
+    registry = _make_registry_with_chat_config(
+        adapter,
+        chat_template_kwargs={"enable_thinking": enable_thinking},
+    )
 
     # Patch ``load_tokenizer`` (called from a thread) with a stub that
     # records the kwargs forwarded to ``apply_chat_template``.
@@ -601,8 +666,10 @@ async def test_streaming_processor_renders_chat_template(monkeypatch) -> None:
 
     assert len(captured_prompts) == 1
     assert captured_prompts[0] == "<rendered>ping</rendered>"
-    assert seen_kwargs == {"enable_thinking": False}
+    assert seen_kwargs == {"enable_thinking": enable_thinking}
     decoded = _decode_chunks(nc)
+    visible = "".join(chunk.get("text_delta", "") for chunk in decoded)
+    assert visible == "hi"
     assert decoded[-1]["done"] is True
     assert decoded[-1]["finish_reason"] == "stop"
 
@@ -2634,6 +2701,31 @@ def test_validate_generate_caps_profile_min_new_tokens_to_explicit_max() -> None
     assert result.min_tokens == 1
 
 
+@pytest.mark.parametrize(
+    "chat_template_kwargs",
+    [
+        "not-an-object",
+        {"arbitrary_tokenizer_kwarg": True},
+        {"enable_thinking": "false"},
+        {"guardian_config": {"risk_name": "harm", "extra": True}},
+    ],
+)
+def test_validate_generate_rejects_unbounded_template_kwargs(chat_template_kwargs: object) -> None:
+    result = StreamingProcessor._validate_generate_params(
+        _make_work_item(
+            generate={
+                "prompt": "Hello",
+                "max_new_tokens": 8,
+                "chat_template_kwargs": chat_template_kwargs,
+            }
+        )
+    )
+
+    assert isinstance(result, _ValidationError)
+    assert result.code == "invalid_request"
+    assert "chat_template_kwargs" in result.message
+
+
 def test_validate_generate_rejects_explicit_min_tokens_above_max() -> None:
     result = StreamingProcessor._validate_generate_params(
         _make_work_item(
@@ -2754,9 +2846,13 @@ def test_parse_message_images_field() -> None:
     assert not isinstance(out, _ValidationError)
     assert out[0]["data"] == b"catbytes"
     assert out[0]["format"] == "png"
+    # New Rust sidecars prepare msgpack binary before backend IPC.
+    prepared = _parse_message_images_field([{"data": b"prepared", "format": "jpeg"}], 0)
+    assert not isinstance(prepared, _ValidationError)
+    assert prepared[0] == {"data": b"prepared", "format": "jpeg"}
     # Non-list rejects.
     assert isinstance(_parse_message_images_field({"data": "x"}, 1), _ValidationError)
-    # Non-string data rejects (gateway sends a base64 string).
+    # Values other than bytes or rolling-compatible base64 strings reject.
     bad = _parse_message_images_field([{"data": 123}], 2)
     assert isinstance(bad, _ValidationError)
     assert "messages[2].images[0]" in bad.message
@@ -2767,7 +2863,7 @@ def test_parse_message_images_field() -> None:
     # Empty data rejects.
     empty = _parse_message_images_field([{"data": ""}], 0)
     assert isinstance(empty, _ValidationError)
-    assert "non-empty base64" in empty.message
+    assert "non-empty bytes or a base64 string" in empty.message
 
 
 @pytest.mark.asyncio
@@ -2910,3 +3006,48 @@ async def test_messages_image_reaches_adapter(monkeypatch: pytest.MonkeyPatch) -
     assert len(adapter.received_images) == 1
     assert adapter.received_images[0]["data"] == b"catbytes"
     assert adapter.received_images[0]["format"] == "png"
+
+
+@pytest.mark.asyncio
+async def test_streaming_processor_reserves_capped_visual_tokens(monkeypatch) -> None:
+    nc = AsyncMock()
+    adapter = _FakeGenAdapter([])
+    registry = _make_registry_with_chat_config(adapter, context_length=1200)
+
+    class _StubTok:
+        def apply_chat_template(self, *args, **kwargs):
+            return "rendered"
+
+        def encode(self, text, *, add_special_tokens):
+            return [0]
+
+    from sie_server.processors import streaming as streaming_mod
+
+    monkeypatch.setattr(streaming_mod, "load_tokenizer", lambda *args, **kwargs: _StubTok())
+
+    proc = StreamingProcessor(nc=nc, registry=registry, worker_id="w1")
+    wi = _make_work_item(
+        generate={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "inspect this image",
+                    "images": [
+                        {
+                            "data": base64.b64encode(b"image").decode(),
+                            "format": "png",
+                        }
+                    ],
+                }
+            ],
+            "max_new_tokens": 64,
+        }
+    )
+    msg = _make_msg(wi)
+    await proc.process(msg, "test/model")
+
+    terminal = _decode_chunks(nc)[-1]
+    assert terminal["done"] is True
+    assert terminal["error"]["code"] == "context_exceeded"
+    assert "~image_tokens (1280)" in terminal["error"]["message"]
+    msg.ack.assert_awaited_once()

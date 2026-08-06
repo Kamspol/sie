@@ -667,6 +667,19 @@ class TestProfileConfig:
         )
         assert profile.compute_precision == "bfloat16"
 
+    def test_chat_template_kwargs(self) -> None:
+        """Generation profiles can carry tokenizer-render overrides."""
+        profile = ProfileConfig(
+            extends="default",
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        assert profile.chat_template_kwargs == {"enable_thinking": True}
+
+    def test_max_output_tokens_must_be_positive(self) -> None:
+        """Generation profile decode caps are positive when present."""
+        with pytest.raises(ValidationError):
+            ProfileConfig(extends="default", max_output_tokens=0)
+
     def test_extra_fields_rejected(self) -> None:
         """ProfileConfig rejects unknown fields."""
         with pytest.raises(ValidationError):
@@ -776,6 +789,135 @@ class TestModelConfigProfiles:
         )
 
         assert config.resolve_profile("child").runtime == {"output_similarity": {"dense": "dot"}}
+
+    def test_resolve_child_profile_overrides_chat_template_kwargs(self) -> None:
+        """A child profile replaces its parent's tokenizer-render preset."""
+        config = ModelConfig(
+            sie_id="test-model",
+            hf_id="org/model",
+            tasks=Tasks(generate=GenerateTask(context_length=8192, max_output_tokens=512)),
+            profiles={
+                "default": ProfileConfig(
+                    adapter_path="mod:Cls",
+                    max_batch_tokens=8192,
+                    kv_budget_tokens=8192,
+                    chat_template_kwargs={"enable_thinking": False},
+                ),
+                "thinking": ProfileConfig(
+                    extends="default",
+                    chat_template_kwargs={"enable_thinking": True},
+                ),
+            },
+        )
+
+        assert config.resolve_profile("default").chat_template_kwargs == {"enable_thinking": False}
+        assert config.resolve_profile("thinking").chat_template_kwargs == {"enable_thinking": True}
+
+    def test_resolve_child_profile_overrides_max_output_tokens(self) -> None:
+        """A long-context child can raise the model-level decode cap."""
+        config = ModelConfig(
+            sie_id="test-model",
+            hf_id="org/model",
+            tasks=Tasks(generate=GenerateTask(context_length=8192, max_output_tokens=4096)),
+            profiles={
+                "default": ProfileConfig(
+                    adapter_path="mod:Cls",
+                    max_batch_tokens=8192,
+                    kv_budget_tokens=8192,
+                ),
+                "long": ProfileConfig(
+                    extends="default",
+                    max_output_tokens=16384,
+                    adapter_options=AdapterOptions(loadtime={"max_seq_length": 32768}),
+                ),
+            },
+        )
+
+        assert config.resolve_profile("default").max_output_tokens is None
+        assert config.resolve_profile("long").max_output_tokens == 16384
+
+    def test_profile_max_output_tokens_require_generation_task(self) -> None:
+        """Decode caps are invalid on non-generation profiles."""
+        with pytest.raises(ValidationError, match="without a generation task"):
+            ModelConfig(
+                sie_id="test-model",
+                hf_id="org/model",
+                tasks=Tasks(encode=EncodeTask(dense=EmbeddingDim(dim=768))),
+                profiles={
+                    "default": ProfileConfig(
+                        adapter_path="mod:Cls",
+                        max_batch_tokens=8192,
+                        max_output_tokens=4096,
+                    ),
+                },
+            )
+
+    def test_profile_max_output_tokens_cannot_exceed_profile_context(self) -> None:
+        """A materialized profile cannot advertise more output than total context."""
+        with pytest.raises(ValidationError, match="exceeding its context_length"):
+            ModelConfig(
+                sie_id="test-model",
+                hf_id="org/model",
+                tasks=Tasks(generate=GenerateTask(context_length=8192, max_output_tokens=4096)),
+                profiles={
+                    "default": ProfileConfig(
+                        adapter_path="mod:Cls",
+                        max_batch_tokens=8192,
+                        kv_budget_tokens=8192,
+                        max_output_tokens=16384,
+                    ),
+                },
+            )
+
+    def test_chat_template_kwargs_require_generation_task(self) -> None:
+        """Tokenizer-render presets are invalid on non-generation profiles."""
+        with pytest.raises(ValidationError, match="without a generation task"):
+            ModelConfig(
+                sie_id="test-model",
+                hf_id="org/model",
+                tasks=Tasks(encode=EncodeTask(dense=EmbeddingDim(dim=768))),
+                profiles={
+                    "default": ProfileConfig(
+                        adapter_path="mod:Cls",
+                        max_batch_tokens=8192,
+                        chat_template_kwargs={"enable_thinking": True},
+                    ),
+                },
+            )
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"arbitrary_extension": True}, "unsupported chat_template_kwargs key"),
+            ({"enable_thinking": "yes"}, "enable_thinking must be a boolean"),
+            ({"guardian_config": {"risk_name": "harm", "extra": True}}, "unsupported.*guardian_config key"),
+            ({"guardian_config": {"risk_name": ""}}, "risk_name must be a non-empty string"),
+        ],
+    )
+    def test_generation_task_chat_template_kwargs_fail_closed(
+        self,
+        kwargs: dict[str, object],
+        message: str,
+    ) -> None:
+        with pytest.raises(ValidationError, match=message):
+            GenerateTask(
+                context_length=8192,
+                max_output_tokens=512,
+                chat_template_kwargs=kwargs,
+            )
+
+    def test_generation_task_accepts_bounded_guardian_config(self) -> None:
+        task = GenerateTask(
+            context_length=8192,
+            max_output_tokens=512,
+            chat_template_kwargs={"guardian_config": {"risk_name": "harm"}},
+        )
+
+        assert task.chat_template_kwargs == {"guardian_config": {"risk_name": "harm"}}
+
+    def test_profile_chat_template_kwargs_fail_closed(self) -> None:
+        with pytest.raises(ValidationError, match="unsupported chat_template_kwargs key"):
+            ProfileConfig(chat_template_kwargs={"arbitrary_extension": True})
 
     def test_resolve_missing_profile_raises(self) -> None:
         """resolve_profile raises for unknown profile."""

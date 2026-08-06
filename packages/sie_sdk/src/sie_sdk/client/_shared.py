@@ -34,6 +34,7 @@ _RESERVED_BASE_URL_HEADERS = frozenset(
         "content-type",
         "cookie",
         "host",
+        "idempotency-key",
         "keep-alive",
         "proxy-authenticate",
         "proxy-authorization",

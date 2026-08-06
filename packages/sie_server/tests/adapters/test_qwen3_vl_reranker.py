@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
+import numpy as np
 import pytest
 import torch
 from sie_server.adapters.qwen3_vl_reranker.adapter import (
@@ -227,6 +228,55 @@ class _FakeProcessor:
         return output
 
 
+class _Transformers53Processor(_FakeProcessor):
+    """Stand-in for the transformers>=5.3.0 ``Qwen3VLProcessor`` contract.
+
+    5.3.0 flipped ``Qwen3VLProcessorKwargs._defaults["text_kwargs"]
+    ["return_mm_token_type_ids"]`` from False to True and builds that map with
+    ``np.array(input_ids)`` — which cannot represent an unpadded batch of
+    unequal-length prompts, so it raises for every multi-pair request while
+    single-pair ones slip through (issue #2856).
+    """
+
+    image_token_id = 1
+
+    def _tokenize(self, prompt: str) -> tuple[list[int], list[tuple[int, int]]]:
+        ids: list[int] = []
+        offsets: list[tuple[int, int]] = []
+        cursor = 0
+        while cursor < len(prompt):
+            if prompt.startswith(self.image_token, cursor):
+                ids.append(self.image_token_id)
+                offsets.append((cursor, cursor + len(self.image_token)))
+                cursor += len(self.image_token)
+            else:
+                ids.append(2 + ord(prompt[cursor]) % 120)
+                offsets.append((cursor, cursor + 1))
+                cursor += 1
+        return ids, offsets
+
+    def __call__(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        tokenized = [self._tokenize(prompt) for prompt in kwargs["text"]]
+        rows = [ids for ids, _ in tokenized]
+        output: dict[str, Any] = {
+            "input_ids": rows,
+            "attention_mask": [[1] * len(row) for row in rows],
+            "offset_mapping": [offsets for _, offsets in tokenized],
+        }
+        if kwargs.get("images"):
+            image_count = len(kwargs["images"])
+            output["pixel_values"] = torch.ones((image_count, 1))
+            output["image_grid_thw"] = torch.ones((image_count, 3), dtype=torch.long)
+        if kwargs.get("return_mm_token_type_ids", True):
+            # Verbatim shape of the 5.3.0 processor body: this is what raises.
+            array_ids = np.array(rows)
+            mm_token_type_ids = np.zeros_like(array_ids)
+            mm_token_type_ids[array_ids == self.image_token_id] = 1
+            output["mm_token_type_ids"] = mm_token_type_ids.tolist()
+        return output
+
+
 class _RaceDetectingProcessor(_FakeProcessor):
     """Emulate shared fast-tokenizer mutation across processor methods."""
 
@@ -285,6 +335,7 @@ class _FakeModel:
         self.calls = 0
         self.attention_implementations: list[str] = []
         self.last_input_ids: torch.Tensor | None = None
+        self.last_kwargs: dict[str, Any] = {}
 
     def set_attn_implementation(self, attention: str) -> None:
         self.attention_implementations.append(attention)
@@ -292,6 +343,7 @@ class _FakeModel:
     def __call__(self, **kwargs: Any) -> SimpleNamespace:
         self.calls += 1
         self.last_input_ids = kwargs["input_ids"]
+        self.last_kwargs = kwargs
         batch_size, sequence_length = kwargs["input_ids"].shape
         logits = torch.zeros((batch_size, sequence_length, 4))
         for index in range(batch_size):
@@ -330,9 +382,77 @@ def test_vl_score_pairs_batches_forward_and_surfaces_measured_units(monkeypatch:
     assert processor.calls[0]["padding"] is False
     assert processor.calls[0]["return_tensors"] is None
     assert processor.calls[0]["return_offsets_mapping"] is True
+    assert processor.calls[0]["return_mm_token_type_ids"] is False
     assert output.scores.tolist() == pytest.approx([0.880797, 0.119203])
     assert output.input_token_counts == [len(prompt) for prompt in processed_prompts]
     assert output.input_image_counts == [0, 1]
+
+
+def test_vl_multi_pair_scoring_survives_transformers_5_3_processor_defaults() -> None:
+    """FIX[#2856]: a ragged multi-pair batch must not trip the 5.3 mm-id default.
+
+    Single-pair scoring passed throughout the outage because one prompt is never
+    ragged, so this asserts the ``items >= 2`` shape that actually broke.
+    """
+    adapter = Qwen3VLRerankerAdapter("unused")
+    model = _FakeModel()
+    processor = _Transformers53Processor()
+    adapter._model = model  # ty: ignore[invalid-assignment]
+    adapter._processor = processor  # ty: ignore[invalid-assignment]
+    adapter._device = "cpu"
+    adapter._yes_token_id = 1
+    adapter._no_token_id = 2
+
+    output = adapter.score_pairs(
+        [Item(text="query"), Item(text="query")],
+        [Item(text="short"), Item(text="a document long enough to make the batch ragged")],
+    )
+
+    assert model.calls == 1
+    assert len(output.scores) == 2
+    assert output.input_token_counts[0] != output.input_token_counts[1]
+    assert processor.calls[0]["return_mm_token_type_ids"] is False
+    # transformers <5.3 has no such forward parameter, so nothing is sent.
+    assert "mm_token_type_ids" not in model.last_kwargs
+
+
+def test_vl_mm_token_type_ids_track_the_trimmed_and_padded_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FIX[#2856]: 5.3+ derives vision RoPE from mm_token_type_ids, so ours must align.
+
+    The processor's own map is built before per-document truncation and padding,
+    so the adapter rebuilds it against the ids the model is actually handed.
+    """
+    adapter = Qwen3VLRerankerAdapter("unused")
+    model = _FakeModel()
+    processor = _Transformers53Processor()
+    adapter._model = model  # ty: ignore[invalid-assignment]
+    adapter._processor = processor  # ty: ignore[invalid-assignment]
+    adapter._device = "cpu"
+    adapter._yes_token_id = 1
+    adapter._no_token_id = 2
+    adapter._image_token_id = processor.image_token_id
+    adapter._accepts_mm_token_type_ids = True
+    monkeypatch.setattr(adapter, "_load_first_image", lambda _item: object())
+
+    output = adapter.score_pairs(
+        [Item(text="query"), Item(text="query")],
+        [
+            Item(text="short"),
+            Item(
+                text="a document long enough to be truncated by the window",
+                images=[{"data": b"doc-image"}],
+            ),
+        ],
+        options={"max_seq_length": 250},
+    )
+
+    input_ids = model.last_kwargs["input_ids"]
+    mm_token_type_ids = model.last_kwargs["mm_token_type_ids"]
+    assert mm_token_type_ids.shape == input_ids.shape
+    assert torch.equal(mm_token_type_ids, (input_ids == processor.image_token_id).to(mm_token_type_ids.dtype))
+    # The image pair keeps its image token; the text-only pair has none.
+    assert mm_token_type_ids.sum(dim=1).tolist() == [0, 1]
+    assert max(output.input_token_counts) == 250
 
 
 def test_vl_processor_tokenization_is_thread_safe() -> None:

@@ -156,6 +156,8 @@ class DoclingAdapter(BaseAdapter):
         # Pre-warm: triggers Docling's lazy download of layout/table models so
         # the first real request doesn't block on a multi-hundred-MB pull.
         # Models cache globally, so subsequent per-task converters are cheap.
+        # This is the born-digital parse path that BOTH profiles depend on, so
+        # a staged artifact root keeps it fail-closed.
         try:
             warm_converter = self._get_converter(ocr_enabled=False)
             _payload, _pages, warm_error = self._convert_bytes(
@@ -165,9 +167,19 @@ class DoclingAdapter(BaseAdapter):
             )
             if warm_error is not None:
                 raise RuntimeError(warm_error.message)
-            # DocumentConverter construction is lazy, so exercise the OCR
-            # converter too. This initializes its OCR assets during readiness
-            # instead of deferring a missing staged file to the first request.
+        except Exception as exc:
+            if self._artifacts_path is not None:
+                raise RuntimeError("Docling staged artifact initialization failed") from exc
+            logger.exception("Docling pre-warm failed; first real request may be slow")
+        # DocumentConverter construction is lazy, so exercise the OCR converter
+        # too — but only as a readiness PROBE, never as a load gate. OCR assets
+        # are an ``ocr``-profile dependency: Docling threads ``do_ocr`` into the
+        # OCR model's ``enabled`` flag, so the ``default`` profile never opens
+        # one. Gating load() on this turned a missing OCR file into a total
+        # outage for both profiles, including the cheaper and more commonly
+        # used born-digital path (#2872). Drop the failed converter instead, so
+        # an ``ocr`` request rebuilds it and surfaces a per-item error.
+        try:
             ocr_converter = self._get_converter(ocr_enabled=True)
             _payload, _pages, ocr_warm_error = self._convert_bytes(
                 ocr_converter,
@@ -176,10 +188,12 @@ class DoclingAdapter(BaseAdapter):
             )
             if ocr_warm_error is not None:
                 raise RuntimeError(ocr_warm_error.message)
-        except Exception as exc:
-            if self._artifacts_path is not None:
-                raise RuntimeError("Docling staged artifact initialization failed") from exc
-            logger.exception("Docling pre-warm failed; first real request may be slow")
+        except Exception:
+            self._converters.pop(True, None)
+            logger.exception(
+                "Docling OCR pre-warm failed; the 'ocr' profile will error per request "
+                "until its OCR assets resolve. The 'default' profile is unaffected."
+            )
         self._loaded = True
 
     def _resolve_artifacts_path(self) -> Path | None:

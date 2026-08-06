@@ -264,6 +264,7 @@ override.tf.json
 !deploy/cloud/terraform/aws-edge/.terraform.lock.hcl
 !deploy/cloud/terraform/s3-state/.terraform.lock.hcl
 !deploy/cloud/terraform/vercel/.terraform.lock.hcl
+!deploy/cloud/terraform/console-preview/.terraform.lock.hcl
 !deploy/cloud/terraform/examples/dev/.terraform.lock.hcl
 !deploy/cloud/terraform/examples/dev-eu/.terraform.lock.hcl
 !deploy/cloud/terraform/examples/staging/.terraform.lock.hcl

@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 from sie_server.adapters._generation_base import GenerationChunk
+from sie_server.adapters.sglang.generation import SGLangGenerationAdapter
 from sie_server.adapters.sglang_vision_extract.adapter import SGLangVisionExtractAdapter
 from sie_server.config.model import ModelConfig
 from sie_server.types.inputs import ImageInput, InvalidMediaError, Item
@@ -78,14 +79,48 @@ def test_device_factory_does_not_apply_text_only_mlx_fallback() -> None:
     assert isinstance(instance, SGLangVisionExtractAdapter)
 
 
-def test_compat_path_is_prepended_to_inherited_pythonpath(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_compat_paths_are_fixed_and_prepend_lighton_hook(monkeypatch: pytest.MonkeyPatch) -> None:
     inherited = os.pathsep.join(("/inherited/one", "/inherited/two"))
     monkeypatch.setenv("PYTHONPATH", inherited)
 
-    instance = SGLangVisionExtractAdapter("lightonai/LightOnOCR-2-1B")
+    instance = SGLangVisionExtractAdapter(
+        "lightonai/LightOnOCR-2-1B",
+        extra_env={"PYTHONPATH": "/checkpoint-controlled"},
+    )
 
-    compat_dir = Path(__file__).resolve().parents[2] / "src/sie_server/adapters/sglang_vision_extract/_compat"
-    assert instance._extra_env["PYTHONPATH"] == os.pathsep.join((str(compat_dir), inherited))
+    source_root = Path(__file__).resolve().parents[2] / "src/sie_server/adapters"
+    assert os.pathsep.join(instance._compat_pythonpath_entries()) == os.pathsep.join(
+        (str(source_root / "sglang_vision_extract/_compat"), str(source_root / "sglang/_compat"), inherited)
+    )
+
+
+@patch("sie_server.adapters.sglang._server.subprocess.Popen")
+@patch("sie_server.adapters.sglang._server.requests.get")
+@patch("sie_server.adapters.sglang._server.find_free_port")
+def test_engine_launch_preserves_lighton_sitecustomize_precedence(
+    mock_find_port: MagicMock,
+    mock_requests_get: MagicMock,
+    mock_popen: MagicMock,
+) -> None:
+    mock_find_port.return_value = 30005
+    mock_process = MagicMock()
+    mock_process.poll.return_value = None
+    mock_popen.return_value = mock_process
+    mock_requests_get.return_value = MagicMock(status_code=200)
+    instance = SGLangVisionExtractAdapter(
+        "lightonai/LightOnOCR-2-1B",
+        extra_env={"SIE_SGLANG_LIGHTON_OCR_COMPAT": "1", "PYTHONPATH": "/checkpoint-controlled"},
+    )
+
+    SGLangGenerationAdapter.load(instance, "cuda:0")
+
+    child_env = mock_popen.call_args.kwargs["env"]
+    source_root = Path(__file__).resolve().parents[2] / "src/sie_server/adapters"
+    assert child_env["PYTHONPATH"].split(os.pathsep)[:2] == [
+        str(source_root / "sglang_vision_extract/_compat"),
+        str(source_root / "sglang/_compat"),
+    ]
+    assert "/checkpoint-controlled" not in child_env["PYTHONPATH"]
 
 
 def test_lighton_default_profile_enables_compat_hook() -> None:

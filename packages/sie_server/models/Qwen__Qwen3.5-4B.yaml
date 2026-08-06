@@ -14,9 +14,9 @@ inputs:
 tasks:
   generate:
     # Native context length is 262,144 tokens (YaRN extends to ~1M).
-    # Keep the public request context at 8192 for every profile. The larger
-    # A100/H100 capacity measurements below size batching and admission; they
-    # are not a claim that a longer request context has been release-gated.
+    # Keep the bare request context at 8192. The explicit ``:long-context``
+    # profile below exposes the already-measured 32K A100 launch shape without
+    # widening latency/capacity expectations for every caller.
     context_length: 8192
     max_output_tokens: 4096
     # Route grammar-constrained requests (response_format / grammar) to the
@@ -151,6 +151,8 @@ profiles:
         # also sets the SGLANG_ENABLE_SPEC_V2=1 env var when
         # speculative.enabled — both are required as a pair.
         extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
           - "--mamba-scheduler-strategy"
           - "extra_buffer"
       runtime:
@@ -171,6 +173,53 @@ profiles:
   # those results remain reproducible while production uses the bare model id.
   a100-40gb:
     extends: default
+  # Explicit reasoning mode. The tokenizer switch changes output semantics,
+  # so it is a named profile rather than the bare model default. Thinking uses
+  # Qwen's recommended sampling recipe; the launch shape remains the measured
+  # A100 default.
+  thinking:
+    extends: default
+    chat_template_kwargs:
+      enable_thinking: true
+    adapter_options:
+      runtime:
+        first_chunk_timeout_s: 60
+        inter_chunk_timeout_s: 15
+        overall_timeout_s: 300
+        default_sampling:
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 1.5
+        stop_tokens:
+          - "<|im_end|>"
+  # The checkpoint is native to 262K and the checked-in A100 calibration
+  # already boots SGLang at 32K. Expose that conservative measured window as
+  # an opt-in variant while the bare model remains 8K.
+  long-context:
+    extends: default
+    adapter_options:
+      loadtime:
+        max_seq_length: 32768
+        mlx_repo: mlx-community/Qwen3.5-4B-4bit
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3.5-4B
+        disable_cuda_graph: true
+        attention_backend: triton
+        grammar_backend: outlines
+        reasoning_parser: qwen3
+        tool_call_parser: qwen3_coder
+        speculative:
+          enabled: true
+          algorithm: nextn
+          num_steps: 3
+          eagle_topk: 1
+          num_draft_tokens: 4
+        extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
+          - "--mamba-scheduler-strategy"
+          - "extra_buffer"
   # L4 is severely constrained for Qwen3.5-4B + NEXTN — fits only ~3
   # concurrent requests, context cap ≈ 8192. Use this explicit profile for
   # smoke / c=1 only; it is not the production default.
@@ -198,6 +247,8 @@ profiles:
           eagle_topk: 1
           num_draft_tokens: 4
         extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
           - "--mamba-scheduler-strategy"
           - "extra_buffer"
           - "--disable-overlap-schedule"
@@ -235,6 +286,8 @@ profiles:
           eagle_topk: 1
           num_draft_tokens: 4
         extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
           - "--mamba-scheduler-strategy"
           - "extra_buffer"
       runtime:
@@ -276,6 +329,8 @@ profiles:
         # identical so a config diff between them shows only the
         # speculative block (the intent of the ablation).
         extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
           - "--mamba-scheduler-strategy"
           - "extra_buffer"
       runtime:

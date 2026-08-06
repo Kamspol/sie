@@ -10,19 +10,26 @@ MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
 
 
 @pytest.mark.parametrize(
-    ("model_file", "model_id", "adapter_path", "grammar_backend"),
+    ("model_file", "model_id", "adapter_path", "grammar_backend", "extra_launch_args"),
     [
         (
             "Qwen__Qwen3.6-35B-A3B.yaml",
             "Qwen/Qwen3.6-35B-A3B",
             "sie_server.adapters.sglang.generation:SGLangGenerationAdapter",
-            "outlines",
+            "xgrammar",
+            [
+                "--mm-process-config",
+                '{"image":{"min_pixels":65536,"max_pixels":1003520}}',
+                "--quantization",
+                "fp8",
+            ],
         ),
         (
             "google__gemma-4-31B-it.yaml",
             "google/gemma-4-31B-it",
             "sie_server.adapters.sglang.gemma:SGLangGemmaAdapter",
             "xgrammar",
+            ["--quantization", "fp8"],
         ),
     ],
 )
@@ -31,6 +38,7 @@ def test_new_generation_models_resolve_h100_fp8_alias(
     model_id: str,
     adapter_path: str,
     grammar_backend: str,
+    extra_launch_args: list[str],
 ) -> None:
     config = ModelConfig.model_validate(yaml.safe_load((MODELS_DIR / model_file).read_text()))
     default = config.resolve_profile("default")
@@ -51,4 +59,4 @@ def test_new_generation_models_resolve_h100_fp8_alias(
     assert default.loadtime["disable_cuda_graph"] is True
     assert default.loadtime["grammar_backend"] == grammar_backend
     assert default.loadtime["speculative"] == {"enabled": False}
-    assert default.loadtime["extra_launch_args"] == ["--quantization", "fp8"]
+    assert default.loadtime["extra_launch_args"] == extra_launch_args

@@ -68,3 +68,12 @@ profiles:
         default_sampling:
           temperature: 0.0
           top_p: 1.0
+  # The checkpoint supports 16,384 tokens. Keep the bare 8K contract for the
+  # measured Spider recipe and expose the full native window explicitly.
+  long-context:
+    extends: default
+    adapter_options:
+      loadtime:
+        max_seq_length: 16384
+        mem_fraction_static: 0.85
+        served_model_name: defog/sqlcoder-7b-2

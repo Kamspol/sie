@@ -472,6 +472,13 @@ class TestDoclingSpec:
         assert not adapter._loaded
 
     def test_staged_artifact_prewarm_exercises_ocr_converter(self, tmp_path: Path) -> None:
+        """The OCR pre-warm is a probe, not a load gate (#2872).
+
+        Missing OCR assets are an ``ocr``-profile dependency. They must not
+        take down the born-digital ``default`` profile, which never opens an
+        OCR file. The probe still runs, load() still succeeds, and the failed
+        OCR converter is dropped so an ``ocr`` request rebuilds it.
+        """
         adapter = DoclingAdapter(package_artifact_root=tmp_path)
         default_converter = _stub_converter("default")
         ocr_converter = _stub_converter("ocr")
@@ -480,12 +487,29 @@ class TestDoclingSpec:
             side_effect=[default_converter, ocr_converter]
         )
 
-        with pytest.raises(RuntimeError, match="staged artifact initialization failed"):
-            adapter.load("cpu")
+        adapter.load("cpu")
 
         assert default_converter.convert.call_count == 1
         assert ocr_converter.convert.call_count == 1
-        assert not adapter._loaded
+        assert adapter._loaded
+        # The default (non-OCR) converter stays cached; the failed OCR one does not.
+        assert set(adapter._converters) == {False}
+
+    def test_default_profile_survives_missing_ocr_assets(self, tmp_path: Path) -> None:
+        """A born-digital parse still serves when only the OCR assets are missing."""
+        adapter = DoclingAdapter(package_artifact_root=tmp_path)
+        default_converter = _stub_converter("default")
+        ocr_converter = _stub_converter("ocr")
+        ocr_converter.convert.side_effect = FileNotFoundError("missing staged OCR model")
+        adapter._make_converter = MagicMock(  # type: ignore[method-assign]
+            side_effect=[default_converter, ocr_converter]
+        )
+        adapter.load("cpu")
+
+        result = adapter.extract([Item(document={"data": b"%PDF-1.4", "format": "pdf"})])
+
+        assert result.errors is None
+        assert adapter._make_converter.call_count == 2  # cached default converter reused
 
     def test_local_model_source_is_used_as_artifact_root(self, tmp_path: Path) -> None:
         adapter = DoclingAdapter(model_name_or_path=tmp_path)

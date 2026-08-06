@@ -92,10 +92,14 @@ import {
   buildJobBody,
   decodeChunkBytes,
   jobChunks,
+  requireConnectionName,
+  requireConnectionSchemaPolicy,
+  requireConnectorIdempotencyKey,
 } from "./jobs.js";
 import { packMessage, unpackMessage } from "./msgpack.js";
 import { parseSseStream } from "./sse.js";
 import type {
+  AddConnectionOptions,
   Batch,
   BatchList,
   CapacityInfo,
@@ -135,14 +139,23 @@ import { SDK_VERSION } from "./version.js";
 
 /** The `client.jobs` batch namespace. */
 export interface JobsNamespace {
-  /** Submit a batch job (`POST /v1/jobs`); returns the created-job envelope. */
-  submit(options: SubmitJobOptions): Promise<JobSubmitResult>;
+  /** Submit a batch job; exact connector replays may return current status. */
+  submit(options: SubmitJobOptions): Promise<JobSubmitResult | JobStatus>;
   /** Fetch a job's public status doc (`GET /v1/jobs/{id}`). */
   get(jobId: string): Promise<JobStatus>;
   /** List the org's jobs (`GET /v1/jobs`; scoped to the key's org). */
   list(): Promise<JobStatus[]>;
   /** Cancel a job (`POST /v1/jobs/{id}/cancel`); the hold's remainder releases. */
   cancel(jobId: string): Promise<JobStatus>;
+  /** Confirm one exact connector plan revision for execution. */
+  execute(jobId: string, planRevision: number, idempotencyKey: string): Promise<JobStatus>;
+  /** Repair one exact recovery-required connector attempt and cutoff. */
+  repair(
+    jobId: string,
+    planRevision: number,
+    recoveryAttemptOrdinal: number,
+    idempotencyKey: string,
+  ): Promise<JobStatus>;
   /** Retrieve a finished job's chunk refs and decode the per-item results. */
   results(jobId: string): Promise<JobResults>;
   /**
@@ -156,7 +169,12 @@ export interface JobsNamespace {
 /** The `client.connections` namespace (org-scoped connector auth). */
 export interface ConnectionsNamespace {
   /** Create an org-scoped connection (connector auth by name). */
-  add(name: string, type: string, secret: string): Promise<ConnectionCreated>;
+  add(
+    name: string,
+    type: string,
+    secret: string,
+    options?: AddConnectionOptions,
+  ): Promise<ConnectionCreated>;
   /** List the org's active connections (secrets redacted). */
   list(): Promise<Connection[]>;
   /** Revoke (soft-delete) a connection; frees the name for reuse. */
@@ -623,11 +641,15 @@ export class SIEClient {
       get: (jobId) => this.jobGet(jobId),
       list: () => this.jobList(),
       cancel: (jobId) => this.jobCancel(jobId),
+      execute: (jobId, planRevision, idempotencyKey) =>
+        this.jobExecute(jobId, planRevision, idempotencyKey),
+      repair: (jobId, planRevision, recoveryAttemptOrdinal, idempotencyKey) =>
+        this.jobRepair(jobId, planRevision, recoveryAttemptOrdinal, idempotencyKey),
       results: (jobId) => this.jobResults(jobId),
       wait: (jobId, options) => this.jobWait(jobId, options),
     };
     this.connections = {
-      add: (name, type, secret) => this.connectionAdd(name, type, secret),
+      add: (name, type, secret, options) => this.connectionAdd(name, type, secret, options),
       list: () => this.connectionList(),
       revoke: (name) => this.connectionRevoke(name),
     };
@@ -2432,12 +2454,14 @@ export class SIEClient {
     body?: unknown,
     timeoutMs: number = this.timeout,
     onError?: (response: Response) => Promise<void>,
+    extraHeaders?: Record<string, string>,
   ): Promise<T> {
     const url = target.startsWith("http") ? target : `${this.baseUrl}${target}`;
     const headers: Record<string, string> = {
       Accept: JSON_CONTENT_TYPE,
       [SDK_VERSION_HEADER]: SDK_VERSION,
     };
+    if (extraHeaders) Object.assign(headers, extraHeaders);
     if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
     const init: RequestInit = { method, headers };
     if (body !== undefined) {
@@ -2470,12 +2494,25 @@ export class SIEClient {
     }
   }
 
-  private async jobSubmit(options: SubmitJobOptions): Promise<JobSubmitResult> {
-    return this.jsonRequest<JobSubmitResult>(
+  private async jobSubmit(options: SubmitJobOptions): Promise<JobSubmitResult | JobStatus> {
+    const body = buildJobBody(options);
+    let extraHeaders: Record<string, string> | undefined;
+    if ("src" in body) {
+      extraHeaders = { "Idempotency-Key": requireConnectorIdempotencyKey(options.idempotencyKey) };
+    } else if (options.idempotencyKey != null) {
+      throw new RequestError(
+        "idempotencyKey applies only to connector-src jobs; inline items must omit it",
+        "invalid_request",
+        400,
+      );
+    }
+    return this.jsonRequest<JobSubmitResult | JobStatus>(
       "/v1/jobs",
       "POST",
-      buildJobBody(options),
+      body,
       Math.max(this.timeout, DEFAULT_LONG_RUNNING_TIMEOUT),
+      undefined,
+      extraHeaders,
     );
   }
 
@@ -2490,6 +2527,40 @@ export class SIEClient {
 
   private async jobCancel(jobId: string): Promise<JobStatus> {
     return this.jsonRequest<JobStatus>(`/v1/jobs/${encodeURIComponent(jobId)}/cancel`, "POST");
+  }
+
+  private async jobExecute(
+    jobId: string,
+    planRevision: number,
+    idempotencyKey: string,
+  ): Promise<JobStatus> {
+    return this.jsonRequest<JobStatus>(
+      `/v1/jobs/${encodeURIComponent(jobId)}/execute`,
+      "POST",
+      { plan_revision: planRevision },
+      this.timeout,
+      undefined,
+      { "Idempotency-Key": requireConnectorIdempotencyKey(idempotencyKey) },
+    );
+  }
+
+  private async jobRepair(
+    jobId: string,
+    planRevision: number,
+    recoveryAttemptOrdinal: number,
+    idempotencyKey: string,
+  ): Promise<JobStatus> {
+    return this.jsonRequest<JobStatus>(
+      `/v1/jobs/${encodeURIComponent(jobId)}/repair`,
+      "POST",
+      {
+        plan_revision: planRevision,
+        recovery_attempt_ordinal: recoveryAttemptOrdinal,
+      },
+      this.timeout,
+      undefined,
+      { "Idempotency-Key": requireConnectorIdempotencyKey(idempotencyKey) },
+    );
   }
 
   private async jobResults(jobId: string): Promise<JobResults> {
@@ -2523,7 +2594,7 @@ export class SIEClient {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const job = await this.jobGet(jobId);
-      if (job.state && TERMINAL_JOB_STATES.has(job.state)) {
+      if ((job.state && TERMINAL_JOB_STATES.has(job.state)) || job.phase === "planned") {
         return job;
       }
       if (Date.now() >= deadline) {
@@ -2592,12 +2663,24 @@ export class SIEClient {
     name: string,
     type: string,
     secret: string,
+    options: AddConnectionOptions = {},
   ): Promise<ConnectionCreated> {
-    return this.jsonRequest<ConnectionCreated>(this.connectionsBase(), "POST", {
+    requireConnectionName(name);
+    const schemaPolicy = requireConnectionSchemaPolicy(
+      type,
+      options.sourceSchema,
+      options.sinkSchema,
+    );
+    const body: Record<string, unknown> = {
       type,
       name,
       secret,
-    });
+    };
+    if (schemaPolicy) {
+      body.source_schema = schemaPolicy.sourceSchema;
+      body.sink_schema = schemaPolicy.sinkSchema;
+    }
+    return this.jsonRequest<ConnectionCreated>(this.connectionsBase(), "POST", body);
   }
 
   private async connectionList(): Promise<Connection[]> {
@@ -2609,8 +2692,9 @@ export class SIEClient {
   }
 
   private async connectionRevoke(name: string): Promise<ConnectionRevoked> {
+    const canonicalName = requireConnectionName(name);
     return this.jsonRequest<ConnectionRevoked>(
-      `${this.connectionsBase()}/${encodeURIComponent(name)}`,
+      `${this.connectionsBase()}/${canonicalName}`,
       "DELETE",
     );
   }

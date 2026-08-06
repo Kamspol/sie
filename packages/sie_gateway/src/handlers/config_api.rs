@@ -733,6 +733,7 @@ mod tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -926,6 +927,7 @@ mod tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("nonexistent.module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -969,6 +971,8 @@ mod tests {
         // compute_model_status directly.
         let entry = crate::types::model::ModelEntry {
             name: "empty/model".to_string(),
+            canonical_base_model: "empty/model".to_string(),
+            canonical_profile: "default".to_string(),
             pool: None,
             bundles: Vec::new(),
             adapter_modules: Default::default(),

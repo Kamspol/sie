@@ -9,6 +9,7 @@ calls the adapter directly (no NATS, no gateway). The gateway-side handler
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from typing import Literal
 from unittest.mock import AsyncMock, MagicMock
@@ -33,6 +34,9 @@ from sie_server.config.model import (
 from sie_server.core.registry import ModelRegistry
 from sie_server.types.grammar import GrammarSpec
 from sie_server.types.inputs import ImageInput
+
+_GEMMA_OPEN = "<" + "|channel" + ">" + "thought\n"
+_GEMMA_CLOSE = "<" + "channel|" + ">"
 
 
 class _FakeGenAdapter(GenerationAdapter):
@@ -158,13 +162,52 @@ class _LegacyTextGenAdapter(_FakeGenAdapter):
         )
 
 
+class _ThinkingGenAdapter(_FakeGenAdapter):
+    """Script reasoning delimiters across engine chunk boundaries."""
+
+    def __init__(self, *, prompt_seeded: bool = False, gemma: bool = False) -> None:
+        super().__init__()
+        self._prompt_seeded = prompt_seeded
+        self._opening = _GEMMA_OPEN if gemma else "<think>"
+        self._closing = _GEMMA_CLOSE if gemma else "</think>"
+
+    async def generate(
+        self,
+        prompt: str,
+        *,
+        max_new_tokens: int,
+        **kwargs: object,
+    ) -> AsyncIterator[GenerationChunk]:
+        _ = (prompt, max_new_tokens, kwargs)
+        text_chunks = (
+            ("private", " reasoning" + self._closing[:5], self._closing[5:] + "Visible answer")
+            if self._prompt_seeded
+            else (
+                self._opening[:5],
+                self._opening[5:] + "private",
+                " reasoning" + self._closing[:5],
+                self._closing[5:] + "Visible answer",
+            )
+        )
+        for text in text_chunks:
+            yield GenerationChunk(text_delta=text)
+        yield GenerationChunk(
+            text_delta="",
+            done=True,
+            finish_reason="stop",
+            prompt_tokens=1,
+            completion_tokens=8,
+        )
+
+
 def _make_config(
     *,
+    model_id: str = "Qwen/Qwen3-4B-Instruct",
     grammar: list[Literal["json_schema", "regex", "ebnf"]] | None = None,
 ) -> ModelConfig:
     return ModelConfig(
-        sie_id="Qwen/Qwen3-4B-Instruct",
-        hf_id="Qwen/Qwen3-4B-Instruct",
+        sie_id=model_id,
+        hf_id=model_id,
         tasks=Tasks(
             generate=GenerateTask(
                 context_length=32768,
@@ -177,6 +220,9 @@ def _make_config(
                 adapter_path="sie_server.adapters.sglang:SGLangGenerationAdapter",
                 max_batch_tokens=16384,
                 kv_budget_tokens=8192,
+                adapter_options=AdapterOptions(
+                    loadtime={"reasoning_parser": "gemma4" if model_id.startswith("google/gemma") else "qwen3"}
+                ),
             ),
         },
     )
@@ -213,6 +259,57 @@ def client(registry: MagicMock) -> TestClient:
 
 
 class TestGenerateEndpoint:
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("enable_thinking", [False, True])
+    @pytest.mark.parametrize("model_id", ["Qwen/Qwen3.5-4B", "google/gemma-4-E2B-it"])
+    def test_reasoning_output_is_hidden_for_every_resolved_profile(
+        self,
+        client: TestClient,
+        registry: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        stream: bool,
+        enable_thinking: bool,
+        model_id: str,
+    ) -> None:
+        config = _make_config(model_id=model_id)
+        gemma = model_id.startswith("google/gemma")
+        opening = _GEMMA_OPEN if gemma else "<think>"
+        assert config.tasks.generate is not None
+        config.tasks.generate.chat_template_kwargs = {"enable_thinking": enable_thinking}
+        if enable_thinking:
+            config.inputs = InputModalities(text=True, image=True)
+
+            async def render(_config: object, prompt: str, image_count: int) -> str:
+                assert prompt == "Hello"
+                assert image_count == 1
+                return "rendered thinking prompt" + opening
+
+            monkeypatch.setattr(generate_api, "_render_native_image_prompt", render)
+        registry.get_config.return_value = config
+        registry.get.return_value = _ThinkingGenAdapter(prompt_seeded=enable_thinking, gemma=gemma)
+
+        request: dict[str, object] = {"prompt": "Hello", "max_new_tokens": 16, "stream": stream}
+        if enable_thinking:
+            request["images"] = [{"data": "aGVsbG8=", "format": "png"}]
+
+        response = client.post(
+            f"/v1/generate/{model_id.replace('/', '__')}",
+            json=request,
+        )
+
+        assert response.status_code == 200, response.text
+        if stream:
+            events = [
+                json.loads(line.removeprefix("data: "))
+                for line in response.text.splitlines()
+                if line.startswith("data: ") and line != "data: [DONE]"
+            ]
+            streamed_text = "".join(event.get("text_delta", "") for event in events)
+            assert streamed_text == "Visible answer"
+            assert "private reasoning" not in streamed_text
+        else:
+            assert response.json()["text"] == "Visible answer"
+
     @pytest.mark.parametrize("stream", [False, True])
     def test_text_only_generate_preserves_legacy_adapter_call_signature(
         self,
@@ -284,14 +381,16 @@ class TestGenerateEndpoint:
         assert fake_adapter.last_call["prompt"] == "<image>Read the image"
         assert fake_adapter.last_call["images"] == [{"data": b"hello", "format": "png"}]
 
+    @pytest.mark.parametrize("enable_thinking", [False, True])
     def test_native_image_prompt_uses_pinned_trusted_model_tokenizer(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        enable_thinking: bool,
     ) -> None:
         config = _make_config()
         config.hf_revision = "0123456789abcdef0123456789abcdef01234567"
         assert config.tasks.generate is not None
-        config.tasks.generate.chat_template_kwargs = {"enable_thinking": False}
+        config.tasks.generate.chat_template_kwargs = {"enable_thinking": enable_thinking}
         captured: dict[str, object] = {}
 
         class _Tokenizer:
@@ -321,7 +420,7 @@ class TestGenerateEndpoint:
         assert captured["template_kwargs"] == {
             "tokenize": False,
             "add_generation_prompt": True,
-            "enable_thinking": False,
+            "enable_thinking": enable_thinking,
         }
 
     def test_native_image_prompt_coalesces_and_caches_tokenizer_loads(

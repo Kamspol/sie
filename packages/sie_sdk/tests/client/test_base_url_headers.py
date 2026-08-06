@@ -129,6 +129,7 @@ def test_sync_adversarial_ref_origins_stay_bare(ref: str) -> None:
         ({"Bad\nName": "value"}, ValueError),
         ({"X-Edge": "value\r\ninjected: yes"}, ValueError),
         ({"Authorization": "other"}, ValueError),
+        ({"Idempotency-Key": "edge-owned"}, ValueError),
         ({"Keep-Alive": "timeout=5"}, ValueError),
         ({"TE": "trailers"}, ValueError),
         ({"Trailer": "X-Checksum"}, ValueError),
@@ -140,6 +141,11 @@ def test_sync_adversarial_ref_origins_stay_bare(ref: str) -> None:
 def test_sync_rejects_unsafe_base_url_headers(headers: Any, error: type[Exception]) -> None:
     with patch("sie_sdk.client.sync.httpx.Client"), pytest.raises(error):
         SIEClient(BASE_URL, base_url_headers=headers)
+
+
+def test_async_rejects_edge_header_that_would_override_connector_idempotency() -> None:
+    with pytest.raises(ValueError, match="SDK-owned header"):
+        SIEAsyncClient(BASE_URL, base_url_headers={"idempotency-key": "edge-owned"})
 
 
 @pytest.mark.parametrize(

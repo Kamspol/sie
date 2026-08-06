@@ -130,6 +130,8 @@ static OPENAPI_JSON: LazyLock<String> = LazyLock::new(|| {
         GenerateUsage,
         ChatCompletionRequest,
         ChatCompletionMessage,
+        ChatTemplateKwargs,
+        GuardianChatTemplateConfig,
         ChatCompletionResponse,
         ChatCompletionChoice,
         ChatCompletionChoiceMessage,
@@ -909,6 +911,25 @@ fn patch_completions_request_schema(value: &mut Value) {
         return;
     };
     properties.insert(
+        "max_tokens".to_string(),
+        json!({
+            "description": "Maximum number of generated tokens. Defaults to 16 when absent or null.",
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "maximum": u32::MAX,
+        }),
+    );
+    properties.insert(
+        "temperature".to_string(),
+        json!({
+            "description": "Sampling temperature representable by the worker runtime.",
+            "type": ["number", "null"],
+            "format": "float",
+            "minimum": 0,
+            "maximum": f32::MAX,
+        }),
+    );
+    properties.insert(
         "stop".to_string(),
         json!({
             "description": "Either a string or an array of strings, mirroring OpenAI.",
@@ -962,22 +983,27 @@ fn patch_responses_request_schema(value: &mut Value) {
     else {
         return;
     };
+    schema["additionalProperties"] = json!(false);
     let Some(properties) = schema
         .get_mut("properties")
         .and_then(|properties| properties.as_object_mut())
     else {
         return;
     };
+    if let Some(model) = properties.get_mut("model") {
+        model["minLength"] = json!(1);
+    }
     // input: either a string OR an array of {role, content} messages.
     properties.insert(
         "input".to_string(),
         json!({
             "description": "Either a string prompt OR an array of `{role, content}` messages \
                             (array-input support). Array form: `role` is one of \
-                            `\"system\" | \"user\" | \"assistant\" | \"developer\"` (\"developer\" \
-                            normalizes to \"system\"). `content` is a string or an array of \
-                            text-only content parts; image parts (`image_url` / `input_image`) \
-                            reject with 400 unsupported_field. The array must not be empty.",
+                            `\"system\" | \"user\" | \"assistant\" | \"developer\"` \
+                            (\"developer\" normalizes to \"system\"). `content` is a string or \
+                            an array of `text`, `input_text`, or `output_text` parts; image parts \
+                            (`image_url` / `input_image`) reject with 400 unsupported_field. The \
+                            array must not be empty.",
             "oneOf": [
                 {"type": "string"},
                 {
@@ -985,6 +1011,7 @@ fn patch_responses_request_schema(value: &mut Value) {
                     "minItems": 1,
                     "items": {
                         "type": "object",
+                        "additionalProperties": false,
                         "required": ["role", "content"],
                         "properties": {
                             "role": {
@@ -998,11 +1025,12 @@ fn patch_responses_request_schema(value: &mut Value) {
                                         "type": "array",
                                         "items": {
                                             "type": "object",
-                                            "required": ["type"],
+                                            "additionalProperties": false,
+                                            "required": ["type", "text"],
                                             "properties": {
                                                 "type": {
                                                     "type": "string",
-                                                    "enum": ["text", "input_text"],
+                                                    "enum": ["text", "input_text", "output_text"],
                                                 },
                                                 "text": {"type": "string"},
                                             },
@@ -1014,6 +1042,25 @@ fn patch_responses_request_schema(value: &mut Value) {
                     },
                 },
             ],
+        }),
+    );
+    properties.insert(
+        "max_output_tokens".to_string(),
+        json!({
+            "description": "Maximum number of generated tokens. Defaults to 16 when absent or null.",
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "maximum": u32::MAX,
+        }),
+    );
+    properties.insert(
+        "temperature".to_string(),
+        json!({
+            "description": "Sampling temperature representable by the worker runtime.",
+            "type": ["number", "null"],
+            "format": "float",
+            "minimum": 0,
+            "maximum": f32::MAX,
         }),
     );
     properties.insert(
@@ -1150,6 +1197,71 @@ fn patch_responses_path(value: &mut Value) {
                 json!({
                     "application/json": {
                         "schema": {"$ref": "#/components/schemas/ResponsesRequest"}
+                    }
+                }),
+            );
+        }
+        if let Some(success) = op_obj
+            .get_mut("responses")
+            .and_then(|responses| responses.get_mut("200"))
+            .and_then(|response| response.as_object_mut())
+        {
+            success.insert(
+                "content".to_string(),
+                json!({
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["id", "object", "created_at", "model", "status", "output", "usage"],
+                            "properties": {
+                                "id": {"type": "string"},
+                                "object": {"type": "string", "const": "response"},
+                                "created_at": {"type": "integer"},
+                                "model": {"type": "string"},
+                                "status": {"type": "string", "const": "completed"},
+                                "output": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "required": ["type", "id", "role", "status", "content"],
+                                        "properties": {
+                                            "type": {"type": "string", "const": "message"},
+                                            "id": {"type": "string"},
+                                            "role": {"type": "string", "const": "assistant"},
+                                            "status": {"type": "string", "const": "completed"},
+                                            "content": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "additionalProperties": false,
+                                                    "required": ["type", "text", "annotations"],
+                                                    "properties": {
+                                                        "type": {"type": "string", "const": "output_text"},
+                                                        "text": {"type": "string"},
+                                                        "annotations": {
+                                                            "type": "array",
+                                                            "items": {"type": "object"},
+                                                        },
+                                                    },
+                                                },
+                                            },
+                                        },
+                                    },
+                                },
+                                "usage": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["input_tokens", "output_tokens", "total_tokens"],
+                                    "properties": {
+                                        "input_tokens": {"type": "integer", "minimum": 0},
+                                        "output_tokens": {"type": "integer", "minimum": 0},
+                                        "total_tokens": {"type": "integer", "minimum": 0},
+                                    },
+                                },
+                            },
+                        }
                     }
                 }),
             );
@@ -1931,6 +2043,30 @@ pub struct ChatCompletionMessage {
     pub tool_call_id: Option<String>,
 }
 
+/// Bounded Granite Guardian options accepted by ``chat_template_kwargs``.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GuardianChatTemplateConfig {
+    /// Non-empty Granite Guardian risk identifier, at most 128 characters.
+    #[schema(min_length = 1, max_length = 128)]
+    pub risk_name: String,
+}
+
+/// Bounded tokenizer-template options accepted from a chat request.
+///
+/// Unknown keys are rejected at the gateway instead of being forwarded to a
+/// tokenizer implementation as arbitrary keyword arguments.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChatTemplateKwargs {
+    /// Qwen-family switch controlling whether the template opens a thinking block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_thinking: Option<bool>,
+    /// Granite Guardian risk selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_config: Option<GuardianChatTemplateConfig>,
+}
+
 /// OpenAI-compatible ``POST /v1/chat/completions`` request.
 ///
 /// **Strict allow-list:** unknown top-level fields reject with 400
@@ -1993,16 +2129,13 @@ pub struct ChatCompletionRequest {
     /// under greedy decode). Absent → sampler default (no minimum).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_tokens: Option<u32>,
-    /// Per-request overrides for kwargs passed to the tokenizer's
-    /// ``apply_chat_template`` call. Object whose entries are merged on
-    /// top of the model YAML's ``chat_template_kwargs`` (the YAML wins
-    /// for keys present in both — adjust the YAML when a request needs
-    /// to defeat a baked-in default). Typical use: pass
-    /// ``{"enable_thinking": false}`` to the Qwen3 family to suppress
-    /// ``<think>`` reasoning on a per-request basis. Absent → only the
-    /// model YAML's defaults apply.
+    /// Per-request overrides from the bounded tokenizer-template contract.
+    /// Only ``enable_thinking`` and ``guardian_config.risk_name`` are
+    /// accepted; unknown keys reject with 400 instead of reaching
+    /// ``apply_chat_template``. Values are merged under the model YAML's
+    /// operator-owned defaults, which win on conflict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chat_template_kwargs: Option<Value>,
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
     /// Number of candidate completions, ``[1, 128]``. ``n>1`` returns a
     /// multi-entry ``choices`` array. Streaming with ``n>1`` is supported:
     /// per-``choice_index`` delta chunks plus per-choice closure chunks
@@ -2225,10 +2358,9 @@ pub struct ResponsesRequest {
     pub model: String,
     /// Either a string prompt OR an array of ``{role, content}`` messages
     /// (array-input support). Array form: ``role`` is one of
-    /// ``"system" | "user" | "assistant" | "developer"`` (``"tool"`` is
-    /// nominally accepted but Responses tools are rejected so it is
-    /// effectively unreachable). ``content`` is a string or an array of
-    /// text-only content parts; image parts reject.
+    /// ``"system" | "user" | "assistant" | "developer"``.
+    /// ``content`` is a string or an array of text-only content parts; image
+    /// parts reject.
     pub input: Value,
     /// Defaults to 16 (mirroring completions) when absent. Positive integer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3241,6 +3373,53 @@ mod tests {
         let user_description = properties["user"]["description"].as_str().unwrap();
         assert!(user_description.contains("Sensitive PII"));
         assert!(!user_description.contains("Logged at debug level"));
+    }
+
+    #[test]
+    fn openapi_json_documents_strict_responses_contract() {
+        let spec: serde_json::Value = serde_json::from_str(&OPENAPI_JSON).unwrap();
+        let request = &spec["components"]["schemas"]["ResponsesRequest"];
+
+        assert_eq!(request["additionalProperties"], false);
+        assert_eq!(request["properties"]["model"]["minLength"], 1);
+        assert_eq!(request["properties"]["max_output_tokens"]["minimum"], 1);
+        assert_eq!(
+            request["properties"]["max_output_tokens"]["maximum"],
+            u32::MAX
+        );
+        let message = &request["properties"]["input"]["oneOf"][1]["items"];
+        assert_eq!(message["additionalProperties"], false);
+        assert!(!message["properties"]["role"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|role| role == "tool"));
+        let part = &message["properties"]["content"]["oneOf"][1]["items"];
+        assert_eq!(part["additionalProperties"], false);
+        assert_eq!(part["required"], json!(["type", "text"]));
+        assert!(part["properties"]["type"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|part_type| part_type == "output_text"));
+
+        let response = &spec["paths"]["/v1/responses"]["post"]["responses"]["200"]["content"]
+            ["application/json"]["schema"];
+        assert_eq!(response["additionalProperties"], false);
+        assert_eq!(response["properties"]["object"]["const"], "response");
+        assert_eq!(
+            response["properties"]["output"]["items"]["properties"]["content"]["items"]
+                ["properties"]["type"]["const"],
+            "output_text"
+        );
+        assert_eq!(
+            response["properties"]["usage"]["required"],
+            json!(["input_tokens", "output_tokens", "total_tokens"])
+        );
+        assert!(spec["paths"]["/v1/responses"]["post"]["responses"]
+            .as_object()
+            .unwrap()
+            .contains_key("413"));
     }
 
     #[test]

@@ -190,6 +190,7 @@ profiles:
     adapter_path: "sie_server.adapters.sglang.generation:SGLangGenerationAdapter"
     max_batch_tokens: 32768
     kv_budget_tokens: 65536
+    max_output_tokens: 16384
     adapter_options:
       loadtime:
         max_seq_length: 32768
@@ -222,8 +223,10 @@ profiles:
         assert long_startup_variant.tasks.generate is not None
         assert extended_startup_variant.tasks.generate is not None
         assert base.tasks.generate.context_length == 4096
+        assert base.tasks.generate.max_output_tokens == 4096
         assert base.max_sequence_length == 4096
         assert variant.tasks.generate.context_length == 32768
+        assert variant.tasks.generate.max_output_tokens == 16384
         assert variant.max_sequence_length == 32768
         assert long_startup_variant.tasks.generate.context_length == 32768
         assert long_startup_variant.max_sequence_length == 32768
@@ -249,6 +252,122 @@ profiles:
         assert extended_startup_variant._resolved_lock is not base._resolved_lock
         assert extended_startup_variant._resolved_lock is not variant._resolved_lock
         assert extended_startup_variant._resolved_lock is not long_startup_variant._resolved_lock
+
+    def test_profile_chat_template_kwargs_are_promoted_to_variant_task(self, tmp_path: Path) -> None:
+        """A profile can opt into thinking without changing the bare model default."""
+        (tmp_path / "thinking.yaml").write_text("""
+sie_id: org/reasoning-model
+hf_id: org/reasoning-model
+tasks:
+  generate:
+    context_length: 8192
+    max_output_tokens: 4096
+    chat_template_kwargs:
+      enable_thinking: false
+      guardian_config:
+        risk_name: base
+max_sequence_length: 8192
+profiles:
+  default:
+    adapter_path: "sie_server.adapters.sglang.generation:SGLangGenerationAdapter"
+    max_batch_tokens: 16384
+    kv_budget_tokens: 8192
+  thinking:
+    extends: default
+    chat_template_kwargs:
+      enable_thinking: true
+""")
+
+        configs = load_model_configs(tmp_path)
+
+        base = configs["org/reasoning-model"]
+        thinking = configs["org/reasoning-model:thinking"]
+        assert base.tasks.generate is not None
+        assert thinking.tasks.generate is not None
+        assert base.tasks.generate.chat_template_kwargs == {
+            "enable_thinking": False,
+            "guardian_config": {"risk_name": "base"},
+        }
+        assert thinking.tasks.generate.chat_template_kwargs == {
+            "enable_thinking": True,
+            "guardian_config": {"risk_name": "base"},
+        }
+        assert thinking.resolve_profile("default").chat_template_kwargs == {
+            "enable_thinking": True,
+        }
+
+    def test_default_profile_chat_template_kwargs_are_promoted_to_bare_task(self, tmp_path: Path) -> None:
+        """The bare identity materializes tokenizer presets declared on its default profile."""
+        (tmp_path / "default-thinking.yaml").write_text("""
+sie_id: org/default-reasoning-model
+hf_id: org/default-reasoning-model
+tasks:
+  generate:
+    context_length: 8192
+    max_output_tokens: 4096
+    chat_template_kwargs:
+      guardian_config:
+        risk_name: base
+profiles:
+  default:
+    adapter_path: "sie_server.adapters.sglang.generation:SGLangGenerationAdapter"
+    max_batch_tokens: 16384
+    kv_budget_tokens: 8192
+    max_output_tokens: 8192
+    chat_template_kwargs:
+      enable_thinking: true
+""")
+
+        configs = load_model_configs(tmp_path)
+
+        bare = configs["org/default-reasoning-model"]
+        assert bare.tasks.generate is not None
+        assert bare.tasks.generate.chat_template_kwargs == {
+            "guardian_config": {"risk_name": "base"},
+            "enable_thinking": True,
+        }
+        assert bare.tasks.generate.max_output_tokens == 8192
+        assert bare.resolve_profile("default").max_output_tokens == 8192
+        assert bare.resolve_profile("default").chat_template_kwargs == {
+            "enable_thinking": True,
+        }
+
+    def test_default_profile_chat_template_kwargs_do_not_bleed_into_standalone_variant(self, tmp_path: Path) -> None:
+        """Standalone variants start from model task defaults, not the default profile."""
+        (tmp_path / "standalone-long-context.yaml").write_text("""
+sie_id: org/reasoning-model
+hf_id: org/reasoning-model
+tasks:
+  generate:
+    context_length: 8192
+    max_output_tokens: 4096
+    chat_template_kwargs:
+      enable_thinking: false
+profiles:
+  default:
+    adapter_path: "sie_server.adapters.sglang.generation:SGLangGenerationAdapter"
+    max_batch_tokens: 16384
+    kv_budget_tokens: 8192
+    chat_template_kwargs:
+      enable_thinking: true
+  long-context:
+    adapter_path: "sie_server.adapters.sglang.generation:SGLangGenerationAdapter"
+    max_batch_tokens: 32768
+    kv_budget_tokens: 32768
+    adapter_options:
+      loadtime:
+        max_seq_length: 32768
+""")
+
+        configs = load_model_configs(tmp_path)
+
+        bare = configs["org/reasoning-model"]
+        long_context = configs["org/reasoning-model:long-context"]
+        assert bare.tasks.generate is not None
+        assert long_context.tasks.generate is not None
+        assert bare.tasks.generate.chat_template_kwargs == {"enable_thinking": True}
+        assert long_context.tasks.generate.chat_template_kwargs == {"enable_thinking": False}
+        assert long_context.tasks.generate.context_length == 32768
 
     def test_missing_models_dir(self, tmp_path: Path) -> None:
         """Raises FileNotFoundError for missing models directory."""

@@ -408,6 +408,150 @@ class GenerateResponseModel(BaseModel):
     usage: GenerateUsageModel = Field(..., description="Token usage")
 
 
+class OpenAICompletionStreamOptionsModel(BaseModel):
+    """Supported OpenAI legacy-completions stream controls."""
+
+    include_usage: bool | None = Field(
+        default=None,
+        description="Emit one usage-only chunk immediately before the [DONE] terminator",
+    )
+    model_config = {"extra": "forbid"}
+
+
+class OpenAICompletionRequestModel(BaseModel):
+    """Strict single-candidate subset of the OpenAI legacy Completions API."""
+
+    model: str = Field(..., min_length=1, description="Generation model id")
+    prompt: str | list[str] = Field(
+        ...,
+        description="One raw prompt string, or a one-element string array; no chat template is applied",
+    )
+    max_tokens: int | None = Field(
+        default=16,
+        ge=1,
+        le=(1 << 32) - 1,
+        description="Maximum generated tokens",
+    )
+    temperature: float | None = Field(
+        default=None,
+        ge=0,
+        le=3.4028234663852886e38,
+        description="Sampling temperature override",
+    )
+    top_p: float | None = Field(default=None, gt=0, le=1, description="Nucleus-sampling probability override")
+    stop: str | list[str] | None = Field(default=None, description="One stop sequence or an array of stop sequences")
+    frequency_penalty: float | None = Field(default=None, ge=-2, le=2, description="Frequency penalty")
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2, description="Presence penalty")
+    seed: int | None = Field(
+        default=None,
+        ge=-(1 << 63),
+        le=(1 << 63) - 1,
+        description="Optional signed 64-bit sampling seed",
+        json_schema_extra={"format": "int64"},
+    )
+    stream: bool | None = Field(default=None, description="Return OpenAI text_completion Server-Sent Events")
+    stream_options: OpenAICompletionStreamOptionsModel | None = None
+    n: Literal[1] | None = Field(default=None, description="Only one completion candidate is supported")
+    model_config = {"extra": "forbid"}
+
+
+class OpenAICompletionChoiceModel(BaseModel):
+    """One choice in a blocking OpenAI legacy completion."""
+
+    text: str
+    index: int
+    finish_reason: str
+
+
+class OpenAICompletionResponseModel(BaseModel):
+    """Blocking OpenAI legacy-completions response."""
+
+    id: str
+    object: Literal["text_completion"]
+    created: int
+    model: str
+    choices: list[OpenAICompletionChoiceModel]
+    system_fingerprint: str | None = None
+    usage: GenerateUsageModel
+
+
+class OpenAIResponseInputContentPartModel(BaseModel):
+    """One text-only content part accepted by the Responses MVP."""
+
+    type: Literal["text", "input_text", "output_text"]
+    text: str
+    model_config = {"extra": "forbid"}
+
+
+class OpenAIResponseInputMessageModel(BaseModel):
+    """One stateless text message accepted by the Responses MVP."""
+
+    role: Literal["system", "user", "assistant", "developer"]
+    content: str | list[OpenAIResponseInputContentPartModel]
+    model_config = {"extra": "forbid"}
+
+
+class OpenAIResponsesRequestModel(BaseModel):
+    """Strict stateless, text-only subset of the OpenAI Responses API."""
+
+    model: str = Field(..., min_length=1, description="Generation model id")
+    input: str | Annotated[list[OpenAIResponseInputMessageModel], Field(min_length=1)]
+    max_output_tokens: int | None = Field(
+        default=16,
+        ge=1,
+        le=(1 << 32) - 1,
+        description="Maximum generated tokens",
+    )
+    temperature: float | None = Field(
+        default=None,
+        ge=0,
+        le=3.4028234663852886e38,
+        description="Sampling temperature override",
+    )
+    top_p: float | None = Field(default=None, gt=0, le=1, description="Nucleus-sampling probability override")
+    seed: int | None = Field(
+        default=None,
+        ge=-(1 << 63),
+        le=(1 << 63) - 1,
+        description="Optional signed 64-bit sampling seed",
+        json_schema_extra={"format": "int64"},
+    )
+    stream: Literal[False] | None = Field(default=None, description="Responses streaming is not supported")
+    model_config = {"extra": "forbid"}
+
+
+class OpenAIResponseOutputTextModel(BaseModel):
+    type: Literal["output_text"]
+    text: str
+    annotations: list[dict[str, Any]]
+
+
+class OpenAIResponseOutputMessageModel(BaseModel):
+    type: Literal["message"]
+    id: str
+    role: Literal["assistant"]
+    status: Literal["completed"]
+    content: list[OpenAIResponseOutputTextModel]
+
+
+class OpenAIResponseUsageModel(BaseModel):
+    input_tokens: int = Field(..., ge=0)
+    output_tokens: int = Field(..., ge=0)
+    total_tokens: int = Field(..., ge=0)
+
+
+class OpenAIResponsesResponseModel(BaseModel):
+    """One completed direct OpenAI Responses result."""
+
+    id: str
+    object: Literal["response"]
+    created_at: int
+    model: str
+    status: Literal["completed"]
+    output: list[OpenAIResponseOutputMessageModel]
+    usage: OpenAIResponseUsageModel
+
+
 class GenerateInputTooLongDetailModel(BaseModel):
     """Detail returned when a generation prompt exceeds the worker limit."""
 

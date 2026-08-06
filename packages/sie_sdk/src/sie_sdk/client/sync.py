@@ -45,7 +45,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from functools import partial
 from pathlib import Path
 from typing import IO, Any, Literal, Self, cast, overload
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import httpx
 import msgpack
@@ -55,7 +55,15 @@ from sie_sdk.audio import convert_item_audio
 from sie_sdk.documents import convert_item_document
 from sie_sdk.files import resolve_upload
 from sie_sdk.images import ImageLike, convert_images_for_json, convert_item_images
-from sie_sdk.jobs import TERMINAL_JOB_STATES, build_job_body, decode_chunk_bytes, job_chunks
+from sie_sdk.jobs import (
+    TERMINAL_JOB_STATES,
+    build_job_body,
+    decode_chunk_bytes,
+    job_chunks,
+    require_connection_name,
+    require_connection_schema_policy,
+    require_connector_idempotency_key,
+)
 from sie_sdk.types import (
     Batch,
     BatchList,
@@ -99,6 +107,7 @@ from ._shared import (
     ESTIMATE_PATH,
     HTTP_CLIENT_ERROR,
     HTTP_GATEWAY_TIMEOUT,
+    HTTP_SERVICE_UNAVAILABLE,
     JSON_CONTENT_TYPE,
     LORA_LOADING_DEFAULT_DELAY_S,
     LORA_LOADING_ERROR_CODE,
@@ -2829,10 +2838,11 @@ class SIEClient:
         """Open an SSE stream (with pre-stream provisioning retry) and yield chunks.
 
         Shared by :meth:`stream_chat_completions` and :meth:`stream_generate`.
-        Only the *pre-stream* response is retried (503 PROVISIONING / MODEL_LOADING); once bytes start
-        flowing a failure is terminal (non-idempotent). Yielding inside the
-        ``with`` keeps the stream open while the caller consumes it; an early
-        ``break`` tears the context down and the worker sees the disconnect.
+        Pre-execution capacity errors are retried when they arrive either as
+        an HTTP 503 or as the first SSE event. Once a chunk has been yielded a
+        failure is terminal (non-idempotent). Yielding inside the ``with``
+        keeps the stream open while the caller consumes it; an early ``break``
+        tears the context down and the worker sees the disconnect.
         """
         self._reset_retry_count()
         timeout = provision_timeout_s if provision_timeout_s is not None else DEFAULT_PROVISION_TIMEOUT_S
@@ -2865,6 +2875,7 @@ class SIEClient:
                         self._record_retry()
                     else:
                         self._check_server_version(response)
+                        yielded_chunk = False
                         for payload in iter_sse_payloads(response.iter_lines()):
                             try:
                                 chunk = json.loads(payload)
@@ -2875,9 +2886,28 @@ class SIEClient:
                                 err = sse_chunk_error(chunk)
                                 if err is not None:
                                     code, message = err
+                                    if not yielded_chunk:
+                                        capacity_response = httpx.Response(
+                                            HTTP_SERVICE_UNAVAILABLE,
+                                            json={"error": {"code": code, "message": message}},
+                                        )
+                                        retry_delay, oom_retries = next_stream_retry_delay(
+                                            capacity_response,
+                                            model=model,
+                                            gpu=resolved_gpu,
+                                            wait_for_capacity=wait_for_capacity,
+                                            start_time=start_time,
+                                            timeout=timeout,
+                                            oom_retries=oom_retries,
+                                            max_oom_retries=max_oom_retries,
+                                        )
+                                        self._record_retry()
+                                        break
                                     raise ServerError(message, code=code)
                             yield chunk
-                        return
+                            yielded_chunk = True
+                        else:
+                            return
             except httpx.ConnectError as e:
                 if wait_for_capacity and is_transient_connect_error(e):
                     delay_s = compute_retry_delay(
@@ -3256,11 +3286,14 @@ class _SyncNamespace:
         url: str,
         *,
         json_body: Any = None,
+        request_headers: Mapping[str, str] | None = None,
         timeout_s: float | None = None,
         include_base_url_headers: bool = True,
     ) -> Any:
         """One JSON request over the client's httpx transport (bearer auth reused)."""
         headers = {"Accept": JSON_CONTENT_TYPE, "Content-Type": JSON_CONTENT_TYPE}
+        if request_headers:
+            headers.update(request_headers)
         try:
             response = self._c._client.request(
                 method,
@@ -3305,25 +3338,34 @@ class _SyncJobs(_SyncNamespace):
         sink_connection: str | None = None,
         field_map: Mapping[str, Any] | None = None,
         output_field: str | None = None,
+        execution: Literal["plan", "run"] | None = None,
         when: Any = None,
         output_types: Sequence[str] | None = None,
         options: Mapping[str, Any] | None = None,
-    ) -> JobSubmitResult:
-        """Submit a batch job (``POST /v1/jobs``); returns the created-job envelope.
+        idempotency_key: str | None = None,
+    ) -> JobSubmitResult | JobStatus:
+        """Submit a batch job (``POST /v1/jobs``).
+
+        Returns the created-job envelope, or the current :class:`JobStatus`
+        when an exact connector idempotency replay has already progressed.
 
         ``source`` is either inline items (a list, or a bare string = one text
         item) or a connector ``scheme://<connection>/…`` URI (incl.
         the internal ``upload://<file-id>`` push-to-us source); ``sink``
-        is ``"return"`` (default), ``"inplace"``, or a connector URI; ``when`` is
-        ``"now"`` (default), ``"schedule:<cron>"``, or ``"watch:<source>"``.
+        is ``"return"`` (default), ``"inplace"``, or a connector URI. Jobs are
+        immediate: omit ``when`` or pass ``"now"``; schedule/watch are not yet
+        part of the public jobs schema.
         ``field_map`` names the uniform source slots
         (``{"id_field", "input_field", "carry", "input_type"}``) and
         ``output_field`` the sink target — connector jobs only; the
-        per-connector URI params keep working as aliases. ``options`` carries
-        the per-item options plus the op inputs (operation matrix:
+        per-connector URI params keep working as aliases. ``options`` is one
+        job-level operation map applied uniformly to every item (operation matrix:
         score → ``options["query"]``, extract → ``options["labels"]`` /
         ``options["output_schema"]``, generate → sampling such as
         ``max_new_tokens``), forwarded as-is.
+        Connector submissions require a caller-owned, retry-stable
+        ``idempotency_key``; inline submissions remain header-free and must
+        omit it.
         """
         body = build_job_body(
             source=source,
@@ -3334,15 +3376,28 @@ class _SyncJobs(_SyncNamespace):
             sink_connection=sink_connection,
             field_map=field_map,
             output_field=output_field,
+            execution=execution,
             when=when,
             output_types=output_types,
             options=options,
         )
-        return self._request_json("POST", "/v1/jobs", json_body=body, timeout_s=max(self._c._timeout, 120.0))
+        request_headers = None
+        if "src" in body:
+            request_headers = {"Idempotency-Key": require_connector_idempotency_key(idempotency_key)}
+        elif idempotency_key is not None:
+            msg = "idempotency_key applies only to connector-src jobs; inline items must omit it"
+            raise ValueError(msg)
+        return self._request_json(
+            "POST",
+            "/v1/jobs",
+            json_body=body,
+            request_headers=request_headers,
+            timeout_s=max(self._c._timeout, 120.0),
+        )
 
     def get(self, job_id: str) -> JobStatus:
         """Fetch a job's public status doc (``GET /v1/jobs/{id}``)."""
-        return self._request_json("GET", f"/v1/jobs/{job_id}")
+        return self._request_json("GET", f"/v1/jobs/{quote(job_id, safe='')}")
 
     def list(self) -> Sequence[JobStatus]:
         """List the org's jobs (``GET /v1/jobs``; scoped to the key's org)."""
@@ -3353,7 +3408,34 @@ class _SyncJobs(_SyncNamespace):
 
     def cancel(self, job_id: str) -> JobStatus:
         """Cancel a job (``POST /v1/jobs/{id}/cancel``); the hold's remainder releases."""
-        return self._request_json("POST", f"/v1/jobs/{job_id}/cancel")
+        return self._request_json("POST", f"/v1/jobs/{quote(job_id, safe='')}/cancel")
+
+    def execute(self, job_id: str, plan_revision: int, idempotency_key: str) -> JobStatus:
+        """Confirm one exact connector plan revision for execution."""
+        return self._request_json(
+            "POST",
+            f"/v1/jobs/{quote(job_id, safe='')}/execute",
+            json_body={"plan_revision": plan_revision},
+            request_headers={"Idempotency-Key": require_connector_idempotency_key(idempotency_key)},
+        )
+
+    def repair(
+        self,
+        job_id: str,
+        plan_revision: int,
+        recovery_attempt_ordinal: int,
+        idempotency_key: str,
+    ) -> JobStatus:
+        """Repair one exact recovery-required connector attempt and cutoff."""
+        return self._request_json(
+            "POST",
+            f"/v1/jobs/{quote(job_id, safe='')}/repair",
+            json_body={
+                "plan_revision": plan_revision,
+                "recovery_attempt_ordinal": recovery_attempt_ordinal,
+            },
+            request_headers={"Idempotency-Key": require_connector_idempotency_key(idempotency_key)},
+        )
 
     def results(self, job_id: str) -> JobResults:
         """Retrieve a finished job's chunk refs and decode the per-item results.
@@ -3383,11 +3465,11 @@ class _SyncJobs(_SyncNamespace):
         }
 
     def wait(self, job_id: str, *, timeout_s: float = 600.0, poll_s: float = 2.0) -> JobStatus:
-        """Poll ``get`` until the job reaches a terminal state or ``timeout_s`` elapses."""
+        """Poll until terminal, or return a connector plan at its stable planned phase."""
         deadline = time.monotonic() + timeout_s
         while True:
             job = self.get(job_id)
-            if job.get("state") in TERMINAL_JOB_STATES:
+            if job.get("state") in TERMINAL_JOB_STATES or job.get("phase") == "planned":
                 return job
             if time.monotonic() >= deadline:
                 msg = f"job {job_id} still {job.get('state')!r} after {timeout_s:.0f}s"
@@ -3440,9 +3522,27 @@ class _SyncConnections(_SyncNamespace):
             raise ValueError(msg)
         return f"{self._c._control_plane_url}/internal/orgs/{self._c._org}/connections"
 
-    def add(self, name: str, type: str, secret: str) -> ConnectionCreated:
-        """Create an org-scoped connection (connector auth). ``type`` is the connector family."""
-        body = {"type": type, "name": name, "secret": secret}
+    def add(
+        self,
+        name: str,
+        type: str,
+        secret: str,
+        *,
+        source_schema: str | None = None,
+        sink_schema: str | None = None,
+    ) -> ConnectionCreated:
+        """Create an org-scoped connection (connector auth).
+
+        PostgreSQL connections may bind an immutable ``source_schema`` /
+        ``sink_schema`` policy. Both schema names must be supplied together;
+        legacy connections without the policy remain ineligible for the strong
+        incremental planner profile.
+        """
+        require_connection_name(name)
+        body: dict[str, Any] = {"type": type, "name": name, "secret": secret}
+        schema_policy = require_connection_schema_policy(type, source_schema, sink_schema)
+        if schema_policy is not None:
+            body["source_schema"], body["sink_schema"] = schema_policy
         return self._request_json("POST", self._base(), json_body=body, include_base_url_headers=False)
 
     def list(self) -> Sequence[Connection]:
@@ -3454,7 +3554,8 @@ class _SyncConnections(_SyncNamespace):
 
     def revoke(self, name: str) -> ConnectionRevoked:
         """Revoke (soft-delete) a connection; frees the name for reuse."""
-        return self._request_json("DELETE", f"{self._base()}/{name}", include_base_url_headers=False)
+        canonical_name = require_connection_name(name)
+        return self._request_json("DELETE", f"{self._base()}/{canonical_name}", include_base_url_headers=False)
 
 
 # ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@ import msgpack
 import numpy as np
 import pytest
 from sie_sdk import build_job_body, connection_name
-from sie_sdk.jobs import decode_chunk_bytes, decode_result_item, job_chunks
+from sie_sdk.jobs import decode_chunk_bytes, decode_result_item, job_chunks, require_connector_idempotency_key
 
 
 def test_inline_list_source_becomes_items() -> None:
@@ -26,12 +26,33 @@ def test_connector_uri_source_derives_connection() -> None:
         operation="encode",
         model="m",
         sink="postgres://warehouse?table=vecs",
+        execution="plan",
     )
     assert body["src"] == "postgres://warehouse?query=SELECT+1"
     assert body["connection"] == "warehouse"
     assert body["sink"] == "postgres://warehouse?table=vecs"
+    assert body["execution"] == "plan"
     # Same-store sink reuses the source connection — no redundant sink_connection.
     assert "sink_connection" not in body
+
+
+def test_connector_requires_explicit_execution_and_inline_rejects_it() -> None:
+    with pytest.raises(ValueError, match="require execution"):
+        build_job_body(
+            source="postgres://warehouse?query=SELECT+1",
+            operation="encode",
+            model="m",
+            sink="postgres://warehouse?table=vecs",
+        )
+    with pytest.raises(ValueError, match="only to connector"):
+        build_job_body(source=["a"], operation="encode", model="m", execution="plan")
+
+
+@pytest.mark.parametrize("key", [None, "", "line\nbreak", "café", "x" * 257])
+def test_connector_idempotency_key_matches_gateway_header_contract(key: str | None) -> None:
+    with pytest.raises(ValueError, match="printable ASCII"):
+        require_connector_idempotency_key(key)
+    assert require_connector_idempotency_key("logical-retry-1") == "logical-retry-1"
 
 
 def test_distinct_sink_threads_sink_connection() -> None:
@@ -40,6 +61,7 @@ def test_distinct_sink_threads_sink_connection() -> None:
         operation="encode",
         model="m",
         sink="s3://out-bucket/vecs",
+        execution="run",
     )
     assert body["sink_connection"] == "out-bucket"
 
@@ -52,13 +74,16 @@ def test_explicit_connection_overrides_derived() -> None:
         sink="postgres://wh?table=t",
         connection="prod-wh",
         sink_connection="prod-wh",
+        execution="run",
     )
     assert body["connection"] == "prod-wh"
     assert body["sink_connection"] == "prod-wh"
 
 
 def test_inplace_sink_sentinel() -> None:
-    body = build_job_body(source="postgres://wh?query=x", operation="encode", model="m", sink="inplace")
+    body = build_job_body(
+        source="postgres://wh?query=x", operation="encode", model="m", sink="inplace", execution="run"
+    )
     assert body["sink"] == "inplace"
 
 
@@ -72,9 +97,6 @@ def test_return_sink_is_omitted() -> None:
     [
         ("now", {}),
         (None, {}),
-        ("schedule:*/5 * * * *", {"when": "schedule", "schedule": "*/5 * * * *"}),
-        ("*/5 * * * *", {"when": "schedule", "schedule": "*/5 * * * *"}),
-        ("watch:s3://in", {"when": "watch", "watch": "s3://in"}),
     ],
 )
 def test_when_trigger_mapping(when: str | None, expected: dict[str, str]) -> None:
@@ -83,6 +105,12 @@ def test_when_trigger_mapping(when: str | None, expected: dict[str, str]) -> Non
         assert body[key] == value
     if not expected:
         assert "when" not in body
+
+
+@pytest.mark.parametrize("when", ["schedule:*/5 * * * *", "*/5 * * * *", "watch:s3://in"])
+def test_unavailable_when_trigger_is_rejected(when: str) -> None:
+    with pytest.raises(ValueError, match="not available"):
+        build_job_body(source=["a"], operation="encode", model="m", when=when)
 
 
 def test_output_types_ride_only_when_set() -> None:
@@ -100,6 +128,7 @@ def test_options_forward_op_inputs_as_is() -> None:
         operation="score",
         model="BAAI/bge-m3",
         sink="postgres://wh?table=scores",
+        execution="run",
         options={"query": "rank these documents"},
     )
     assert score["options"] == {"query": "rank these documents"}
@@ -119,6 +148,7 @@ def test_options_forward_op_inputs_as_is() -> None:
         operation="generate",
         model="Qwen/Qwen3-4B-Instruct-2507",
         sink="postgres://wh?table=docs&mode=inplace&column=summary",
+        execution="run",
         options={"max_new_tokens": 64, "temperature": 0.0},
     )
     assert generate["options"] == {"max_new_tokens": 64, "temperature": 0.0}
@@ -152,6 +182,7 @@ def test_field_map_and_output_field_ride_connector_jobs() -> None:
         field_map={"id_field": "id", "input_field": "body", "carry": ["source_url"], "input_type": "text"},
         sink="postgres://wh?table=doc_vectors",
         output_field="embedding",
+        execution="plan",
     )
     assert body["field_map"] == {
         "id_field": "id",
@@ -169,12 +200,18 @@ def test_field_map_omitted_keys_do_not_ride() -> None:
         model="m",
         sink="postgres://wh?table=t",
         field_map={"id_field": "id"},
+        execution="plan",
     )
     assert body["field_map"] == {"id_field": "id"}
     assert "output_field" not in body
     # An all-empty field_map rides nothing (additive-only wire).
     body = build_job_body(
-        source="postgres://wh?query=x", operation="encode", model="m", sink="postgres://wh?table=t", field_map={}
+        source="postgres://wh?query=x",
+        operation="encode",
+        model="m",
+        sink="postgres://wh?table=t",
+        field_map={},
+        execution="plan",
     )
     assert "field_map" not in body
 
@@ -195,6 +232,7 @@ def test_bad_field_map_raises(field_map: dict, match: str) -> None:
             model="m",
             sink="postgres://wh?table=t",
             field_map=field_map,
+            execution="plan",
         )
 
 
@@ -203,6 +241,20 @@ def test_field_map_on_inline_items_raises() -> None:
         build_job_body(source=["a"], operation="encode", model="m", field_map={"id_field": "id"})
     with pytest.raises(ValueError, match="connector-src"):
         build_job_body(source=["a"], operation="encode", model="m", output_field="embedding")
+
+
+@pytest.mark.parametrize(
+    "connector_fields",
+    [
+        {"sink": "inplace"},
+        {"sink": "postgres://wh?table=vecs"},
+        {"sink_connection": "wh"},
+        {"connection": "wh"},
+    ],
+)
+def test_connector_fields_on_inline_items_raise(connector_fields: dict[str, str]) -> None:
+    with pytest.raises(ValueError, match="connector-src"):
+        build_job_body(source=["a"], operation="encode", model="m", **connector_fields)
 
 
 # ---- §4.5.4 upload:// (internal scheme — no connection derived) ----------------
@@ -215,11 +267,23 @@ def test_upload_source_derives_no_connection() -> None:
         model="m",
         sink="upload://file-out",
         field_map={"id_field": "doc_id", "input_field": "text", "input_type": "text"},
+        execution="run",
     )
     assert body["src"] == "upload://file-abc?format=csv"
     assert body["sink"] == "upload://file-out"
     assert "connection" not in body
     assert "sink_connection" not in body
+
+
+def test_upload_connector_is_run_only() -> None:
+    with pytest.raises(ValueError, match="run-only"):
+        build_job_body(
+            source="upload://file-abc",
+            operation="encode",
+            model="m",
+            sink="upload://file-out",
+            execution="plan",
+        )
 
 
 def test_upload_source_to_external_sink_threads_sink_connection() -> None:
@@ -229,6 +293,7 @@ def test_upload_source_to_external_sink_threads_sink_connection() -> None:
         model="m",
         sink="postgres://wh?table=doc_vectors",
         sink_connection="wh",
+        execution="run",
     )
     assert "connection" not in body
     assert body["sink_connection"] == "wh"
@@ -249,6 +314,43 @@ def test_bad_sink_raises() -> None:
 )
 def test_connection_name(uri: str, expected: str) -> None:
     assert connection_name(uri) == expected
+
+
+@pytest.mark.parametrize(
+    "invalid_name",
+    [
+        "../other",
+        "warehouse/name",
+        r"warehouse\name",
+        "warehouse%2fname",
+        "warehouse\n",
+        "warehouse\r",
+        "warehouse\u2028",
+        "_warehouse",
+        "café",
+        "a" * 129,
+    ],
+)
+def test_connector_connection_names_are_canonical(invalid_name: str) -> None:
+    if invalid_name != "warehouse/name":
+        with pytest.raises(ValueError, match="connection name"):
+            connection_name(f"postgres://{invalid_name}?query=x")
+    with pytest.raises(ValueError, match="connection name"):
+        build_job_body(
+            source="postgres://warehouse?query=x",
+            operation="encode",
+            model="m",
+            sink="postgres://warehouse?table=out",
+            connection=invalid_name,
+        )
+    with pytest.raises(ValueError, match="connection name"):
+        build_job_body(
+            source="postgres://warehouse?query=x",
+            operation="encode",
+            model="m",
+            sink="postgres://warehouse?table=out",
+            sink_connection=invalid_name,
+        )
 
 
 def _chunk_bytes(n: int, dims: int) -> bytes:

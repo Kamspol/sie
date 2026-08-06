@@ -53,8 +53,14 @@ from sie_server.adapters._generation_base import (
     FinishReason,
     GenerationAdapter,
     GenerationChunk,
+    ReasoningFormat,
     ToolCallDelta,
+    reasoning_starts_in_prompt,
+    resolve_reasoning_format,
+    suppress_thinking_blocks,
+    thinking_blocks_must_be_hidden,
 )
+from sie_server.config.model import validate_chat_template_kwargs
 from sie_server.core.runtime_options import apply_generation_runtime_options
 from sie_server.core.text_tokens import estimate_tokens_from_chars
 from sie_server.core.tokenizer import image_first_chat_message, load_tokenizer
@@ -248,10 +254,12 @@ _MAX_IMAGES_PER_REQUEST = 16
 # admission reservation. The chat template renders each image as a short
 # placeholder, but the vision encoder expands it into many tokens (Qwen-VL:
 # up to ~1280 at max_pixels). Exact counts need the image dimensions + the
-# model's vision tokenizer, which we don't have at this layer — so we use a
-# conservative constant. Over-reserving is safe; under-counting risks a
-# context-window overflow (opaque SGLang error) and admission over-admit.
-_VISION_TOKENS_PER_IMAGE_ESTIMATE = 1024
+# model's vision tokenizer, which we don't have at this layer. Qwen SGLang
+# profiles cap preprocessing at 1280 visual tokens, so this value is both a
+# conservative reservation and a hard upper bound for the image-capable
+# generation family. Under-counting risks a context-window overflow and
+# admission over-admit.
+_VISION_TOKENS_PER_IMAGE_ESTIMATE = 1280
 
 # Hard ceiling on a single decoded image's bytes. Bounds worker memory on the
 # decode path even for the direct-queue caller that bypasses the gateway's
@@ -323,11 +331,11 @@ def _parse_message_images_field(raw: object, idx: int) -> tuple[ImageInput, ...]
     """Parse a message-level ``images`` field of gateway-forwarded images.
 
     The gateway extracts OpenAI ``image_url`` data URIs and forwards them as
-    ``messages[i].images = [{"data": <base64-str>, "format": <str?>}, ...]``.
-    ``data`` is the **base64 payload string**, not raw bytes — that's what
-    survives the sidecar's ``WorkItem.generate: serde_json::Value`` (msgpack
-    ``bin`` does not; see the gateway ``ChatImage`` doc). We base64-decode here
-    into the ``bytes`` the adapter expects. Missing/``None`` → no images.
+    ``messages[i].images = [{"data": <bytes-or-base64>, "format": <str?>},
+    ...]``. The Rust sidecar normalizes legacy base64 strings to msgpack
+    binary before Python execution. Accepting both representations here keeps
+    direct execution and mixed-version workers compatible while preserving
+    the same byte limits. Missing/``None`` means no images.
     """
     if raw is None:
         return ()
@@ -341,40 +349,56 @@ def _parse_message_images_field(raw: object, idx: int) -> tuple[ImageInput, ...]
                 message=f"messages[{idx}].images[{i}] must be an object",
             )
         entry_dict = cast("dict[str, Any]", entry)
-        b64 = entry_dict.get("data")
-        if not isinstance(b64, str) or not b64:
+        raw_data = entry_dict.get("data")
+        if isinstance(raw_data, bytes):
+            data = raw_data
+            if not data:
+                return _ValidationError(
+                    code="invalid_request",
+                    message=f"messages[{idx}].images[{i}]: image data is empty",
+                )
+            if len(data) > _MAX_DECODE_IMAGE_BYTES:
+                return _ValidationError(
+                    code="invalid_request",
+                    message=(
+                        f"messages[{idx}].images[{i}]: image too large ({len(data)} bytes); exceeds the "
+                        f"{_MAX_DECODE_IMAGE_BYTES // (1024 * 1024)} MiB limit"
+                    ),
+                )
+        elif isinstance(raw_data, str) and raw_data:
+            stripped = raw_data.strip()
+            if (len(stripped) * 3) // 4 > _MAX_DECODE_IMAGE_BYTES:
+                return _ValidationError(
+                    code="invalid_request",
+                    message=(
+                        f"messages[{idx}].images[{i}]: image too large; exceeds the "
+                        f"{_MAX_DECODE_IMAGE_BYTES // (1024 * 1024)} MiB limit"
+                    ),
+                )
+            try:
+                data = base64.b64decode(stripped, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                return _ValidationError(
+                    code="invalid_request",
+                    message=f"messages[{idx}].images[{i}]: invalid base64 image data: {exc}",
+                )
+            if not data:
+                return _ValidationError(
+                    code="invalid_request",
+                    message=f"messages[{idx}].images[{i}]: image data is empty",
+                )
+            if len(data) > _MAX_DECODE_IMAGE_BYTES:
+                return _ValidationError(
+                    code="invalid_request",
+                    message=(
+                        f"messages[{idx}].images[{i}]: image too large ({len(data)} bytes); exceeds the "
+                        f"{_MAX_DECODE_IMAGE_BYTES // (1024 * 1024)} MiB limit"
+                    ),
+                )
+        else:
             return _ValidationError(
                 code="invalid_request",
-                message=f"messages[{idx}].images[{i}].data must be a non-empty base64 string",
-            )
-        stripped = b64.strip()
-        if (len(stripped) * 3) // 4 > _MAX_DECODE_IMAGE_BYTES:
-            return _ValidationError(
-                code="invalid_request",
-                message=(
-                    f"messages[{idx}].images[{i}]: image too large; exceeds the "
-                    f"{_MAX_DECODE_IMAGE_BYTES // (1024 * 1024)} MiB limit"
-                ),
-            )
-        try:
-            data = base64.b64decode(stripped, validate=True)
-        except (binascii.Error, ValueError) as exc:
-            return _ValidationError(
-                code="invalid_request",
-                message=f"messages[{idx}].images[{i}]: invalid base64 image data: {exc}",
-            )
-        if not data:
-            return _ValidationError(
-                code="invalid_request",
-                message=f"messages[{idx}].images[{i}]: image data is empty",
-            )
-        if len(data) > _MAX_DECODE_IMAGE_BYTES:
-            return _ValidationError(
-                code="invalid_request",
-                message=(
-                    f"messages[{idx}].images[{i}]: image too large ({len(data)} bytes); exceeds the "
-                    f"{_MAX_DECODE_IMAGE_BYTES // (1024 * 1024)} MiB limit"
-                ),
+                message=f"messages[{idx}].images[{i}].data must be non-empty bytes or a base64 string",
             )
         fmt = entry_dict.get("format")
         out.append({"data": data, "format": fmt if isinstance(fmt, str) else None})
@@ -1571,6 +1595,8 @@ class StreamingProcessor:
             )
             return
         params = validation
+        suppress_thinking = thinking_blocks_must_be_hidden(config)
+        reasoning_format = resolve_reasoning_format(config, adapter)
 
         # Resolve ``tool_choice`` mode up front. When the caller set
         # ``tool_choice == "none"`` the OpenAI contract is that the model
@@ -1637,6 +1663,10 @@ class StreamingProcessor:
             prompt_str = rendered
         else:
             prompt_str = params.input.prompt
+        thinking_starts_in_prompt = suppress_thinking and reasoning_starts_in_prompt(
+            prompt_str,
+            reasoning_format,
+        )
 
         # Cancel may have arrived during chat-template rendering (CPU-bound
         # on a large message list).
@@ -1825,6 +1855,9 @@ class StreamingProcessor:
                 repetition_penalty=params.repetition_penalty,
                 min_tokens=params.min_tokens,
                 chat_template_kwargs=params.chat_template_kwargs,
+                suppress_thinking=suppress_thinking,
+                thinking_starts_in_prompt=thinking_starts_in_prompt,
+                reasoning_format=reasoning_format,
                 grammar=effective_grammar,
                 tools=effective_tools,
                 enable_tool_parser=enable_tool_parser,
@@ -1883,6 +1916,9 @@ class StreamingProcessor:
         # caller can forward the whole ``params`` block without sniffing
         # which fields belong to which stage.
         chat_template_kwargs: dict[str, Any] | None = None,
+        suppress_thinking: bool = False,
+        thinking_starts_in_prompt: bool = False,
+        reasoning_format: ReasoningFormat = "qwen3",
         grammar: GrammarSpec | None = None,
         tools: tuple[dict[str, Any], ...] | None = None,
         enable_tool_parser: bool | None = None,
@@ -1970,6 +2006,15 @@ class StreamingProcessor:
             "AsyncGenerator[GenerationChunk, None]",
             adapter.generate(**gen_kwargs),
         )
+        if suppress_thinking:
+            chunks_iter = cast(
+                "AsyncGenerator[GenerationChunk, None]",
+                suppress_thinking_blocks(
+                    chunks_iter,
+                    start_inside=thinking_starts_in_prompt,
+                    reasoning_format=reasoning_format,
+                ),
+            )
         # OpenAI tools: when enabled, wrap the adapter iterator with the
         # tool-call parser so ``<tool_call>{...}</tool_call>`` blocks
         # emitted by the chat template surface as ``ToolCallDelta``s on
@@ -2917,15 +2962,23 @@ class StreamingProcessor:
             else:
                 min_tokens = min_tokens_val if min_tokens_val >= 0 else None
 
-        # Per-request chat-template kwargs. Gateway has already validated
-        # this is an object (or absent); store as-is and merge with the
-        # model YAML defaults in ``_render_chat_template`` below.
+        # Per-request chat-template kwargs. Revalidate the bounded shape at
+        # the worker boundary before it can reach ``apply_chat_template``;
+        # this protects queue-bypass and mixed-version callers too.
         chat_template_kwargs_raw = params.get("chat_template_kwargs")
         chat_template_kwargs: dict[str, Any] | None
-        if isinstance(chat_template_kwargs_raw, dict):
-            chat_template_kwargs = dict(chat_template_kwargs_raw)
-        else:
+        if chat_template_kwargs_raw is None:
             chat_template_kwargs = None
+        elif isinstance(chat_template_kwargs_raw, dict):
+            try:
+                chat_template_kwargs = validate_chat_template_kwargs(dict(chat_template_kwargs_raw))
+            except ValueError as exc:
+                return _ValidationError(code="invalid_request", message=str(exc))
+        else:
+            return _ValidationError(
+                code="invalid_request",
+                message="'chat_template_kwargs' must be an object",
+            )
 
         # OpenAI ``seed`` / ``logit_bias`` / ``logprobs`` / ``top_logprobs``
         # round-trips. Gateway is the authority for shape validation

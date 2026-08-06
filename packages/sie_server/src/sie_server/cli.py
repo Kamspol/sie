@@ -224,17 +224,19 @@ def openapi_export(
     from sie_server.api.health import router as health_router
     from sie_server.api.models import router as models_router
     from sie_server.api.openai_compat import router as openai_router
+    from sie_server.api.openai_completions import router as openai_completions_router
+    from sie_server.api.openai_responses import router as openai_responses_router
     from sie_server.api.openapi import setup_custom_openapi_schema
     from sie_server.api.root import router as root_router
     from sie_server.api.score import router as score_router
     from sie_server.api.ws import router as ws_router
 
     # Build a lightweight FastAPI app for the PUBLISHED API surface — no lifespan (no GPU
-    # init, model registry, telemetry, or NATS). NOTE: the local-only convenience routes are
-    # intentionally excluded from the committed openapi.json — the ``openai_local`` router
-    # (/v1/chat/completions + /v1/rerank) is a single-node/dev convenience surface. The
-    # SIE-native ``generate`` route is part of the worker contract and is published here even
-    # though the Rust gateway remains the production cluster API authority.
+    # init, model registry, telemetry, or NATS). NOTE: the direct-container convenience routes
+    # are intentionally excluded from the committed openapi.json — the ``openai_local`` router
+    # (/v1/chat/completions + /v1/rerank) proxies managed MLX/SGLang children for single-node
+    # serving, while the Rust gateway owns the published production chat contract. The
+    # SIE-native ``generate`` route is part of the worker contract and is published here.
     app_ = FastAPI(
         title="SIE Server",
         description="Search Inference Engine - GPU inference server for search workloads",
@@ -250,6 +252,8 @@ def openapi_export(
     app_.include_router(ws_router)
     app_.include_router(openai_audio_router)
     app_.include_router(openai_router)
+    app_.include_router(openai_completions_router)
+    app_.include_router(openai_responses_router)
     setup_custom_openapi_schema(app_)
 
     spec = app_.openapi()
@@ -518,10 +522,9 @@ def serve(
         typer.echo(f"Devices: {', '.join(resolved_devices)}")
     if resolved_device == "mps":
         # Apple-Silicon banner: surface the one-command local OpenAI endpoint so the
-        # first-run experience points at the playground / docs / OpenAI base URL.
+        # first-run experience points at the docs / OpenAI base URL.
         typer.echo("")
         typer.echo("  Apple Silicon (Metal) — one local OpenAI-compatible endpoint:")
-        typer.echo(f"    →  Playground   http://localhost:{port}/")
         typer.echo(f"    →  API docs     http://localhost:{port}/docs")
         typer.echo(
             f"    →  OpenAI base  http://localhost:{port}/v1   (embeddings · rerank; chat/completions with -b sglang)"

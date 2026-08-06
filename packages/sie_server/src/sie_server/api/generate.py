@@ -58,7 +58,15 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from sie_sdk.queue_types import denormalize_model_id
 
-from sie_server.adapters._generation_base import GenerationAdapter, collect_generation
+from sie_server.adapters._generation_base import (
+    GenerationAdapter,
+    ReasoningFormat,
+    collect_generation,
+    reasoning_starts_in_prompt,
+    resolve_reasoning_format,
+    suppress_thinking_blocks,
+    thinking_blocks_must_be_hidden,
+)
 from sie_server.api.helpers import ModelStateChecker
 from sie_server.api.validation import validate_machine_profile_header, validate_signed_i64
 from sie_server.core.runtime_options import apply_generation_runtime_options
@@ -571,9 +579,25 @@ def _parse_native_grammar(value: Any) -> GrammarSpec | None:
 
 async def _render_native_image_prompt(config: Any, prompt: str, image_count: int) -> str:
     """Render one image-aware user turn with the model's own chat template."""
+    message = image_first_chat_message(role="user", text=prompt, image_count=image_count)
+    return await _render_native_messages_prompt(config, [message], param="images")
+
+
+async def _render_native_messages_prompt(
+    config: Any,
+    messages: list[dict[str, Any]],
+    *,
+    param: str = "input",
+) -> str:
+    """Render validated direct-route messages through the model tokenizer.
+
+    Native image generation and direct OpenAI Responses share this bounded,
+    pinned tokenizer path so both direct message surfaces use the same model
+    template defaults before calling ``GenerationAdapter.generate``.
+    """
     source = config.hf_id or config.weights_path
     if not isinstance(source, str | Path):
-        raise _bad_request("model has no tokenizer source for image generation", param="images")
+        raise _bad_request("model has no tokenizer source for message generation", param=param)
     revision = config.hf_revision if config.hf_id else None
     try:
         tokenizer = await asyncio.to_thread(
@@ -581,21 +605,24 @@ async def _render_native_image_prompt(config: Any, prompt: str, image_count: int
             str(source),
             revision,
         )
-        message = image_first_chat_message(role="user", text=prompt, image_count=image_count)
         kwargs = dict(config.tasks.generate.chat_template_kwargs or {})
-        apply_chat_template = cast("Any", tokenizer.apply_chat_template)
+        apply_chat_template = tokenizer.apply_chat_template
         rendered = await asyncio.to_thread(
             apply_chat_template,
-            [message],
+            messages,
             tokenize=False,
             add_generation_prompt=True,
             **kwargs,
         )
     except Exception as exc:
-        logger.info("native image prompt render failed for %s: %s", config.name, exc)
-        raise _bad_request("failed to render the model-native image prompt", param="images") from exc
+        logger.info(
+            "native message prompt render failed for %s (%s)",
+            config.name,
+            type(exc).__name__,
+        )
+        raise _bad_request("failed to render the model-native message prompt", param=param) from exc
     if not isinstance(rendered, str) or not rendered:
-        raise _bad_request("model-native image prompt rendering returned no text", param="images")
+        raise _bad_request("model-native message prompt rendering returned no text", param=param)
     return rendered
 
 
@@ -658,6 +685,9 @@ async def _stream_generate_events(
     logit_bias: dict[str, float] | None,
     logprobs: bool,
     top_logprobs: int | None,
+    suppress_thinking: bool = False,
+    thinking_starts_in_prompt: bool = False,
+    reasoning_format: ReasoningFormat = "qwen3",
     images: list[ImageInput] | None = None,
 ) -> AsyncIterator[str]:
     """Yield SIE-native ``GenerateChunk`` SSE lines for ``SIEClient.stream_generate``.
@@ -685,7 +715,7 @@ async def _stream_generate_events(
     if images is not None:
         optional_adapter_inputs["images"] = images
     try:
-        async for chunk in adapter.generate(
+        chunks = adapter.generate(
             prompt=prompt,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
@@ -700,7 +730,14 @@ async def _stream_generate_events(
             logprobs=logprobs,
             top_logprobs=top_logprobs,
             **optional_adapter_inputs,
-        ):
+        )
+        if suppress_thinking:
+            chunks = suppress_thinking_blocks(
+                chunks,
+                start_inside=thinking_starts_in_prompt,
+                reasoning_format=reasoning_format,
+            )
+        async for chunk in chunks:
             if chunk.done:
                 saw_terminal = True
                 finish_reason = chunk.finish_reason or "stop"
@@ -1031,6 +1068,7 @@ async def generate(
         generation_prompt = prompt
         if images:
             generation_prompt = await _render_native_image_prompt(config, prompt, len(images))
+        suppress_thinking = thinking_blocks_must_be_hidden(config)
 
         # Do not start a potentially expensive model load until the complete
         # request has passed validation.
@@ -1042,6 +1080,11 @@ async def generate(
                 f"Model '{model}' adapter does not support generate (not a GenerationAdapter)",
                 code=ErrorCode.MODEL_NOT_FOUND.value,
             )
+        reasoning_format = resolve_reasoning_format(config, adapter)
+        thinking_starts_in_prompt = suppress_thinking and reasoning_starts_in_prompt(
+            generation_prompt,
+            reasoning_format,
+        )
 
         if stream_raw:
             return StreamingResponse(
@@ -1061,6 +1104,9 @@ async def generate(
                     grammar=grammar,
                     logprobs=logprobs,
                     top_logprobs=top_logprobs,
+                    suppress_thinking=suppress_thinking,
+                    thinking_starts_in_prompt=thinking_starts_in_prompt,
+                    reasoning_format=reasoning_format,
                     images=images,
                 ),
                 media_type="text/event-stream",
@@ -1091,6 +1137,12 @@ async def generate(
                 logit_bias=logit_bias,
                 **optional_adapter_inputs,
             )
+            if suppress_thinking:
+                chunks = suppress_thinking_blocks(
+                    chunks,
+                    start_inside=thinking_starts_in_prompt,
+                    reasoning_format=reasoning_format,
+                )
             result = await collect_generation(chunks)
         except Exception as e:
             logger.warning("generate failed for %s", model, exc_info=True)

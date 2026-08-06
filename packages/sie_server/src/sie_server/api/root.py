@@ -1,17 +1,12 @@
 """Root endpoint router."""
 
-from importlib.resources import files
-
 from fastapi import APIRouter
-from fastapi.responses import HTMLResponse
+from fastapi.responses import RedirectResponse
 
 router = APIRouter()
 
-# Load static HTML file at module load time
-_index_html = files("sie_server.static").joinpath("index.html").read_text()
 
-
-@router.get("/", response_class=HTMLResponse)
-async def root() -> HTMLResponse:
-    """Basic HTML status page for the root endpoint."""
-    return HTMLResponse(content=_index_html)
+@router.get("/", include_in_schema=False)
+async def root() -> RedirectResponse:
+    """Redirect the root path to the interactive OpenAPI docs."""
+    return RedirectResponse(url="/docs")

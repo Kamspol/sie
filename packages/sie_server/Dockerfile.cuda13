@@ -127,7 +127,8 @@ RUN echo "import sys; sys.path.insert(0, '/app/bundle-libs')" \
 
 # Conservative venv cleanup — only runtime-safe removals. Keep torch/include
 # (triton JIT compiles against torch C++ headers for sglang/flashinfer custom
-# ops) and gcc/libc6-dev at runtime.
+# ops), gcc/libc6-dev, and wheel RECORD metadata. Native loaders such as
+# tvm_ffi use RECORD to locate packaged shared libraries.
 RUN set -eux; \
     cd /app/.venv/lib/python3.12/site-packages; \
     find . -type d -name '__pycache__' -prune -exec rm -rf {} +; \
@@ -135,7 +136,6 @@ RUN set -eux; \
     find . -type d -name 'tests' -prune -exec rm -rf {} +; \
     rm -rf torch/test torch/utils/tensorboard torch/utils/bottleneck 2>/dev/null || true; \
     find torch -type f -name '*.a' -delete 2>/dev/null || true; \
-    find . -type f -name 'RECORD' -path '*dist-info*' -delete; \
     find nvidia -type f -name '*.a' -delete 2>/dev/null || true; \
     rm -rf /app/.venv/share/jupyter 2>/dev/null || true; \
     find /app/.venv -exec touch -h -d @0 {} + 2>/dev/null || true
@@ -193,7 +193,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
             -r /tmp/bundle-requirements.txt ; \
     fi
 
-# bundle-libs cleanup (symmetric to the .venv cleanup in base).
+# bundle-libs cleanup (symmetric to the .venv cleanup in base). Preserve
+# dist-info RECORD files so tvm_ffi can find xgrammar's native binding.
 RUN set -eux; \
     if [ -d /app/bundle-libs ]; then \
         cd /app/bundle-libs; \
@@ -202,7 +203,6 @@ RUN set -eux; \
         find . -type d -name 'tests' -prune -exec rm -rf {} +; \
         rm -rf torch/test torch/utils/tensorboard torch/utils/bottleneck 2>/dev/null || true; \
         find torch -type f -name '*.a' -delete 2>/dev/null || true; \
-        find . -type f -name 'RECORD' -path '*dist-info*' -delete; \
         find nvidia -type f -name '*.a' -delete 2>/dev/null || true; \
     fi; \
     find /app/bundle-libs -exec touch -h -d @0 {} + 2>/dev/null || true

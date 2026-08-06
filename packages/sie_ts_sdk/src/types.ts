@@ -623,6 +623,12 @@ export interface SIEClientOptions {
   org?: string;
 }
 
+/** Optional immutable namespace policy for a PostgreSQL connection. */
+export interface AddConnectionOptions {
+  sourceSchema?: string | null;
+  sinkSchema?: string | null;
+}
+
 /**
  * An org-scoped connection (connector auth by name). The secret is never
  * returned by the list endpoint (only the job-runner resolve path sees it).
@@ -631,6 +637,9 @@ export interface Connection {
   id?: number;
   type?: string;
   name?: string;
+  authorization_generation?: number;
+  source_schema?: string | null;
+  sink_schema?: string | null;
   created_at?: number;
 }
 

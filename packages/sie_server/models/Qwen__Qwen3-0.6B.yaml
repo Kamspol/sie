@@ -31,6 +31,10 @@ tasks:
       grammar: []
       streaming: true
       tools: false
+    # Qwen3 enables reasoning by default. Keep the bare model deterministic
+    # and direct; the explicit ``:thinking`` profile below opts back in.
+    chat_template_kwargs:
+      enable_thinking: false
 max_sequence_length: 4096
 # KV-cache memory math (Qwen3-0.6B, bf16):
 #   layers=28, kv_heads=8, head_dim=128, bytes_per_elem=2
@@ -117,3 +121,31 @@ profiles:
         default_sampling:
           temperature: 0.0
           top_p: 1.0
+  # Explicit reasoning mode. Qwen3-0.6B supports the chat-template thinking
+  # switch; use the model-card sampling recipe instead of inheriting the
+  # non-thinking profile's greedy decode.
+  thinking:
+    extends: default
+    chat_template_kwargs:
+      enable_thinking: true
+    adapter_options:
+      runtime:
+        first_chunk_timeout_s: 30
+        inter_chunk_timeout_s: 10
+        overall_timeout_s: 300
+        default_sampling:
+          temperature: 0.6
+          top_p: 0.95
+          top_k: 20
+  # The checkpoint's native window is 32,768 tokens. Keep the 4K bare/L4
+  # shape for fast smoke traffic and expose the full window on the dedicated
+  # A100 launch shape, whose checked-in KV budget covers one 32K admission.
+  long-context:
+    extends: a100-40gb
+    adapter_options:
+      loadtime:
+        max_seq_length: 32768
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3-0.6B
+        disable_cuda_graph: true
+        attention_backend: triton

@@ -306,6 +306,7 @@ mod tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some(
                     "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
                         .to_string(),
@@ -322,6 +323,7 @@ mod tests {
         profiles.insert(
             "fp8".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some(
                     "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
                         .to_string(),

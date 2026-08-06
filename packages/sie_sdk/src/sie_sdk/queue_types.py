@@ -147,6 +147,9 @@ class WorkResult(_WorkResultRequired, total=False):
         execution_identity_sha256: Opaque worker-origin SHA-256 binding the
             successful result to one immutable managed deployment/resource
             identity. Optional for rolling and self-host compatibility.
+        executed_bundle_config_hash: Worker-origin hash of the registry bundle
+            held stable for this successful execution. Optional for rolling
+            and self-host compatibility.
     """
 
     result_msgpack: bytes | None
@@ -168,6 +171,7 @@ class WorkResult(_WorkResultRequired, total=False):
     units: dict[str, int] | None
 
     execution_identity_sha256: str | None
+    executed_bundle_config_hash: str | None
 
 
 # -- NATS subject helpers ---------------------------------------------------

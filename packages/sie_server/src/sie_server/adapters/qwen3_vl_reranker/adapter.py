@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import io
 import logging
 from pathlib import Path
@@ -96,7 +97,7 @@ class Qwen3VLRerankerAdapter(BaseAdapter):
     spec: ClassVar[AdapterSpec] = AdapterSpec(
         inputs=("text", "image"),
         outputs=("score",),
-        unload_fields=("_model", "_processor", "_yes_token_id", "_no_token_id"),
+        unload_fields=("_model", "_processor", "_yes_token_id", "_no_token_id", "_image_token_id"),
         default_preprocessor="image",
     )
 
@@ -127,6 +128,8 @@ class Qwen3VLRerankerAdapter(BaseAdapter):
         self._yes_token_id: int | None = None
         self._attn_implementation: str | None = None
         self._no_token_id: int | None = None
+        self._image_token_id: int | None = None
+        self._accepts_mm_token_type_ids: bool = False
 
     def load(self, device: str) -> None:
         from transformers import AutoProcessor, AutoTokenizer, Qwen3VLForConditionalGeneration
@@ -229,6 +232,29 @@ class Qwen3VLRerankerAdapter(BaseAdapter):
                 "tokenizer that includes them or adding them via add_tokens()."
             )
             raise ValueError(msg)
+
+        # FIX[#2856]: transformers 5.3+ moved the vision-RoPE modality map out of
+        # the model and onto the processor/forward contract. Resolve both halves
+        # once at load time so a version that needs the map cannot quietly serve
+        # image pairs with text-only positions.
+        self._accepts_mm_token_type_ids = "mm_token_type_ids" in inspect.signature(self._model.forward).parameters
+        image_token = getattr(self._processor, "image_token", None)
+        if not image_token:
+            msg = f"Processor for {self._model_name_or_path} does not expose an image token"
+            raise ValueError(msg)
+        image_token_id = tokenizer.convert_tokens_to_ids(image_token)
+        if (
+            image_token_id is None
+            or image_token_id == unk_id
+            or tokenizer.convert_ids_to_tokens(image_token_id) != image_token
+        ):
+            msg = (
+                f"Tokenizer for {self._model_name_or_path} does not contain the processor image token "
+                f"{image_token!r} (resolved to id={image_token_id}, unk_id={unk_id}). "
+                "Multimodal reranking cannot place image tokens without it."
+            )
+            raise ValueError(msg)
+        self._image_token_id = int(image_token_id)
 
     def _resolve_dtype(self) -> torch.dtype:
         if not self._device or not str(self._device).startswith("cuda"):
@@ -409,6 +435,15 @@ class Qwen3VLRerankerAdapter(BaseAdapter):
             "return_tensors": None,
             "padding": False,
             "truncation": False,
+            # FIX[#2856]: transformers 5.3.0 flipped Qwen3VLProcessorKwargs'
+            # ``return_mm_token_type_ids`` default from False to True. The
+            # processor then runs ``np.array(input_ids)`` over this deliberately
+            # unpadded batch, which raises ValueError on any two prompts of
+            # unequal length — every multi-pair request, while single-pair ones
+            # slipped through. We pad and trim per document ourselves, so ask
+            # the processor to stay out of it and rebuild the tensor in
+            # ``_prepare_model_inputs`` against the ids the model actually sees.
+            "return_mm_token_type_ids": False,
         }
         if max_length is not None:
             proc_kwargs["return_offsets_mapping"] = True
@@ -524,10 +559,28 @@ class Qwen3VLRerankerAdapter(BaseAdapter):
             )
         inputs = dict(padded)
         for key, value in processor_inputs.items():
-            if key in {"input_ids", "attention_mask", "offset_mapping"}:
+            if key in {"input_ids", "attention_mask", "offset_mapping", "mm_token_type_ids"}:
                 continue
             inputs[key] = value if isinstance(value, torch.Tensor) else torch.as_tensor(np.asarray(value))
+        mm_token_type_ids = self._derive_mm_token_type_ids(inputs["input_ids"])
+        if mm_token_type_ids is not None:
+            inputs["mm_token_type_ids"] = mm_token_type_ids
         return inputs, [len(ids) for ids in trimmed_ids]
+
+    def _derive_mm_token_type_ids(self, input_ids: torch.Tensor) -> torch.Tensor | None:
+        """Rebuild the modality map transformers 5.3+ needs for 3D vision RoPE.
+
+        FIX[#2856]: from transformers 5.3.0 ``Qwen3VLModel`` only computes mrope
+        positions when it is handed ``mm_token_type_ids``; without it, image
+        tokens silently fall back to 1D positions. Up to 5.2 the model derived
+        the same map itself from ``input_ids`` and the image token id, so
+        deriving it here reproduces the pre-5.3 positions exactly — and it is
+        the only version that survives our per-document trimming, which the
+        processor's own (pre-trim) map would not line up with.
+        """
+        if not self._accepts_mm_token_type_ids or self._image_token_id is None:
+            return None
+        return (input_ids == self._image_token_id).to(torch.int32)
 
     def _expand_image_placeholders(
         self,

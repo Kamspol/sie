@@ -3,7 +3,7 @@
 //! What this proves:
 //!   * `sie-server-sidecar --ingest local` starts with **no NATS server**
 //!     anywhere (the mode's whole point).
-//!   * The UDS listener speaks the wire protocol v0.1: u32-LE frame + msgpack
+//!   * The UDS listener speaks the wire protocol v0.2: u32-LE frame + msgpack
 //!     `{id, op, body}` envelopes; `ping`, `publish_work`, unknown-op
 //!     error envelope.
 //!   * `publish_work` WorkItem bytes flow through the real dispatcher →
@@ -141,6 +141,8 @@ impl PythonHarness {
                 socket_path.to_str().unwrap(),
                 "--worker-id",
                 "loopback-harness",
+                "--fake-generate-model",
+                "BAAI/bge-m3",
                 "--log-level",
                 "INFO",
             ])
@@ -499,7 +501,7 @@ async fn local_ingest_round_trips_publish_work_without_nats() {
         assert_eq!(r.error_code.as_deref(), Some("pool_admission_rejected"));
     }
 
-    // 4. generate op -> typed bad_operation error (streaming lands later).
+    // 4. The legacy one-shot op still rejects generate instead of hanging.
     let gen = vec![work_item("li-req-3", 0, 1, "generate", "default")];
     send_request(
         &mut stream,
@@ -534,7 +536,316 @@ async fn local_ingest_round_trips_publish_work_without_nats() {
         Some(true)
     );
 
-    // 6. Concurrent publish_work calls on separate connections coalesce in
+    // 6. Versioned generation streams one prepared binary-image chunk and one
+    //    transport final over the same Rust-sidecar/backend path.
+    let mut generate = work_item("li-gen-1", 0, 1, "generate", "default");
+    generate.item = None;
+    generate.output_types = None;
+    generate.generate = Some(rmpv::Value::Map(vec![
+        (
+            rmpv::Value::from("messages"),
+            rmpv::Value::Array(vec![rmpv::Value::Map(vec![
+                (rmpv::Value::from("role"), rmpv::Value::from("user")),
+                (rmpv::Value::from("content"), rmpv::Value::from("inspect")),
+                (
+                    rmpv::Value::from("images"),
+                    rmpv::Value::Array(vec![rmpv::Value::Map(vec![
+                        (rmpv::Value::from("data"), rmpv::Value::from("Y2F0Ynl0ZXM=")),
+                        (rmpv::Value::from("format"), rmpv::Value::from("png")),
+                    ])]),
+                ),
+            ])]),
+        ),
+        (rmpv::Value::from("max_new_tokens"), rmpv::Value::from(8)),
+    ]));
+    send_request(
+        &mut stream,
+        7,
+        "publish_generate_stream",
+        publish_work_body(&[generate], "default", 600_001),
+    )
+    .await;
+    let chunk = timeout(Duration::from_secs(30), read_response(&mut stream))
+        .await
+        .expect("generation chunk answered");
+    assert_eq!(map_get(&chunk, "id").and_then(rmpv::Value::as_u64), Some(7));
+    assert_eq!(
+        map_get(&chunk, "ok").and_then(rmpv::Value::as_bool),
+        Some(true)
+    );
+    let chunk_body = map_get(&chunk, "body").expect("chunk body");
+    assert_eq!(
+        map_get(chunk_body, "seq").and_then(rmpv::Value::as_u64),
+        Some(0)
+    );
+    let rmpv::Value::Binary(payload) = map_get(chunk_body, "chunk").expect("chunk payload") else {
+        panic!("generation payload must be msgpack binary");
+    };
+    let semantic: rmpv::Value = rmp_serde::from_slice(payload).expect("semantic chunk");
+    assert_eq!(
+        map_get(&semantic, "request_id").and_then(rmpv::Value::as_str),
+        Some("li-gen-1")
+    );
+    assert_eq!(
+        map_get(&semantic, "image_data_is_bytes").and_then(rmpv::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        map_get(&semantic, "image_data"),
+        Some(&rmpv::Value::Binary(b"catbytes".to_vec()))
+    );
+    let final_frame = read_response(&mut stream).await;
+    let final_body = map_get(&final_frame, "body").expect("final body");
+    assert_eq!(
+        map_get(final_body, "final").and_then(rmpv::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        map_get(final_body, "outcome")
+            .and_then(|outcome| map_get(outcome, "chunks"))
+            .and_then(rmpv::Value::as_u64),
+        Some(1)
+    );
+
+    // 7. A control call can cancel an in-flight generation stream. Waiting
+    //    for its first chunk proves the Python processor registered the
+    //    request before cancel is sent, avoiding a test-only race.
+    let mut cancellable = work_item("li-gen-cancel", 0, 1, "generate", "default");
+    cancellable.item = None;
+    cancellable.output_types = None;
+    cancellable.generate = Some(rmpv::Value::Map(vec![
+        (
+            rmpv::Value::from("messages"),
+            rmpv::Value::Array(vec![rmpv::Value::Map(vec![
+                (rmpv::Value::from("role"), rmpv::Value::from("user")),
+                (rmpv::Value::from("content"), rmpv::Value::from("wait")),
+            ])]),
+        ),
+        (rmpv::Value::from("max_new_tokens"), rmpv::Value::from(8)),
+        (
+            rmpv::Value::from("wait_for_cancel"),
+            rmpv::Value::from(true),
+        ),
+    ]));
+    let duplicate = cancellable.clone();
+    let mut deadline_generate = cancellable.clone();
+    deadline_generate.work_item_id = "li-gen-timeout.0".to_string();
+    deadline_generate.request_id = "li-gen-timeout".to_string();
+    send_request(
+        &mut stream,
+        8,
+        "publish_generate_stream",
+        publish_work_body(&[cancellable], "default", 30_000),
+    )
+    .await;
+    let started = timeout(Duration::from_secs(30), read_response(&mut stream))
+        .await
+        .expect("generation start chunk answered");
+    assert_eq!(
+        map_get(&started, "id").and_then(rmpv::Value::as_u64),
+        Some(8)
+    );
+    let started_body = map_get(&started, "body").expect("started body");
+    let rmpv::Value::Binary(started_payload) =
+        map_get(started_body, "chunk").expect("started payload")
+    else {
+        panic!("generation start payload must be msgpack binary");
+    };
+    let started_semantic: rmpv::Value =
+        rmp_serde::from_slice(started_payload).expect("started semantic chunk");
+    assert_eq!(
+        map_get(&started_semantic, "done").and_then(rmpv::Value::as_bool),
+        Some(false)
+    );
+
+    // A request id is process-wide while its backend generation is active.
+    // A different connection cannot reuse it, even though envelope ids are
+    // scoped to each connection.
+    let mut foreign_stream = connect_with_retry(&ingest_sock.path, Duration::from_secs(30)).await;
+    send_request(
+        &mut foreign_stream,
+        1,
+        "publish_generate_stream",
+        publish_work_body(&[duplicate], "default", 30_000),
+    )
+    .await;
+    let duplicate_response = timeout(Duration::from_secs(5), read_response(&mut foreign_stream))
+        .await
+        .expect("cross-connection duplicate answered");
+    assert_eq!(
+        map_get(&duplicate_response, "id").and_then(rmpv::Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        map_get(&duplicate_response, "ok").and_then(rmpv::Value::as_bool),
+        Some(false)
+    );
+    assert!(map_get(&duplicate_response, "error")
+        .and_then(rmpv::Value::as_str)
+        .unwrap_or_default()
+        .starts_with("DUPLICATE_REQUEST:"));
+
+    // A different connection may know the request id but does not own the
+    // stream. Its cancel is an idempotent no-op and must not reach the backend.
+    send_request(
+        &mut foreign_stream,
+        2,
+        "cancel",
+        rmpv::Value::Map(vec![(
+            rmpv::Value::from("request_id"),
+            rmpv::Value::from("li-gen-cancel"),
+        )]),
+    )
+    .await;
+    let foreign_cancel = timeout(Duration::from_secs(5), read_response(&mut foreign_stream))
+        .await
+        .expect("foreign cancel answered");
+    assert_eq!(
+        map_get(&foreign_cancel, "id").and_then(rmpv::Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        map_get(&foreign_cancel, "ok").and_then(rmpv::Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        timeout(Duration::from_secs(1), read_response(&mut stream))
+            .await
+            .is_err(),
+        "a foreign connection cancelled a generation stream it does not own"
+    );
+
+    send_request(
+        &mut stream,
+        9,
+        "cancel",
+        rmpv::Value::Map(vec![(
+            rmpv::Value::from("request_id"),
+            rmpv::Value::from("li-gen-cancel"),
+        )]),
+    )
+    .await;
+    let mut saw_cancel = false;
+    let mut saw_cancelled_chunk = false;
+    let mut saw_final = false;
+    for _ in 0..3 {
+        let response = timeout(Duration::from_secs(30), read_response(&mut stream))
+            .await
+            .expect("cancel sequence answered");
+        match map_get(&response, "id").and_then(rmpv::Value::as_u64) {
+            Some(9) => {
+                assert_eq!(
+                    map_get(&response, "body"),
+                    Some(&rmpv::Value::Map(Vec::new()))
+                );
+                saw_cancel = true;
+            }
+            Some(8) => {
+                let body = map_get(&response, "body").expect("generation response body");
+                if map_get(body, "final").and_then(rmpv::Value::as_bool) == Some(true) {
+                    saw_final = true;
+                    continue;
+                }
+                let rmpv::Value::Binary(payload) =
+                    map_get(body, "chunk").expect("cancelled chunk payload")
+                else {
+                    panic!("cancelled payload must be msgpack binary");
+                };
+                let semantic: rmpv::Value =
+                    rmp_serde::from_slice(payload).expect("cancelled semantic chunk");
+                assert_eq!(
+                    map_get(&semantic, "finish_reason").and_then(rmpv::Value::as_str),
+                    Some("cancelled")
+                );
+                saw_cancelled_chunk = true;
+            }
+            id => panic!("unexpected response id in cancel sequence: {id:?}"),
+        }
+    }
+    assert!(saw_cancel && saw_cancelled_chunk && saw_final);
+
+    // 8. The local total deadline signals backend cancellation, suppresses
+    //    chunks produced after the deadline, and emits one timeout terminal.
+    send_request(
+        &mut stream,
+        10,
+        "publish_generate_stream",
+        publish_work_body(&[deadline_generate], "default", 250),
+    )
+    .await;
+    let started = timeout(Duration::from_secs(30), read_response(&mut stream))
+        .await
+        .expect("deadline generation start chunk answered");
+    assert_eq!(
+        map_get(&started, "id").and_then(rmpv::Value::as_u64),
+        Some(10)
+    );
+    let started_body = map_get(&started, "body").expect("deadline start body");
+    assert!(matches!(
+        map_get(started_body, "chunk"),
+        Some(rmpv::Value::Binary(_))
+    ));
+    let terminal = timeout(Duration::from_secs(5), read_response(&mut stream))
+        .await
+        .expect("generation timeout terminal answered");
+    assert_eq!(
+        map_get(&terminal, "id").and_then(rmpv::Value::as_u64),
+        Some(10)
+    );
+    assert_eq!(
+        map_get(&terminal, "ok").and_then(rmpv::Value::as_bool),
+        Some(false)
+    );
+    let terminal_body = map_get(&terminal, "body").expect("timeout body");
+    assert_eq!(terminal_body, &rmpv::Value::Map(Vec::new()));
+    assert!(map_get(&terminal, "error")
+        .and_then(rmpv::Value::as_str)
+        .unwrap_or_default()
+        .starts_with("TIMEOUT: generation timed out after 250ms"));
+
+    // 9. A semantic NAK is intercepted by Rust and becomes one retryable
+    //    transport terminal; it is never misrouted as a malformed chunk.
+    let mut retry = work_item("li-gen-retry", 0, 1, "generate", "default");
+    retry.item = None;
+    retry.output_types = None;
+    retry.generate = Some(rmpv::Value::Map(vec![
+        (
+            rmpv::Value::from("messages"),
+            rmpv::Value::Array(vec![rmpv::Value::Map(vec![
+                (rmpv::Value::from("role"), rmpv::Value::from("user")),
+                (rmpv::Value::from("content"), rmpv::Value::from("retry")),
+            ])]),
+        ),
+        (rmpv::Value::from("max_new_tokens"), rmpv::Value::from(8)),
+        (
+            rmpv::Value::from("test_nak_reason"),
+            rmpv::Value::from("kv_budget"),
+        ),
+    ]));
+    send_request(
+        &mut stream,
+        11,
+        "publish_generate_stream",
+        publish_work_body(&[retry], "default", 0),
+    )
+    .await;
+    let retry_terminal = timeout(Duration::from_secs(30), read_response(&mut stream))
+        .await
+        .expect("semantic NAK terminal answered");
+    assert_eq!(
+        map_get(&retry_terminal, "ok").and_then(rmpv::Value::as_bool),
+        Some(false)
+    );
+    assert!(map_get(&retry_terminal, "error")
+        .and_then(rmpv::Value::as_str)
+        .unwrap_or_default()
+        .contains("RETRY_LATER: generation backend requested retry: kv_budget"));
+    assert_eq!(
+        map_get(&retry_terminal, "body"),
+        Some(&rmpv::Value::Map(Vec::new()))
+    );
+
+    // 10. Concurrent publish_work calls on separate connections coalesce in
     //    the same scheduler without cross-talk.
     let path_a = ingest_sock.path.clone();
     let path_b = ingest_sock.path.clone();

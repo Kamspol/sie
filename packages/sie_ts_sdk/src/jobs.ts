@@ -62,22 +62,168 @@ export interface SubmitJobOptions {
   fieldMap?: JobFieldMap | null;
   /** Sink target (≈ `response.body`; aliases PG `column` / object-store `suffix`). */
   outputField?: string | null;
-  /** Trigger: "now" (default), "schedule:<cron>", or "watch:<source>". */
+  /** Connector-only explicit consent: inspect a plan or run it. No implicit default. */
+  execution?: "plan" | "run" | null;
+  /** Required retry-stable key for a connector submission; inline jobs must omit it. */
+  idempotencyKey?: string | null;
+  /** Immediate trigger only: "now" (default); schedule/watch are unavailable. */
   when?: string | null;
   /** Encode output types (default: dense). */
   outputTypes?: string[];
   /**
-   * Per-item options plus the op inputs, forwarded as-is (operation
-   * matrix): score → `options.query`, extract → `options.labels` /
+   * One job-level operation map, applied uniformly to every item and forwarded
+   * as-is: score → `options.query`, extract → `options.labels` /
    * `options.output_schema`, generate → sampling (e.g. `max_new_tokens`).
    */
   options?: Record<string, unknown> | null;
+}
+
+/** Validate the gateway's connector-only `Idempotency-Key` header contract. */
+export function requireConnectorIdempotencyKey(key: string | null | undefined): string {
+  if (
+    typeof key !== "string" ||
+    key.length < 1 ||
+    key.length > 256 ||
+    [...key].some((character) => {
+      const code = character.charCodeAt(0);
+      return code < 0x20 || code > 0x7e;
+    })
+  ) {
+    throw new RequestError(
+      "connector idempotencyKey must contain 1-256 printable ASCII bytes",
+      "invalid_request",
+      400,
+    );
+  }
+  return key;
 }
 
 /** The preflight reservation echoed on submit / status. */
 export interface JobPreflight {
   estimated_credits?: number;
   estimate_basis?: string;
+}
+
+/** Planner proofs safe to expose to a connector caller. */
+export interface ConnectorJobValidation {
+  source?: string;
+  identity?: string;
+  sink?: string;
+}
+
+/** The bounded behavior proven for one connector plan revision. */
+export interface ConnectorJobCapabilities {
+  incremental_inference?: boolean;
+  incremental_source_scan?: boolean;
+  source_scan?: string;
+  source_proof?: string;
+  checkpoint_profile?: string;
+  incremental_selection?: boolean;
+  inference?: string;
+  sink_targets?: unknown;
+  snapshot?: string;
+  ordering?: string;
+  deletion_handling?: string;
+  publication?: string;
+}
+
+/** Redacted, canonical output shape for one connector plan. */
+export interface ConnectorPlanOutputShape {
+  result_kind: "vector";
+  output_field: "embedding";
+  output_types: ["dense"];
+  dimensions: number | null;
+}
+
+/** A durable inspect-first plan. It contains metadata, never source rows. */
+export interface ConnectorJobPlan {
+  revision?: number;
+  expires_at?: number;
+  executable?: boolean;
+  executor_available?: boolean | null;
+  executor_availability?: string;
+  blocking_code?: string | null;
+  rows?: number;
+  mapped_bytes?: number;
+  input_bytes?: number;
+  eligible_count?: number;
+  eligible_count_quality?: string;
+  eligible_input_byte_count?: number;
+  matched_checkpoint_count?: number;
+  skipped_unchanged_count?: number;
+  deleted_preserved_count?: number;
+  output_dimensions?: number | null;
+  output: ConnectorPlanOutputShape;
+  cost_basis?: string;
+  max_reservation_credits?: number;
+  validation?: ConnectorJobValidation;
+  capabilities?: ConnectorJobCapabilities;
+}
+
+/** Public checkpoint/fence position for the connector profile. */
+export interface ConnectorJobCheckpoint {
+  profile?: string;
+  profile_version?: number;
+  region?: string;
+  expected_generation?: number;
+  generation?: number;
+  published_revision?: number;
+}
+
+/** Bounded item counters for one connector attempt. */
+export interface ConnectorJobItemOutcomes {
+  claimed?: number;
+  dispatched?: number;
+  inferred?: number;
+  staged?: number;
+  published?: number;
+  failed?: number;
+  reexecution_required?: number;
+  skipped_unchanged?: number;
+}
+
+/** Public evidence for one atomic sink publication. */
+export interface ConnectorJobPublication {
+  attempt_ordinal?: number;
+  revision?: number;
+  published?: number;
+  skipped_unchanged?: number;
+  deleted?: number;
+  failed?: number;
+  reexecuted?: number;
+  committed_at?: number;
+}
+
+/** One public execute/repair attempt; private dispatch authority is omitted. */
+export interface ConnectorJobAttempt {
+  ordinal: number;
+  action: "execute" | "repair";
+  state: string;
+  recovery_attempt_ordinal?: number;
+  outcome?: string | null;
+  error_code?: string | null;
+  replayed?: boolean;
+  billed_credits?: number | null;
+  overlap_owner?: { job_id?: string; attempt_ordinal?: number } | null;
+  item_outcomes?: ConnectorJobItemOutcomes;
+  publication?: ConnectorJobPublication | null;
+  created_at?: number;
+  finished_at?: number | null;
+}
+
+/** Public crash-recovery posture; tokens and receipt MACs never appear. */
+export interface ConnectorJobRecovery {
+  required?: boolean;
+  state?: string | null;
+  outcome?: string | null;
+  error_code?: string | null;
+  reexecution_required?: boolean;
+  repair?: {
+    expires_at?: number | null;
+    attempts_used?: number | null;
+    attempts_remaining?: number | null;
+    attempts_max?: number | null;
+  };
 }
 
 /** One spawned chunk's settle metadata (`output.chunks[]`; results-as-refs). */
@@ -102,7 +248,7 @@ export interface JobChunk {
   error?: unknown;
 }
 
-/** The `201` envelope from `POST /v1/jobs` (inline or connector job). */
+/** The fresh `201` envelope from `POST /v1/jobs` (inline or connector job). */
 export interface JobSubmitResult {
   id: string;
   object: string;
@@ -112,9 +258,17 @@ export interface JobSubmitResult {
   total_items?: number;
   chunks?: number;
   preflight?: JobPreflight;
-  input_source?: string;
-  source?: string;
-  sink?: string;
+  // Connector source/sink URIs and SQL are deliberately absent from public responses.
+  execution?: "plan" | "run";
+  phase?: string;
+  plan_revision?: number;
+  plan_expires_at?: number;
+  idempotency_expires_at?: number;
+  plan?: ConnectorJobPlan | null;
+  checkpoint?: ConnectorJobCheckpoint;
+  attempt?: ConnectorJobAttempt;
+  publication?: ConnectorJobPublication | null;
+  recovery?: ConnectorJobRecovery;
 }
 
 /** A job's public status doc from `GET /v1/jobs/{id}` (refs, never payloads). */
@@ -124,6 +278,19 @@ export interface JobStatus {
   operation: string;
   model: string;
   state: JobState;
+  execution?: "plan" | "run";
+  phase?: string;
+  outcome?: string | null;
+  error_code?: string | null;
+  plan_revision?: number | null;
+  plan_expires_at?: number | null;
+  idempotency_expires_at?: number | null;
+  plan?: ConnectorJobPlan | null;
+  checkpoint?: ConnectorJobCheckpoint;
+  attempt?: ConnectorJobAttempt;
+  attempts?: ConnectorJobAttempt[];
+  publication?: ConnectorJobPublication | null;
+  recovery?: ConnectorJobRecovery;
   total_items?: number;
   completed_items?: number;
   preflight?: JobPreflight;
@@ -164,6 +331,10 @@ const INTERNAL_SCHEMES = new Set(["upload"]);
 // Uniform source-mapping slots (the sink slot is `output_field`).
 const FIELD_MAP_KEYS = new Set(["id_field", "input_field", "carry", "input_type"]);
 const INPUT_TYPES = new Set(["text", "document"]);
+const CONNECTION_NAME_START_PATTERN = /^[A-Za-z0-9]$/;
+const CONNECTION_NAME_CHAR_PATTERN = /^[A-Za-z0-9._-]$/;
+const POSTGRES_SCHEMA_START_PATTERN = /^[A-Za-z_]$/;
+const POSTGRES_SCHEMA_CHAR_PATTERN = /^[A-Za-z0-9_$]$/;
 
 function isConnectorUri(value: string): boolean {
   return value.includes("://");
@@ -190,7 +361,7 @@ export function connectionName(uri: string): string {
   // URL can't parse custom schemes reliably; take the authority manually.
   const afterScheme = uri.split("://", 2)[1] ?? "";
   const authority = afterScheme.split(/[/?#]/, 1)[0] ?? "";
-  const name = authority.trim();
+  const name = authority;
   if (!name) {
     throw new RequestError(
       `connector URI ${JSON.stringify(uri)} names no connection (expected 'scheme://<connection>/…')`,
@@ -198,7 +369,62 @@ export function connectionName(uri: string): string {
       400,
     );
   }
+  return requireConnectionName(name);
+}
+
+/** Return a canonical named-connection path segment or fail before I/O. */
+export function requireConnectionName(name: string): string {
+  if (
+    name.length === 0 ||
+    name.length > 128 ||
+    !CONNECTION_NAME_START_PATTERN.test(name[0] ?? "") ||
+    Array.from(name).some((char) => !CONNECTION_NAME_CHAR_PATTERN.test(char))
+  ) {
+    throw new RequestError(
+      "connection name must be 1-128 ASCII letters, digits, '.', '_', or '-', and start with a letter or digit",
+      "invalid_request",
+      400,
+    );
+  }
   return name;
+}
+
+/** Validate the optional Postgres source/sink namespace pair before I/O. */
+export function requireConnectionSchemaPolicy(
+  connectionType: string,
+  sourceSchema: string | null | undefined,
+  sinkSchema: string | null | undefined,
+): { sourceSchema: string; sinkSchema: string } | undefined {
+  const sourceMissing = sourceSchema == null;
+  const sinkMissing = sinkSchema == null;
+  if (sourceMissing !== sinkMissing) {
+    throw new RequestError(
+      "sourceSchema and sinkSchema must be supplied together",
+      "invalid_request",
+      400,
+    );
+  }
+  if (sourceMissing || sinkMissing) return undefined;
+  if (connectionType !== "postgres") {
+    throw new RequestError(
+      "sourceSchema and sinkSchema apply only to postgres connections",
+      "invalid_request",
+      400,
+    );
+  }
+  const validSchema = (schema: string): boolean =>
+    schema.length >= 1 &&
+    schema.length <= 63 &&
+    POSTGRES_SCHEMA_START_PATTERN.test(schema[0] ?? "") &&
+    Array.from(schema.slice(1)).every((char) => POSTGRES_SCHEMA_CHAR_PATTERN.test(char));
+  if (!validSchema(sourceSchema) || !validSchema(sinkSchema)) {
+    throw new RequestError(
+      "sourceSchema and sinkSchema must be canonical Postgres identifiers of at most 63 ASCII bytes",
+      "invalid_request",
+      400,
+    );
+  }
+  return { sourceSchema, sinkSchema };
 }
 
 function resolveSource(source: JobSource, connection?: string | null): Record<string, unknown> {
@@ -211,9 +437,14 @@ function resolveSource(source: JobSource, connection?: string | null): Record<st
   if (isConnectorUri(source)) {
     if (isInternalUri(source)) {
       // Internal scheme (upload:// = OUR Files store): no connection.
-      return connection ? { src: source, connection } : { src: source };
+      return connection
+        ? { src: source, connection: requireConnectionName(connection) }
+        : { src: source };
     }
-    return { src: source, connection: connection ?? connectionName(source) };
+    return {
+      src: source,
+      connection: connection == null ? connectionName(source) : requireConnectionName(connection),
+    };
   }
   if (typeof source === "string" && source.trim()) {
     return { items: [{ text: source }] };
@@ -240,10 +471,11 @@ function resolveSink(
     const body: Record<string, unknown> = { sink };
     if (isInternalUri(sink)) {
       // Internal scheme: OUR Files store, no connection to name.
-      if (sinkConnection != null) body.sink_connection = sinkConnection;
+      if (sinkConnection != null) body.sink_connection = requireConnectionName(sinkConnection);
       return body;
     }
-    const resolved = sinkConnection ?? connectionName(sink);
+    const resolved =
+      sinkConnection == null ? connectionName(sink) : requireConnectionName(sinkConnection);
     // Thread the sink connection when explicitly overridden or distinct from
     // the source's (the common "index my own store" case reuses the source).
     if (sinkConnection != null || resolved !== sourceConnection) {
@@ -317,27 +549,8 @@ function resolveWhen(when: string | null | undefined): Record<string, unknown> {
   if (when == null || when.trim() === "" || when.trim().toLowerCase() === "now") {
     return {};
   }
-  const text = when.trim();
-  // Slice off the prefix (not `split(":")`, which would drop a value's own colons).
-  if (text.toLowerCase().startsWith("schedule:")) {
-    return { when: "schedule", schedule: text.slice("schedule:".length).trim() };
-  }
-  if (text.toLowerCase().startsWith("watch:")) {
-    return { when: "watch", watch: text.slice("watch:".length).trim() };
-  }
-  if (text.toLowerCase() === "schedule") {
-    throw new RequestError(
-      "schedule trigger needs a cron expr: when='schedule:<cron>'",
-      "invalid_request",
-      400,
-    );
-  }
-  // A bare cron expression (5 whitespace-separated fields) is a schedule.
-  if (text.split(/\s+/).length === 5) {
-    return { when: "schedule", schedule: text };
-  }
   throw new RequestError(
-    `unrecognized when ${JSON.stringify(when)}: use 'now', 'schedule:<cron>', or 'watch:<source>'`,
+    `scheduled and watched jobs are not available; omit when or use "now" (got ${JSON.stringify(when)})`,
     "invalid_request",
     400,
   );
@@ -356,14 +569,51 @@ export function buildJobBody(options: SubmitJobOptions): Record<string, unknown>
   const body: Record<string, unknown> = { operation, model: options.model };
   const sourceFields = resolveSource(options.source, options.connection);
   Object.assign(body, sourceFields);
-  Object.assign(
-    body,
-    resolveSink(
-      options.sink,
-      sourceFields.connection as string | undefined,
-      options.sinkConnection,
-    ),
+  const sinkFields = resolveSink(
+    options.sink,
+    sourceFields.connection as string | undefined,
+    options.sinkConnection,
   );
+  if (
+    "items" in sourceFields &&
+    (options.connection != null ||
+      Object.keys(sinkFields).length > 0 ||
+      options.sinkConnection != null)
+  ) {
+    throw new RequestError(
+      "connection/sink/sinkConnection apply only to connector-src jobs; inline items return results",
+      "invalid_request",
+      400,
+    );
+  }
+  Object.assign(body, sinkFields);
+  if ("src" in body) {
+    if (options.execution !== "plan" && options.execution !== "run") {
+      throw new RequestError(
+        "connector jobs require execution='plan' or execution='run'",
+        "invalid_request",
+        400,
+      );
+    }
+    if (
+      options.execution !== "run" &&
+      (isInternalUri(String(options.source)) ||
+        (typeof options.sink === "string" && isInternalUri(options.sink)))
+    ) {
+      throw new RequestError(
+        "upload:// connector jobs are run-only; set execution='run'",
+        "invalid_request",
+        400,
+      );
+    }
+    body.execution = options.execution;
+  } else if (options.execution != null) {
+    throw new RequestError(
+      "execution applies only to connector-src jobs; inline items must omit it",
+      "invalid_request",
+      400,
+    );
+  }
   const mappingFields = resolveFieldMap(options.fieldMap, options.outputField);
   if (Object.keys(mappingFields).length > 0 && !("src" in body)) {
     throw new RequestError(
@@ -377,8 +627,8 @@ export function buildJobBody(options: SubmitJobOptions): Record<string, unknown>
   if (options.outputTypes && options.outputTypes.length > 0) {
     body.output_types = options.outputTypes;
   }
-  // Per-item options + op inputs (score query / extract labels / generate
-  // sampling), forwarded as-is; an empty map stays off the wire (additive).
+  // One job-level operation map (score query / extract labels / generate
+  // sampling), applied uniformly; an empty map stays off the wire (additive).
   if (options.options && Object.keys(options.options).length > 0) {
     body.options = options.options;
   }

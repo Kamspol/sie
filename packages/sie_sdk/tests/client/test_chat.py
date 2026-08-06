@@ -259,6 +259,39 @@ def test_stream_chat_retries_503_provisioning_then_streams() -> None:
         client.close()
 
 
+def test_stream_chat_retries_first_sse_model_loading_then_streams() -> None:
+    loading = {
+        "error": {"code": "MODEL_LOADING", "message": "loading"},
+    }
+    s200_loading = _FakeStream(lines=_sse(loading))
+    s200_ok = _FakeStream(lines=_sse(_chat_chunk("ok", finish="stop")))
+    with patch("sie_sdk.client.sync.httpx.Client") as mc, patch("sie_sdk.client.sync.time.sleep"):
+        mc.return_value.stream.side_effect = [s200_loading, s200_ok]
+        client = SIEClient("http://localhost:8080")
+
+        out = list(client.stream_chat_completions("m", [{"role": "user", "content": "hi"}], provision_timeout_s=5.0))
+
+        assert [c["choices"][0]["delta"].get("content") for c in out] == ["ok"]
+        assert mc.return_value.stream.call_count == 2
+        assert client.last_retry_count == 1
+        client.close()
+
+
+def test_stream_chat_does_not_retry_sse_model_loading_after_output() -> None:
+    loading = {"error": {"code": "MODEL_LOADING", "message": "loading"}}
+    partial_then_loading = _FakeStream(lines=_sse(_chat_chunk("partial"), loading))
+    with patch("sie_sdk.client.sync.httpx.Client") as mc:
+        mc.return_value.stream.return_value = partial_then_loading
+        client = SIEClient("http://localhost:8080")
+
+        with pytest.raises(ServerError, match="loading"):
+            list(client.stream_chat_completions("m", [{"role": "user", "content": "hi"}]))
+
+        assert mc.return_value.stream.call_count == 1
+        assert client.last_retry_count == 0
+        client.close()
+
+
 def test_chat_completions_reports_pre_execution_retry() -> None:
     retry = MagicMock()
     retry.status_code = 503

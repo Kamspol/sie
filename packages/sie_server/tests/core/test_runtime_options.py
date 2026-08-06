@@ -214,6 +214,19 @@ def test_generation_request_runtime_overrides_profile_defaults() -> None:
     assert resolved["top_p"] == 0.8
 
 
+def test_generation_frequency_penalty_and_seed_defaults_apply() -> None:
+    config = _generation_config()
+    config.profiles["default"].adapter_options.runtime["default_sampling"] |= {
+        "frequency_penalty": 0.5,
+        "seed": -(1 << 63),
+    }
+
+    resolved = apply_generation_runtime_options(config, None, {"prompt": "hi"})
+
+    assert resolved["frequency_penalty"] == 0.5
+    assert resolved["seed"] == -(1 << 63)
+
+
 def test_generation_profile_default_min_new_tokens_caps_to_explicit_max() -> None:
     config = _generation_config()
     config.profiles["default"].adapter_options.runtime["default_sampling"]["min_new_tokens"] = 10
@@ -279,8 +292,15 @@ def test_generation_unknown_option_fails_closed() -> None:
         {"temperature": "0.7"},
         {"top_p": None},
         {"presence_penalty": float("inf")},
+        {"temperature": 1 << 1024},
+        {"top_k": 1 << 1024},
+        {"min_new_tokens": 1 << 1024},
+        {"frequency_penalty": -2.1},
         {"top_k": True},
         {"min_new_tokens": -1},
+        {"seed": True},
+        {"seed": 1 << 63},
+        {"seed": 1 << 1024},
     ],
 )
 def test_generation_invalid_sampling_option_fails_closed(sampling: dict[str, object]) -> None:
@@ -292,6 +312,7 @@ def test_generation_invalid_sampling_option_fails_closed(sampling: dict[str, obj
         )
 
 
-def test_generation_non_finite_timeout_fails_closed() -> None:
+@pytest.mark.parametrize("value", [float("inf"), 1 << 1024])
+def test_generation_non_finite_timeout_fails_closed(value: float) -> None:
     with pytest.raises(ValueError, match="positive number"):
-        apply_generation_runtime_options(_generation_config(), {"overall_timeout_s": float("inf")}, {"prompt": "hi"})
+        apply_generation_runtime_options(_generation_config(), {"overall_timeout_s": value}, {"prompt": "hi"})

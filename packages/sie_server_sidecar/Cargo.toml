@@ -1,6 +1,6 @@
 [package]
 name = "sie-server-sidecar"
-version = "0.6.26"
+version = "0.6.27"
 edition = "2021"
 publish = false
 description = "SIE worker sidecar: NATS JetStream consumer, scheduler, IPC client, and GPU-independent prep for sie-server pods."
@@ -42,6 +42,7 @@ rmp = "0.8"
 # cannot round-trip through serde_json::Value.
 rmpv = { version = "1", features = ["with-serde"] }
 sha2 = "0.10"
+base64 = "0.22"
 
 clap = { version = "4", features = ["derive", "env"] }
 thiserror = "2"

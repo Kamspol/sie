@@ -1102,12 +1102,12 @@ async fn work_cancel_is_namespaced_acks_before_ipc_and_excludes_generation() {
         score_items: None,
         labels: None,
         output_schema: None,
-        generate: Some(serde_json::json!({
+        generate: Some(msg_value(serde_json::json!({
             "prompt": "generation is not request-cancelled",
             "max_new_tokens": 4,
             "temperature": 0.0,
             "top_p": 1.0,
-        })),
+        }))),
         routing_key: None,
         prompt_cache_key: None,
         bundle_config_hash: String::new(),
@@ -1207,12 +1207,12 @@ async fn smoke_generate_direct_dispatch_round_trips_through_rust_worker() {
         score_items: None,
         labels: None,
         output_schema: None,
-        generate: Some(serde_json::json!({
+        generate: Some(msg_value(serde_json::json!({
             "prompt": "hello",
             "max_new_tokens": 4,
             "temperature": 0.0,
             "top_p": 1.0,
-        })),
+        }))),
         routing_key: None,
         prompt_cache_key: None,
         bundle_config_hash: String::new(),
@@ -1323,12 +1323,12 @@ async fn smoke_generation_direct_dispatch_is_active_before_capability_reconcile(
         score_items: None,
         labels: None,
         output_schema: None,
-        generate: Some(serde_json::json!({
+        generate: Some(msg_value(serde_json::json!({
             "prompt": "hello after config",
             "max_new_tokens": 4,
             "temperature": 0.0,
             "top_p": 1.0,
-        })),
+        }))),
         routing_key: None,
         prompt_cache_key: None,
         bundle_config_hash: String::new(),

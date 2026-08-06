@@ -167,23 +167,80 @@ class _StubExecutor:
 
 
 class _FakeGenerateProcessor:
-    def signal_cancel(self, request_id: str) -> bool:  # noqa: ARG002
-        return False
+    def __init__(self) -> None:
+        self._cancel_events: dict[str, asyncio.Event] = {}
+
+    def signal_cancel(self, request_id: str) -> bool:
+        event = self._cancel_events.get(request_id)
+        if event is None:
+            return False
+        event.set()
+        return True
+
+    async def prewarm_grammars_for_model(self, model_id: str) -> None:  # noqa: ARG002
+        return None
 
     async def process(self, msg: Any, model_id: str) -> None:
         work_item = msgpack.unpackb(msg.data, raw=False)
         await msg.in_progress()
-        payload = msgpack.packb(
-            {
+        generate = work_item.get("generate") or {}
+        request_id = work_item.get("request_id")
+        messages = generate.get("messages") or []
+        images = messages[0].get("images") if messages else []
+        image_data = images[0].get("data") if images else None
+        test_nak_reason = generate.get("test_nak_reason")
+        wait_for_cancel = bool(generate.get("wait_for_cancel"))
+        cancel_event = asyncio.Event()
+        if wait_for_cancel:
+            self._cancel_events[request_id] = cancel_event
+
+        def payload(*, seq: int, done: bool, text_delta: str, finish_reason: str | None) -> bytes:
+            body = {
+                "kind": "chunk",
+                "request_id": request_id,
+                "attempt_id": "ipc-test-harness",
+                "seq": seq,
+                "text_delta": text_delta,
+                "done": done,
+                "image_data_is_bytes": isinstance(image_data, bytes),
+                "image_data": image_data,
+                "model_id": model_id,
                 "smoke": "generate",
                 "source": "ipc_test_harness",
-                "model_id": model_id,
-                "request_id": work_item.get("request_id"),
                 "work_item_id": work_item.get("work_item_id"),
-            },
-            use_bin_type=True,
-        )
-        await msg._sink.publish(work_item["reply_subject"], payload)
+            }
+            if finish_reason is not None:
+                body["finish_reason"] = finish_reason
+            return msgpack.packb(body, use_bin_type=True)
+
+        try:
+            if isinstance(test_nak_reason, str) and test_nak_reason:
+                await msg._sink.publish(
+                    work_item["reply_subject"],
+                    msgpack.packb(
+                        {
+                            "kind": "nak",
+                            "request_id": request_id,
+                            "attempt_id": "ipc-test-harness",
+                            "reason": test_nak_reason,
+                        },
+                        use_bin_type=True,
+                    ),
+                )
+                await msg.ack()
+                return
+            if wait_for_cancel:
+                await msg._sink.publish(
+                    work_item["reply_subject"],
+                    payload(seq=0, done=False, text_delta="started", finish_reason=None),
+                )
+                await cancel_event.wait()
+                terminal = payload(seq=1, done=True, text_delta="", finish_reason="cancelled")
+            else:
+                terminal = payload(seq=0, done=True, text_delta="generated", finish_reason="stop")
+            await msg._sink.publish(work_item["reply_subject"], terminal)
+        finally:
+            self._cancel_events.pop(request_id, None)
         await msg.ack()
 
 

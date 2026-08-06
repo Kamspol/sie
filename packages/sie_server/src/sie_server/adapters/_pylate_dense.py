@@ -3,19 +3,21 @@
 pylate ColBERT checkpoints describe their projection head in ``modules.json``:
 module 0 is the sentence-transformers ``Transformer`` backbone, and every later
 module is a ``pylate.models.Dense.Dense`` whose weights live in
-``<path>/model.safetensors`` under the single key ``linear.weight`` (shape
-``[out_features, in_features]``). pylate's ``Dense.forward`` is literally
-``self.linear(x)`` — it never applies the checkpoint's ``activation_function``
-— so with ``bias: false`` / ``use_residual: false`` the whole head is the
-sequential matmul ``hidden @ W0.T @ W1.T ...`` on the backbone's final-normed
-``last_hidden_state``. This composition is proven bit-exact against official
-pylate output in ``_poc/pylate-dense-chain/FINDINGS.md``. See #1680.
+``<path>/model.safetensors`` under ``linear.weight`` and, for dimension-changing
+residual layers, ``residual.weight``. With Identity activation and no bias, a
+residual layer is still one matmul: ``linear(x) + residual(x)`` is equivalent to
+``x @ (W_linear + W_residual).T`` (or ``W_linear + I`` when the dimensions are
+equal). The whole head can therefore remain the sequential matmul
+``hidden @ W0.T @ W1.T ...`` on the backbone's final-normed
+``last_hidden_state``. The non-residual composition is proven bit-exact against
+official pylate output in ``_poc/pylate-dense-chain/FINDINGS.md``. See #1680.
 
 Any checkpoint whose modules.json is absent, has no Dense modules (e.g.
 mxbai-colbert-large-v1 ships a Transformer-only modules.json), or declares math
-this loader does not reproduce (bias, residual, non-Identity activation, dim
-discontinuities) yields ``None`` so callers keep their existing behavior
-(legacy projection probes / backbone truncation) — degrade, don't fail.
+this loader does not reproduce (bias, non-Identity activation, malformed
+residual weights, dim discontinuities) yields ``None`` so callers keep their
+existing behavior (legacy projection probes / backbone truncation) — degrade,
+don't fail.
 """
 
 from __future__ import annotations
@@ -147,17 +149,8 @@ def load_pylate_dense_chain(
                 "Dense module %s has bias=true for %s; using backbone truncation", rel_dir, model_name_or_path
             )
             return None
-        # Missing key == false (GTE-ModernColBERT's config has no use_residual key).
-        if config.get("use_residual"):
-            logger.warning(
-                "Dense module %s has use_residual=true for %s; using backbone truncation",
-                rel_dir,
-                model_name_or_path,
-            )
-            return None
-        # pylate's Dense.forward never applies activation_function, but
-        # sentence-transformers' Dense.forward does — a non-Identity value means
-        # the checkpoint was trained with math we would not reproduce: degrade.
+        # PyLate applies activation_function before any residual. Only Identity
+        # keeps the layer reducible to the linear composition used below.
         activation = config.get("activation_function")
         if activation is not None and str(activation).rsplit(".", 1)[-1] != "Identity":
             logger.warning(
@@ -210,6 +203,36 @@ def load_pylate_dense_chain(
                 rel_dir,
                 tuple(weight.shape),
                 expected_shape,
+                model_name_or_path,
+            )
+            return None
+        use_residual = bool(config.get("use_residual", False))
+        residual = state.get("residual.weight")
+        if use_residual:
+            if expected_shape[0] == expected_shape[1]:
+                if residual is not None:
+                    logger.warning(
+                        "Dense module %s for %s unexpectedly ships residual.weight for an identity residual; "
+                        "using backbone truncation",
+                        rel_dir,
+                        model_name_or_path,
+                    )
+                    return None
+                residual = torch.eye(expected_shape[0], dtype=weight.dtype, device=weight.device)
+            elif residual is None or tuple(residual.shape) != expected_shape:
+                logger.warning(
+                    "Dense module %s residual shape %s != config (out, in)=%s for %s; using backbone truncation",
+                    rel_dir,
+                    None if residual is None else tuple(residual.shape),
+                    expected_shape,
+                    model_name_or_path,
+                )
+                return None
+            weight = weight + residual
+        elif residual is not None:
+            logger.warning(
+                "Dense module %s for %s ships residual.weight with use_residual=false; using backbone truncation",
+                rel_dir,
                 model_name_or_path,
             )
             return None

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SIEClient } from "../src/client.js";
 import { buildJobBody, connectionName } from "../src/jobs.js";
+import type { JobStatus } from "../src/jobs.js";
 import { packMessage } from "../src/msgpack.js";
 
 const mockFetch = vi.fn();
@@ -24,7 +25,29 @@ const SUBMIT_RESP = {
   preflight: { estimated_credits: 64 },
 };
 
+const CONNECTOR_STATUS_WITH_NUMERIC_REVISIONS: JobStatus = {
+  id: "job-1",
+  object: "job",
+  operation: "encode",
+  model: "BAAI/bge-m3",
+  state: "succeeded",
+  checkpoint: { published_revision: 3 },
+  publication: { revision: 4 },
+  attempt: {
+    ordinal: 2,
+    action: "repair",
+    state: "published",
+    recovery_attempt_ordinal: 1,
+  },
+};
+
 describe("buildJobBody (pure slot mapping)", () => {
+  it("types checkpoint and publication revisions as wire-format numbers", () => {
+    expect(CONNECTOR_STATUS_WITH_NUMERIC_REVISIONS.checkpoint?.published_revision).toBe(3);
+    expect(CONNECTOR_STATUS_WITH_NUMERIC_REVISIONS.publication?.revision).toBe(4);
+    expect(CONNECTOR_STATUS_WITH_NUMERIC_REVISIONS.attempt?.recovery_attempt_ordinal).toBe(1);
+  });
+
   it("maps an inline list to items", () => {
     expect(buildJobBody({ source: ["a", "b"], model: "m" })).toEqual({
       operation: "encode",
@@ -38,10 +61,12 @@ describe("buildJobBody (pure slot mapping)", () => {
       source: "postgres://warehouse?query=x",
       model: "m",
       sink: "postgres://warehouse?table=t",
+      execution: "plan",
     });
     expect(body.src).toBe("postgres://warehouse?query=x");
     expect(body.connection).toBe("warehouse");
     expect(body.sink).toBe("postgres://warehouse?table=t");
+    expect(body.execution).toBe("plan");
     expect(body.sink_connection).toBeUndefined();
   });
 
@@ -50,26 +75,67 @@ describe("buildJobBody (pure slot mapping)", () => {
       source: "postgres://wh?query=x",
       model: "m",
       sink: "s3://out/vecs",
+      execution: "run",
     });
     expect(body.sink_connection).toBe("out");
   });
 
-  it("maps schedule / watch triggers", () => {
-    expect(buildJobBody({ source: ["a"], model: "m", when: "schedule:*/5 * * * *" })).toMatchObject(
-      {
-        when: "schedule",
-        schedule: "*/5 * * * *",
-      },
+  it("requires explicit connector execution and rejects it for inline jobs", () => {
+    expect(() =>
+      buildJobBody({
+        source: "postgres://warehouse?query=x",
+        model: "m",
+        sink: "postgres://warehouse?table=t",
+      }),
+    ).toThrow(/require execution/);
+    expect(() => buildJobBody({ source: ["a"], model: "m", execution: "plan" })).toThrow(
+      /only to connector/,
     );
-    expect(buildJobBody({ source: ["a"], model: "m", when: "watch:s3://in" })).toMatchObject({
-      when: "watch",
-      watch: "s3://in",
-    });
+  });
+
+  it("rejects unavailable schedule / watch triggers", () => {
+    expect(() => buildJobBody({ source: ["a"], model: "m", when: "schedule:*/5 * * * *" })).toThrow(
+      /not available/,
+    );
+    expect(() => buildJobBody({ source: ["a"], model: "m", when: "watch:s3://in" })).toThrow(
+      /not available/,
+    );
   });
 
   it("derives connection names from URIs", () => {
     expect(connectionName("postgres://warehouse?query=x")).toBe("warehouse");
     expect(connectionName("s3://customer-bucket/in/")).toBe("customer-bucket");
+  });
+
+  it.each([
+    "../other",
+    "warehouse/name",
+    "warehouse%2fname",
+    "warehouse\n",
+    "warehouse\r",
+    "warehouse\u2028",
+    "café",
+    "a".repeat(129),
+  ])("rejects non-canonical connector name %s", (name) => {
+    if (name !== "warehouse/name") {
+      expect(() => connectionName(`postgres://${name}?query=x`)).toThrow(/connection name/);
+    }
+    expect(() =>
+      buildJobBody({
+        source: "postgres://warehouse?query=x",
+        model: "m",
+        sink: "postgres://warehouse?table=out",
+        connection: name,
+      }),
+    ).toThrow(/connection name/);
+    expect(() =>
+      buildJobBody({
+        source: "postgres://warehouse?query=x",
+        model: "m",
+        sink: "postgres://warehouse?table=out",
+        sinkConnection: name,
+      }),
+    ).toThrow(/connection name/);
   });
 
   // field_map / output_field + the internal upload:// scheme
@@ -86,6 +152,7 @@ describe("buildJobBody (pure slot mapping)", () => {
         input_type: "text",
       },
       outputField: "embedding",
+      execution: "plan",
     });
     expect(body.field_map).toEqual({
       id_field: "id",
@@ -105,6 +172,7 @@ describe("buildJobBody (pure slot mapping)", () => {
         source: "postgres://wh?query=x",
         model: "m",
         sink: "postgres://wh?table=t",
+        execution: "plan",
         fieldMap: { id_column: "id" } as never,
       }),
     ).toThrowError(/unknown field_map key/);
@@ -113,9 +181,21 @@ describe("buildJobBody (pure slot mapping)", () => {
         source: "postgres://wh?query=x",
         model: "m",
         sink: "postgres://wh?table=t",
+        execution: "plan",
         fieldMap: { input_type: "rows" } as never,
       }),
     ).toThrowError(/input_type/);
+  });
+
+  it.each([
+    { sink: "inplace" },
+    { sink: "postgres://wh?table=vecs" },
+    { sinkConnection: "wh" },
+    { connection: "wh" },
+  ])("rejects connector fields on inline items: %j", (connectorFields) => {
+    expect(() => buildJobBody({ source: ["a"], model: "m", ...connectorFields })).toThrowError(
+      /connector-src/,
+    );
   });
 
   it("derives no connection for the internal upload:// scheme", () => {
@@ -124,6 +204,7 @@ describe("buildJobBody (pure slot mapping)", () => {
       model: "m",
       sink: "upload://file-out",
       fieldMap: { id_field: "doc_id", input_field: "text" },
+      execution: "run",
     });
     expect(body.src).toBe("upload://file-abc?format=csv");
     expect(body.sink).toBe("upload://file-out");
@@ -135,9 +216,18 @@ describe("buildJobBody (pure slot mapping)", () => {
       model: "m",
       sink: "postgres://wh?table=doc_vectors",
       sinkConnection: "wh",
+      execution: "run",
     });
     expect(cross.connection).toBeUndefined();
     expect(cross.sink_connection).toBe("wh");
+    expect(() =>
+      buildJobBody({
+        source: "upload://file-abc",
+        model: "m",
+        sink: "upload://file-out",
+        execution: "plan",
+      }),
+    ).toThrow(/run-only/);
   });
 
   it("forwards op inputs via options as-is (op matrix)", () => {
@@ -148,6 +238,7 @@ describe("buildJobBody (pure slot mapping)", () => {
       operation: "score",
       sink: "postgres://wh?table=scores",
       options: { query: "rank these documents" },
+      execution: "run",
     });
     expect(score.options).toEqual({ query: "rank these documents" });
 
@@ -195,11 +286,16 @@ describe("client.jobs", () => {
       source: "postgres://warehouse?query=x",
       model: "m",
       sink: "s3://out/vecs",
+      execution: "plan",
+      idempotencyKey: "plan-warehouse-1",
     });
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const init = mockFetch.mock.calls[0][1];
+    const body = JSON.parse(init.body);
     expect(body.src).toBe("postgres://warehouse?query=x");
     expect(body.connection).toBe("warehouse");
     expect(body.sink_connection).toBe("out");
+    expect(body.execution).toBe("plan");
+    expect(init.headers["Idempotency-Key"]).toBe("plan-warehouse-1");
   });
 
   it("submit forwards score query and extract labels via options", async () => {
@@ -211,6 +307,8 @@ describe("client.jobs", () => {
       operation: "score",
       sink: "postgres://wh?table=scores",
       options: { query: "rank these documents" },
+      execution: "run",
+      idempotencyKey: "run-score-1",
     });
     const scoreBody = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(scoreBody.operation).toBe("score");
@@ -228,6 +326,26 @@ describe("client.jobs", () => {
     expect(extractBody.options).toEqual({ labels: ["PERSON", "ORG"] });
   });
 
+  it("requires a retry-stable idempotency key for connectors before fetch", async () => {
+    const client = new SIEClient("http://gw:8080");
+    await expect(
+      client.jobs.submit({
+        source: "postgres://warehouse?query=x",
+        model: "m",
+        sink: "postgres://warehouse?table=out",
+        execution: "plan",
+      }),
+    ).rejects.toThrow(/idempotencyKey/);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("keeps inline submissions free of connector idempotency headers", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse(SUBMIT_RESP, 201));
+    const client = new SIEClient("http://gw:8080");
+    await client.jobs.submit({ source: ["a"], model: "m" });
+    expect(mockFetch.mock.calls[0][1].headers["Idempotency-Key"]).toBeUndefined();
+  });
+
   it("get and cancel hit the expected URLs", async () => {
     mockFetch.mockResolvedValueOnce(jsonResponse({ id: "job-1", state: "running" }));
     const client = new SIEClient("http://gw:8080");
@@ -239,6 +357,47 @@ describe("client.jobs", () => {
     expect(out.state).toBe("cancelled");
     expect(mockFetch.mock.calls[1][0]).toBe("http://gw:8080/v1/jobs/job-1/cancel");
     expect(mockFetch.mock.calls[1][1].method).toBe("POST");
+  });
+
+  it("execute posts the exact plan revision with one idempotency key", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ id: "job-1", state: "queued" }));
+    const client = new SIEClient("http://gw:8080");
+
+    await client.jobs.execute("job-1", 3, "execute-plan-3");
+
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(url).toBe("http://gw:8080/v1/jobs/job-1/execute");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual({ plan_revision: 3 });
+    expect(init.headers["Idempotency-Key"]).toBe("execute-plan-3");
+  });
+
+  it("execute rejects an invalid idempotency key before fetch", async () => {
+    const client = new SIEClient("http://gw:8080");
+    await expect(client.jobs.execute("job-1", 3, "")).rejects.toThrow(/idempotencyKey/);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("repair posts the exact plan revision and recovery predecessor", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ id: "job-1", state: "running" }, 202));
+    const client = new SIEClient("http://gw:8080");
+
+    await client.jobs.repair("job-1", 3, 2, "repair-plan-3-attempt-2");
+
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(url).toBe("http://gw:8080/v1/jobs/job-1/repair");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual({
+      plan_revision: 3,
+      recovery_attempt_ordinal: 2,
+    });
+    expect(init.headers["Idempotency-Key"]).toBe("repair-plan-3-attempt-2");
+  });
+
+  it("repair rejects an invalid idempotency key before fetch", async () => {
+    const client = new SIEClient("http://gw:8080");
+    await expect(client.jobs.repair("job-1", 3, 2, "")).rejects.toThrow(/idempotencyKey/);
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it("list returns the data array", async () => {
@@ -293,6 +452,16 @@ describe("client.jobs", () => {
     const job = await client.jobs.wait("job-1", { pollMs: 0 });
     expect(job.state).toBe("succeeded");
     expect(mockFetch.mock.calls.length).toBe(2);
+  });
+
+  it("wait returns a stable planned connector phase without polling again", async () => {
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ id: "job-plan-1", state: "queued", execution: "plan", phase: "planned" }),
+    );
+    const client = new SIEClient("http://gw:8080");
+    const job = await client.jobs.wait("job-plan-1", { pollMs: 0 });
+    expect(job.phase).toBe("planned");
+    expect(mockFetch.mock.calls.length).toBe(1);
   });
 
   it("wait throws a job_wait_timeout RequestError when the deadline passes", async () => {

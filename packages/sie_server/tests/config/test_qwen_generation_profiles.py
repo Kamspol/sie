@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import yaml
+from PIL import Image
 from sie_server.config.model import ModelConfig, ResolvedProfile
+from transformers import Qwen2VLImageProcessorFast
 
 _QWEN35_MODEL_PATH = Path(__file__).resolve().parents[2] / "models" / "Qwen__Qwen3.5-4B.yaml"
 _ADAPTER = "sie_server.adapters.sglang.generation:SGLangGenerationAdapter"
+_STRICT_THINKING_ADAPTER = "sie_server.adapters.sglang.cuda13:SGLangStrictThinkingAdapter"
 _MLX_REPO = "mlx-community/Qwen3.5-4B-4bit"
 _QWEN36_MODEL_PATH = Path(__file__).resolve().parents[2] / "models" / "Qwen__Qwen3.6-27B.yaml"
+_QWEN36_35B_MODEL_PATH = Path(__file__).resolve().parents[2] / "models" / "Qwen__Qwen3.6-35B-A3B.yaml"
+_QWEN_IMAGE_MIN_PIXELS = 65536
+_QWEN_IMAGE_MAX_PIXELS = 1280 * 28 * 28
+_MM_PROCESS_CONFIG_ARGS = [
+    "--mm-process-config",
+    '{"image":{"min_pixels":65536,"max_pixels":1003520}}',
+]
 
 
 def _qwen35_config() -> ModelConfig:
@@ -46,6 +57,7 @@ def test_qwen35_default_resolves_to_measured_a100_shape() -> None:
         "num_draft_tokens": 4,
     }
     assert default.loadtime["extra_launch_args"] == [
+        *_MM_PROCESS_CONFIG_ARGS,
         "--mamba-scheduler-strategy",
         "extra_buffer",
     ]
@@ -63,6 +75,7 @@ def test_qwen35_l4_smoke_preserves_constrained_c1_shape() -> None:
     assert l4_smoke.loadtime["mem_fraction_static"] == 0.90
     assert l4_smoke.loadtime["speculative"]["enabled"] is True
     assert l4_smoke.loadtime["extra_launch_args"] == [
+        *_MM_PROCESS_CONFIG_ARGS,
         "--mamba-scheduler-strategy",
         "extra_buffer",
         "--disable-overlap-schedule",
@@ -127,8 +140,12 @@ def test_qwen36_grammar_requests_route_to_no_spec() -> None:
     assert h100_fp8.adapter_path == no_spec.adapter_path
     assert h100_fp8.runtime == no_spec.runtime
     assert h100_fp8.loadtime["speculative"] == {"enabled": False}
-    assert h100_fp8.loadtime["extra_launch_args"] == ["--quantization", "fp8"]
-    assert default.loadtime["grammar_backend"] == no_spec.loadtime["grammar_backend"] == "outlines"
+    assert h100_fp8.loadtime["extra_launch_args"] == [
+        *_MM_PROCESS_CONFIG_ARGS,
+        "--quantization",
+        "fp8",
+    ]
+    assert default.loadtime["grammar_backend"] == no_spec.loadtime["grammar_backend"] == "xgrammar"
     assert default.loadtime["speculative"] == {
         "enabled": False,
         "algorithm": "nextn",
@@ -139,18 +156,21 @@ def test_qwen36_grammar_requests_route_to_no_spec() -> None:
     assert no_spec.loadtime["speculative"] == {"enabled": False}
 
 
-def test_qwen36_profiles_use_official_non_thinking_sampling_defaults() -> None:
+def test_qwen36_minimum_tokens_are_limited_to_free_text_profiles() -> None:
     config = ModelConfig.model_validate(yaml.safe_load(_QWEN36_MODEL_PATH.read_text()))
-    expected = {
+    base_sampling = {
         "temperature": 0.7,
         "top_p": 0.8,
         "top_k": 20,
         "presence_penalty": 1.5,
-        "min_new_tokens": 10,
     }
 
-    for profile_name in ("default", "h100", "h100-fp8", "rtx-pro-6000", "batch", "no-spec"):
-        assert config.resolve_profile(profile_name).runtime["default_sampling"] == expected
+    for profile_name in ("default", "h100", "rtx-pro-6000", "batch"):
+        assert config.resolve_profile(profile_name).runtime["default_sampling"] == (
+            base_sampling | {"min_new_tokens": 10}
+        )
+    for profile_name in ("no-spec", "h100-fp8"):
+        assert config.resolve_profile(profile_name).runtime["default_sampling"] == base_sampling
 
 
 def test_qwen36_base_profiles_expose_8k_context() -> None:
@@ -164,3 +184,47 @@ def test_qwen36_base_profiles_expose_8k_context() -> None:
     assert config.resolve_profile("h100-fp8").kv_budget_tokens == 16384
     assert config.resolve_profile("batch").kv_budget_tokens == 32768
     assert config.resolve_profile("no-spec").kv_budget_tokens == 65536
+
+
+def test_all_qwen_vlm_profiles_pair_pinned_image_bounds() -> None:
+    for model_path in (
+        _QWEN35_MODEL_PATH,
+        _QWEN36_MODEL_PATH,
+        _QWEN36_35B_MODEL_PATH,
+    ):
+        config = ModelConfig.model_validate(yaml.safe_load(model_path.read_text()))
+        assert config.inputs.image is True
+        for profile_name in config.profiles:
+            profile = config.resolve_profile(profile_name)
+            if profile.adapter_path not in {_ADAPTER, _STRICT_THINKING_ADAPTER}:
+                continue
+            args = profile.loadtime["extra_launch_args"]
+            assert args.count("--mm-process-config") == 1, (model_path.name, profile_name, args)
+            index = args.index("--mm-process-config")
+            assert json.loads(args[index + 1]) == {
+                "image": {
+                    # Transformers 4.57.6 only applies the per-call maximum
+                    # when the Qwen fast processor receives both bounds.
+                    "min_pixels": _QWEN_IMAGE_MIN_PIXELS,
+                    "max_pixels": _QWEN_IMAGE_MAX_PIXELS,
+                }
+            }
+
+
+def test_qwen_fast_processor_applies_paired_image_bounds() -> None:
+    processor = Qwen2VLImageProcessorFast(
+        size={"shortest_edge": _QWEN_IMAGE_MIN_PIXELS, "longest_edge": 16777216},
+        patch_size=16,
+        temporal_patch_size=2,
+        merge_size=2,
+    )
+
+    result = processor(
+        images=Image.new("RGB", (2048, 2048), (255, 0, 0)),
+        return_tensors="pt",
+        min_pixels=_QWEN_IMAGE_MIN_PIXELS,
+        max_pixels=_QWEN_IMAGE_MAX_PIXELS,
+    )
+
+    assert result["image_grid_thw"].tolist() == [[1, 62, 62]]
+    assert result["image_grid_thw"].prod().item() // (2**2) <= 1280

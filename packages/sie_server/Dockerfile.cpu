@@ -108,7 +108,7 @@ RUN echo "import sys; sys.path.insert(0, '/app/bundle-libs')" \
 # .venv cleanup + stdlib trim — runs here so /app/.venv reaches its final
 # form BEFORE bundle divergence. Largest wins: torch/include, *.a static
 # libs, stripping shared objects. Keep bytecode (cold-start matters more
-# than size).
+# than size) and wheel RECORD metadata used by native-library loaders.
 RUN set -eux; \
     cd /app/.venv/lib/python3.12/site-packages; \
     find . -type d -name '__pycache__' -prune -exec rm -rf {} +; \
@@ -116,7 +116,6 @@ RUN set -eux; \
     find . -type d -name 'tests' -prune -exec rm -rf {} +; \
     rm -rf torch/test torch/utils/tensorboard torch/utils/bottleneck 2>/dev/null || true; \
     find torch -type f -name '*.a' -delete 2>/dev/null || true; \
-    find . -type f -name 'RECORD' -path '*dist-info*' -delete; \
     rm -rf /app/.venv/share/jupyter 2>/dev/null || true; \
     rm -rf /usr/local/lib/python3.12/test /usr/local/lib/python3.12/idlelib 2>/dev/null || true; \
     find /app/.venv -exec touch -h -d @0 {} + 2>/dev/null || true
@@ -151,7 +150,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
             -r /tmp/bundle-requirements.txt; \
     fi
 
-# bundle-libs cleanup (symmetric to the .venv cleanup in base).
+# bundle-libs cleanup (symmetric to the .venv cleanup in base). Preserve
+# dist-info RECORD files for runtime native-library discovery.
 RUN set -eux; \
     if [ -d /app/bundle-libs ]; then \
         cd /app/bundle-libs; \
@@ -160,7 +160,6 @@ RUN set -eux; \
         find . -type d -name 'tests' -prune -exec rm -rf {} +; \
         rm -rf torch/test torch/utils/tensorboard torch/utils/bottleneck 2>/dev/null || true; \
         find torch -type f -name '*.a' -delete 2>/dev/null || true; \
-        find . -type f -name 'RECORD' -path '*dist-info*' -delete; \
     fi; \
     find /app/bundle-libs -exec touch -h -d @0 {} + 2>/dev/null || true
 

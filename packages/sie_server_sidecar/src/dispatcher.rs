@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 use async_nats::jetstream::Message;
 use futures_util::future::join_all;
 use rmpv::Value as MsgValue;
-use serde_json::Value as Json;
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
@@ -73,6 +72,107 @@ const PAYLOAD_TOO_LARGE_ERROR_CODE: &str = "PAYLOAD_TOO_LARGE";
 const PAYLOAD_ERROR_CODE: &str = "payload_error";
 const PAYLOAD_RESOLVE_ERROR_MESSAGE: &str = "failed to resolve item";
 const PAYLOAD_TOO_LARGE_MESSAGE: &str = "referenced payload exceeds the worker size limit";
+
+#[derive(Debug, Error)]
+#[error("{code}: {message}")]
+pub struct GenerateDispatchError {
+    pub code: String,
+    pub message: String,
+}
+
+impl GenerateDispatchError {
+    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+enum LocalGeneratePhase {
+    #[default]
+    Streaming,
+    AwaitingChunkAck,
+    AwaitingRetryAck {
+        reason: String,
+    },
+    Complete,
+    Retry {
+        reason: String,
+    },
+}
+
+#[derive(Default)]
+struct LocalGenerateState {
+    attempt_id: Option<String>,
+    next_seq: u32,
+    phase: LocalGeneratePhase,
+}
+
+impl LocalGenerateState {
+    fn observe_ack(&mut self) -> Result<(), String> {
+        self.phase = match &self.phase {
+            LocalGeneratePhase::AwaitingChunkAck => LocalGeneratePhase::Complete,
+            LocalGeneratePhase::AwaitingRetryAck { reason } => LocalGeneratePhase::Retry {
+                reason: reason.clone(),
+            },
+            phase => {
+                return Err(format!(
+                    "generation ACK violated publication/settlement ordering in phase {phase:?}"
+                ));
+            }
+        };
+        Ok(())
+    }
+
+    fn observe_transport_nak(&mut self) -> Result<(), String> {
+        if !matches!(self.phase, LocalGeneratePhase::Streaming) || self.next_seq != 0 {
+            return Err(format!(
+                "generation NAK violated publication/settlement ordering in phase {:?}",
+                self.phase
+            ));
+        }
+        self.phase = LocalGeneratePhase::Retry {
+            reason: "backend_redelivery".to_string(),
+        };
+        Ok(())
+    }
+
+    fn observe_progress(&self) -> Result<(), String> {
+        if matches!(self.phase, LocalGeneratePhase::Streaming) {
+            Ok(())
+        } else {
+            Err(format!(
+                "generation progress violated terminal/settlement ordering in phase {:?}",
+                self.phase
+            ))
+        }
+    }
+}
+
+#[derive(Debug)]
+enum LocalGeneratePublication {
+    Chunk(Vec<u8>),
+    Retry,
+}
+
+struct InflightBatchGuard {
+    runtime_state: Arc<RuntimeState>,
+}
+
+impl InflightBatchGuard {
+    fn enter(runtime_state: Arc<RuntimeState>) -> Self {
+        runtime_state.inflight_batches.inc();
+        Self { runtime_state }
+    }
+}
+
+impl Drop for InflightBatchGuard {
+    fn drop(&mut self) {
+        decrement_gauge(&self.runtime_state.inflight_batches, 1);
+    }
+}
 
 fn payload_error_contract(error: &PayloadError) -> (&'static str, &'static str) {
     match error {
@@ -585,6 +685,186 @@ impl Dispatcher {
 }
 
 impl Dispatcher {
+    /// Execute one already-bound generation item without assuming a queue
+    /// result substrate. The caller supplies a backpressured chunk sink;
+    /// Python remains responsible for model semantics and chunk encoding.
+    pub async fn process_local_generate<F, Fut>(
+        &self,
+        mut wi: WorkItem,
+        on_chunk: F,
+    ) -> Result<(), GenerateDispatchError>
+    where
+        F: Fn(Vec<u8>) -> Fut + Clone,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
+        let model_id = wi.model_id.clone();
+        match self.backend.ensure_model_ready(&model_id).await {
+            Ok(response) => match response.state {
+                ReadinessState::Ready => {}
+                ReadinessState::LoadingStarted
+                | ReadinessState::LoadingInProgress
+                | ReadinessState::RetryLater => {
+                    return Err(GenerateDispatchError::new(
+                        MODEL_LOADING_ERROR_CODE,
+                        format!("model {model_id:?} is loading"),
+                    ));
+                }
+                ReadinessState::Failed => {
+                    return Err(GenerateDispatchError::new(
+                        MODEL_LOAD_FAILED_ERROR_CODE,
+                        format!("model {model_id:?} failed to load"),
+                    ));
+                }
+            },
+            Err(error) => {
+                return Err(GenerateDispatchError::new(
+                    "BACKEND_UNAVAILABLE",
+                    format!("EnsureModelReady failed: {error}"),
+                ));
+            }
+        }
+
+        if let Some(generate) = wi.generate.as_mut() {
+            crate::prep::media::normalize_generate_media(generate).map_err(|error| {
+                GenerateDispatchError::new(INVALID_INPUT_ERROR_CODE, error.to_string())
+            })?;
+        } else {
+            return Err(GenerateDispatchError::new(
+                INVALID_INPUT_ERROR_CODE,
+                "generate parameters are required",
+            ));
+        }
+
+        let _execution_guard = if let Some(state) = self.config_apply_state.as_ref() {
+            let guard = state.lock_execution().await;
+            if !state.accepts_bundle_config_hash(&wi.bundle_config_hash) {
+                return Err(GenerateDispatchError::new(
+                    "BUNDLE_CONFIG_MISMATCH",
+                    "worker configuration changed before generation execution",
+                ));
+            }
+            Some(guard)
+        } else {
+            None
+        };
+        let executed_hash = wi.bundle_config_hash.clone();
+        let reply_subject = wi.reply_subject.clone();
+        let expected_request_id = wi.request_id.clone();
+        let work_item_msgpack = rmp_serde::to_vec_named(&wi).map_err(|error| {
+            GenerateDispatchError::new(
+                "INTERNAL_ERROR",
+                format!("failed to encode generate work item: {error}"),
+            )
+        })?;
+        let state = Arc::new(Mutex::new(LocalGenerateState::default()));
+        let callback_state = Arc::clone(&state);
+
+        let _inflight_guard = InflightBatchGuard::enter(Arc::clone(&self.runtime_state));
+        let result = self
+            .worker_pool
+            .process_generate(
+                ProcessGenerateRequest {
+                    model_id,
+                    work_item_msgpack,
+                },
+                move |event| {
+                    let state = Arc::clone(&callback_state);
+                    let on_chunk = on_chunk.clone();
+                    let executed_hash = executed_hash.clone();
+                    let expected_request_id = expected_request_id.clone();
+                    let reply_subject = reply_subject.clone();
+                    async move {
+                        match event.kind.as_str() {
+                            "publish" => {
+                                if event.reply_subject != reply_subject {
+                                    return Err(IpcError::Server(
+                                        "generation publish reply_subject mismatch".to_string(),
+                                    ));
+                                }
+                                let publication = {
+                                    let mut state = state.lock().await;
+                                    validate_local_generate_publication(
+                                        event.payload,
+                                        &expected_request_id,
+                                        &executed_hash,
+                                        &mut state,
+                                    )
+                                    .map_err(IpcError::Server)?
+                                };
+                                match publication {
+                                    LocalGeneratePublication::Chunk(payload) => {
+                                        on_chunk(payload).await.map_err(IpcError::Server)
+                                    }
+                                    LocalGeneratePublication::Retry => Ok(()),
+                                }
+                            }
+                            "ack" => {
+                                let mut state = state.lock().await;
+                                state.observe_ack().map_err(IpcError::Server)
+                            }
+                            "nak" => {
+                                let mut state = state.lock().await;
+                                state.observe_transport_nak().map_err(IpcError::Server)
+                            }
+                            "in_progress" => {
+                                let state = state.lock().await;
+                                state.observe_progress().map_err(IpcError::Server)
+                            }
+                            other => Err(IpcError::Server(format!(
+                                "unknown ProcessGenerate event {other:?}"
+                            ))),
+                        }
+                    }
+                },
+            )
+            .await;
+
+        if let Err(error) = result {
+            let _ = self
+                .worker_pool
+                .signal_generate_cancel(wi.request_id.clone())
+                .await;
+            return Err(GenerateDispatchError::new(
+                "TRANSPORT_FAILURE",
+                format!("generation backend stream failed: {error}"),
+            ));
+        }
+        let phase = state.lock().await.phase.clone();
+        match phase {
+            LocalGeneratePhase::Complete => Ok(()),
+            LocalGeneratePhase::Retry { reason } => Err(GenerateDispatchError::new(
+                "RETRY_LATER",
+                format!("generation backend requested retry: {reason}"),
+            )),
+            phase => {
+                let _ = self
+                    .worker_pool
+                    .signal_generate_cancel(wi.request_id.clone())
+                    .await;
+                Err(GenerateDispatchError::new(
+                    "TRANSPORT_FAILURE",
+                    format!("generation ended in incomplete phase {phase:?}"),
+                ))
+            }
+        }
+    }
+
+    pub async fn signal_local_generate_cancel(
+        &self,
+        request_id: &str,
+    ) -> Result<bool, GenerateDispatchError> {
+        self.worker_pool
+            .signal_generate_cancel(request_id.to_string())
+            .await
+            .map(|response| response.matched)
+            .map_err(|error| {
+                GenerateDispatchError::new(
+                    "TRANSPORT_FAILURE",
+                    format!("generation cancel IPC failed: {error}"),
+                )
+            })
+    }
+
     fn current_bundle_config_hash(&self) -> Option<String> {
         self.config_apply_state
             .as_ref()
@@ -1335,6 +1615,34 @@ impl Dispatcher {
                     nak_msg(&msg, base_delay_ms, &self.runtime_state.telemetry).await;
                     return;
                 }
+            }
+        }
+
+        if let Some(generate) = wi.generate.as_mut() {
+            if let Err(error) = crate::prep::media::normalize_generate_media(generate) {
+                warn!(
+                    work_item_id = %wi.work_item_id,
+                    request_id = %wi.request_id,
+                    model = %model_id,
+                    error = %error,
+                    "invalid generation media — publishing terminal error + ACK"
+                );
+                match self
+                    .publish_generate_terminal_error(
+                        &wi,
+                        INVALID_INPUT_ERROR_CODE,
+                        &error.to_string(),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        let _ = ack_msg(&msg, &self.runtime_state.telemetry).await;
+                    }
+                    Err(_) => {
+                        nak_msg(&msg, base_delay_ms, &self.runtime_state.telemetry).await;
+                    }
+                }
+                return;
             }
         }
 
@@ -3644,6 +3952,174 @@ fn stamp_generate_execution_hash(
         .map_err(|error| IpcError::Server(format!("encode generation chunk: {error}")).into())
 }
 
+fn validate_local_generate_publication(
+    payload: Vec<u8>,
+    expected_request_id: &str,
+    executed_bundle_config_hash: &str,
+    state: &mut LocalGenerateState,
+) -> Result<LocalGeneratePublication, String> {
+    let mut value: MsgValue = rmp_serde::from_slice(&payload)
+        .map_err(|error| format!("decode generation publication: {error}"))?;
+    let MsgValue::Map(fields) = &value else {
+        return Err("generation publication is not a msgpack map".to_string());
+    };
+    let kind = unique_generate_chunk_field(fields, "kind")?
+        .and_then(MsgValue::as_str)
+        .ok_or_else(|| "generation publication kind must be a string".to_string())?
+        .to_string();
+
+    match kind.as_str() {
+        "chunk" => {
+            validate_local_generate_chunk_fields(fields, expected_request_id, state)?;
+            if !executed_bundle_config_hash.is_empty() {
+                let MsgValue::Map(fields) = &mut value else {
+                    unreachable!("publication map was validated above")
+                };
+                fields.retain(|(key, _)| key.as_str() != Some("executed_bundle_config_hash"));
+                fields.push((
+                    MsgValue::from("executed_bundle_config_hash"),
+                    MsgValue::from(executed_bundle_config_hash),
+                ));
+            }
+            let payload = rmp_serde::to_vec_named(&value)
+                .map_err(|error| format!("encode generation chunk: {error}"))?;
+            Ok(LocalGeneratePublication::Chunk(payload))
+        }
+        "nak" => {
+            validate_local_generate_nak_fields(fields, expected_request_id, state)?;
+            Ok(LocalGeneratePublication::Retry)
+        }
+        other => Err(format!("unexpected generation publication kind {other:?}")),
+    }
+}
+
+#[cfg(test)]
+fn validate_local_generate_chunk(
+    payload: &[u8],
+    expected_request_id: &str,
+    state: &mut LocalGenerateState,
+) -> Result<(), String> {
+    let value: MsgValue = rmp_serde::from_slice(payload)
+        .map_err(|error| format!("decode generation chunk: {error}"))?;
+    let MsgValue::Map(fields) = value else {
+        return Err("generation chunk is not a msgpack map".to_string());
+    };
+    validate_local_generate_chunk_fields(&fields, expected_request_id, state)
+}
+
+fn validate_local_generate_chunk_fields(
+    fields: &[(MsgValue, MsgValue)],
+    expected_request_id: &str,
+    state: &mut LocalGenerateState,
+) -> Result<(), String> {
+    if !matches!(state.phase, LocalGeneratePhase::Streaming) {
+        return Err(format!(
+            "generation emitted a chunk after terminal/settlement phase {:?}",
+            state.phase
+        ));
+    }
+    let kind = unique_generate_chunk_field(fields, "kind")?
+        .and_then(MsgValue::as_str)
+        .ok_or_else(|| "generation chunk kind must be a string".to_string())?;
+    if kind != "chunk" {
+        return Err(format!("unexpected generation chunk kind {kind:?}"));
+    }
+    let request_id = unique_generate_chunk_field(fields, "request_id")?
+        .and_then(MsgValue::as_str)
+        .ok_or_else(|| "generation chunk request_id must be a string".to_string())?;
+    if request_id != expected_request_id {
+        return Err("generation chunk request_id mismatch".to_string());
+    }
+    let attempt_id = unique_generate_chunk_field(fields, "attempt_id")?
+        .and_then(MsgValue::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .ok_or_else(|| "generation chunk attempt_id is invalid".to_string())?;
+    match state.attempt_id.as_deref() {
+        Some(expected) if expected != attempt_id => {
+            return Err("generation chunk attempt_id changed within stream".to_string());
+        }
+        None => state.attempt_id = Some(attempt_id.to_string()),
+        _ => {}
+    }
+    let seq = unique_generate_chunk_field(fields, "seq")?
+        .and_then(MsgValue::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| "generation chunk seq must be a u32".to_string())?;
+    if seq != state.next_seq {
+        return Err(format!(
+            "generation chunk seq gap: got {seq}, expected {}",
+            state.next_seq
+        ));
+    }
+    state.next_seq = state
+        .next_seq
+        .checked_add(1)
+        .ok_or_else(|| "generation chunk sequence overflow".to_string())?;
+    let done = unique_generate_chunk_field(fields, "done")?
+        .and_then(MsgValue::as_bool)
+        .ok_or_else(|| "generation chunk done must be a bool".to_string())?;
+    if done {
+        state.phase = LocalGeneratePhase::AwaitingChunkAck;
+    }
+    Ok(())
+}
+
+fn validate_local_generate_nak_fields(
+    fields: &[(MsgValue, MsgValue)],
+    expected_request_id: &str,
+    state: &mut LocalGenerateState,
+) -> Result<(), String> {
+    if !matches!(state.phase, LocalGeneratePhase::Streaming) || state.next_seq != 0 {
+        return Err(format!(
+            "generation emitted a semantic NAK after output/settlement phase {:?}",
+            state.phase
+        ));
+    }
+    let request_id = unique_generate_chunk_field(fields, "request_id")?
+        .and_then(MsgValue::as_str)
+        .ok_or_else(|| "generation NAK request_id must be a string".to_string())?;
+    if request_id != expected_request_id {
+        return Err("generation NAK request_id mismatch".to_string());
+    }
+    let attempt_id = unique_generate_chunk_field(fields, "attempt_id")?
+        .and_then(MsgValue::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .ok_or_else(|| "generation NAK attempt_id is invalid".to_string())?;
+    match state.attempt_id.as_deref() {
+        Some(expected) if expected != attempt_id => {
+            return Err("generation NAK attempt_id changed within stream".to_string());
+        }
+        None => state.attempt_id = Some(attempt_id.to_string()),
+        _ => {}
+    }
+    let reason = unique_generate_chunk_field(fields, "reason")?
+        .and_then(MsgValue::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .ok_or_else(|| "generation NAK reason is invalid".to_string())?;
+    state.phase = LocalGeneratePhase::AwaitingRetryAck {
+        reason: reason.to_string(),
+    };
+    Ok(())
+}
+
+fn unique_generate_chunk_field<'a>(
+    fields: &'a [(MsgValue, MsgValue)],
+    expected: &str,
+) -> Result<Option<&'a MsgValue>, String> {
+    let mut found = None;
+    for (key, value) in fields {
+        if key.as_str() != Some(expected) {
+            continue;
+        }
+        if found.replace(value).is_some() {
+            return Err(format!(
+                "generation chunk contains duplicate {expected:?} field"
+            ));
+        }
+    }
+    Ok(found)
+}
+
 async fn ack(
     delivery: &Delivery,
     telemetry: &crate::observability::metrics::SidecarTelemetry,
@@ -4785,10 +5261,9 @@ pub(crate) async fn scheduler_drain_loop(
 
 /// Decode an offloaded generate payload blob (msgpack) into the inline
 /// `generate` value. Extracted so the transport contract is directly
-/// testable: the gateway offloads `generate` carrying **base64-string** image
-/// data, which round-trips through `serde_json::Value`; the original, buggy
-/// msgpack-`bin` (`serde_bytes`) shape does NOT decode here.
-fn decode_offloaded_generate(bytes: &[u8]) -> Result<Json, rmp_serde::decode::Error> {
+/// testable: legacy gateway blobs carry base64-string images, while
+/// sidecar-prepared or newer producers may already carry msgpack binary.
+fn decode_offloaded_generate(bytes: &[u8]) -> Result<MsgValue, rmp_serde::decode::Error> {
     rmp_serde::from_slice(bytes)
 }
 
@@ -5085,6 +5560,159 @@ mod tests {
         assert_eq!(decoded["text_delta"], "done");
     }
 
+    fn local_chunk(request_id: &str, attempt_id: &str, seq: u32, done: bool) -> Vec<u8> {
+        rmp_serde::to_vec_named(&serde_json::json!({
+            "kind": "chunk",
+            "request_id": request_id,
+            "attempt_id": attempt_id,
+            "seq": seq,
+            "text_delta": "x",
+            "done": done
+        }))
+        .unwrap()
+    }
+
+    fn local_nak(request_id: &str, attempt_id: &str, reason: &str) -> Vec<u8> {
+        rmp_serde::to_vec_named(&serde_json::json!({
+            "kind": "nak",
+            "request_id": request_id,
+            "attempt_id": attempt_id,
+            "reason": reason
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn local_generation_chunk_validation_requires_exact_order_and_terminal() {
+        let mut state = LocalGenerateState::default();
+        validate_local_generate_chunk(
+            &local_chunk("req-1", "attempt-1", 0, false),
+            "req-1",
+            &mut state,
+        )
+        .unwrap();
+        validate_local_generate_chunk(
+            &local_chunk("req-1", "attempt-1", 1, true),
+            "req-1",
+            &mut state,
+        )
+        .unwrap();
+        assert!(matches!(state.phase, LocalGeneratePhase::AwaitingChunkAck));
+        assert_eq!(state.next_seq, 2);
+
+        let error = validate_local_generate_chunk(
+            &local_chunk("req-1", "attempt-1", 2, false),
+            "req-1",
+            &mut state,
+        )
+        .unwrap_err();
+        assert!(error.contains("after terminal"));
+    }
+
+    #[test]
+    fn local_generation_semantic_nak_is_a_retry_terminal_after_ack() {
+        let mut state = LocalGenerateState::default();
+        let publication = validate_local_generate_publication(
+            local_nak("req-1", "attempt-1", "kv_budget"),
+            "req-1",
+            "hash-a",
+            &mut state,
+        )
+        .unwrap();
+        assert!(matches!(publication, LocalGeneratePublication::Retry));
+        assert!(matches!(
+            state.phase,
+            LocalGeneratePhase::AwaitingRetryAck { ref reason } if reason == "kv_budget"
+        ));
+        assert!(state.observe_progress().is_err());
+        assert!(state.observe_transport_nak().is_err());
+        state.observe_ack().unwrap();
+        assert!(matches!(
+            state.phase,
+            LocalGeneratePhase::Retry { ref reason } if reason == "kv_budget"
+        ));
+        assert!(state.observe_ack().is_err());
+    }
+
+    #[test]
+    fn local_generation_semantic_nak_rejects_partial_output_and_bad_identity() {
+        let mut after_output = LocalGenerateState::default();
+        validate_local_generate_chunk(
+            &local_chunk("req-1", "attempt-1", 0, false),
+            "req-1",
+            &mut after_output,
+        )
+        .unwrap();
+        let error = validate_local_generate_publication(
+            local_nak("req-1", "attempt-1", "model_not_loaded"),
+            "req-1",
+            "",
+            &mut after_output,
+        )
+        .unwrap_err();
+        assert!(error.contains("after output"));
+
+        let error = validate_local_generate_publication(
+            local_nak("other", "attempt-1", "model_not_loaded"),
+            "req-1",
+            "",
+            &mut LocalGenerateState::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("request_id mismatch"));
+    }
+
+    #[test]
+    fn local_generation_terminal_requires_one_ack_and_rejects_late_progress() {
+        let mut state = LocalGenerateState::default();
+        validate_local_generate_chunk(
+            &local_chunk("req-1", "attempt-1", 0, true),
+            "req-1",
+            &mut state,
+        )
+        .unwrap();
+        assert!(state.observe_progress().is_err());
+        assert!(state.observe_transport_nak().is_err());
+        state.observe_ack().unwrap();
+        assert!(matches!(state.phase, LocalGeneratePhase::Complete));
+        assert!(state.observe_ack().is_err());
+        assert!(state.observe_progress().is_err());
+    }
+
+    #[test]
+    fn local_generation_chunk_validation_rejects_identity_gap_and_duplicates() {
+        let mut state = LocalGenerateState::default();
+        assert!(validate_local_generate_chunk(
+            &local_chunk("other", "attempt-1", 0, false),
+            "req-1",
+            &mut state,
+        )
+        .unwrap_err()
+        .contains("request_id mismatch"));
+        assert!(validate_local_generate_chunk(
+            &local_chunk("req-1", "attempt-1", 1, false),
+            "req-1",
+            &mut state,
+        )
+        .unwrap_err()
+        .contains("seq gap"));
+
+        let duplicate = MsgValue::Map(vec![
+            (MsgValue::from("kind"), MsgValue::from("chunk")),
+            (MsgValue::from("request_id"), MsgValue::from("req-1")),
+            (MsgValue::from("request_id"), MsgValue::from("req-1")),
+            (MsgValue::from("attempt_id"), MsgValue::from("attempt-1")),
+            (MsgValue::from("seq"), MsgValue::from(0)),
+            (MsgValue::from("done"), MsgValue::from(false)),
+        ]);
+        let bytes = rmp_serde::to_vec_named(&duplicate).unwrap();
+        assert!(
+            validate_local_generate_chunk(&bytes, "req-1", &mut LocalGenerateState::default(),)
+                .unwrap_err()
+                .contains("duplicate")
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn offloaded_generate_blob_with_base64_images_resolves_via_object_store() {
@@ -5111,9 +5739,18 @@ mod tests {
             .get("req-1_0.bin")
             .await
             .expect("blob fetched from object store");
-        let decoded = decode_offloaded_generate(&bytes)
-            .expect("base64-image generate blob must decode as serde_json::Value");
-        assert_eq!(decoded["messages"][0]["images"][0]["data"], "aGVsbG8=");
+        let mut decoded =
+            decode_offloaded_generate(&bytes).expect("base64-image generate blob must decode");
+        assert_eq!(
+            decoded["messages"][0]["images"][0]["data"],
+            MsgValue::from("aGVsbG8=")
+        );
+        crate::prep::media::normalize_generate_media(&mut decoded)
+            .expect("sidecar normalizes generation media");
+        assert_eq!(
+            decoded["messages"][0]["images"][0]["data"],
+            MsgValue::Binary(b"hello".to_vec())
+        );
 
         // Inline into a WorkItem and re-encode → decode (the sidecar → Python
         // worker hop): the base64 image survives the full round trip.
@@ -5123,15 +5760,16 @@ mod tests {
         let reencoded = rmp_serde::to_vec_named(&work).unwrap();
         let back: WorkItem = rmp_serde::from_slice(&reencoded).unwrap();
         let g = back.generate.expect("generate inlined onto the work item");
-        assert_eq!(g["messages"][0]["images"][0]["data"], "aGVsbG8=");
+        assert_eq!(
+            g["messages"][0]["images"][0]["data"],
+            MsgValue::Binary(b"hello".to_vec())
+        );
     }
 
     #[test]
-    fn bin_generate_blob_fails_to_decode_proving_base64_is_required() {
-        // The original (buggy) shape: image bytes as a msgpack `bin` via
-        // serde_bytes. `serde_json::Value` cannot hold `bin`, so the sidecar
-        // decode fails — this is exactly the transport bug the base64-string
-        // representation fixes.
+    fn bin_generate_blob_decodes_for_rolling_prepared_media() {
+        // Newer producers may send image bytes as msgpack `bin`; the
+        // sidecar's wire-native generation value must preserve them.
         #[derive(serde::Serialize)]
         struct BinImage {
             #[serde(with = "serde_bytes")]
@@ -5147,9 +5785,10 @@ mod tests {
             }],
         })
         .unwrap();
-        assert!(
-            decode_offloaded_generate(&blob).is_err(),
-            "msgpack bin must NOT decode as serde_json::Value — the exact bug base64 transport fixes"
+        let decoded = decode_offloaded_generate(&blob).expect("msgpack binary must decode");
+        assert_eq!(
+            decoded["images"][0]["data"],
+            MsgValue::Binary(vec![0xFF, 0xD8, 0xFF, 0xE0])
         );
     }
 

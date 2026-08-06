@@ -38,6 +38,21 @@ struct AdapterWorkerChild {
     models: Mutex<HashSet<String>>,
 }
 
+struct ChildInflightGuard(Arc<AdapterWorkerChild>);
+
+impl ChildInflightGuard {
+    fn enter(child: Arc<AdapterWorkerChild>) -> Self {
+        child.inflight_batches.fetch_add(1, Ordering::AcqRel);
+        Self(child)
+    }
+}
+
+impl Drop for ChildInflightGuard {
+    fn drop(&mut self) {
+        self.0.inflight_batches.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl AdapterWorkerChild {
     fn model_count(&self) -> usize {
         self.models
@@ -337,9 +352,8 @@ impl AdapterWorkerPool {
         self.ensure_not_config_quarantined()?;
         let model_id = req.model_id.clone();
         let child = self.child_for_model(&model_id);
-        child.inflight_batches.fetch_add(1, Ordering::AcqRel);
+        let _inflight_guard = ChildInflightGuard::enter(Arc::clone(&child));
         let result = child.ipc.process_generate(req, on_event).await;
-        child.inflight_batches.fetch_sub(1, Ordering::AcqRel);
         match &result {
             Ok(()) => self.mark_child_call_succeeded(&child),
             Err(_) => {

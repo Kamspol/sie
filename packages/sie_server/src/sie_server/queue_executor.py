@@ -15,8 +15,9 @@ import yaml
 from sie_server.api.ws import compute_bundle_config_hash_cached
 from sie_server.config.model import ModelConfig
 from sie_server.core.encode_pipeline import EncodePipeline, resolve_encode_output_types
+from sie_server.core.extract_cost import build_extract_prepared_items
 from sie_server.core.oom import is_oom_error
-from sie_server.core.prepared import AudioPayload, AudioPreparedItem, ExtractPreparedItem
+from sie_server.core.prepared import AudioPayload, AudioPreparedItem
 from sie_server.core.registry import ModelRegistry
 from sie_server.core.runtime_options import merge_runtime_options, merge_runtime_options_with_profile
 from sie_server.core.score_cost import build_score_prepared_items_timed
@@ -1441,10 +1442,35 @@ class QueueExecutor:
                         AudioPreparedItem(payload=payload, cost=payload.duration_cost_ms, original_index=0)
                     ]
                 else:
-                    # Batching proxy only; authoritative text billing comes
-                    # from the adapter's real tokenizer count on ExtractOutput.
-                    char_count = len(server_item.text) if server_item.text else 0
-                    prepared_items = [ExtractPreparedItem(cost=char_count, original_index=0)]
+                    # Match the in-process HTTP extract path: vision adapters
+                    # consume their registered image preprocessor payloads,
+                    # not cost-only batching placeholders. Passing an
+                    # ExtractPreparedItem to a payload-aware adapter makes a
+                    # valid image look like an empty preprocessed batch (and
+                    # caused Grounding DINO / OWLv2 to return ``objects: []``
+                    # without ever running inference).
+                    preprocessor_registry = getattr(self._registry, "preprocessor_registry", None)
+                    has_image_preprocessor = False
+                    if preprocessor_registry is not None and server_item.images:
+                        try:
+                            has_image_preprocessor = preprocessor_registry.has_preprocessor(model_id, "image") is True
+                        except (AttributeError, TypeError):
+                            pass
+
+                    if has_image_preprocessor and preprocessor_registry is not None:
+                        task = options.get("task") if options else None
+                        prepared_batch = await preprocessor_registry.prepare(
+                            model_id,
+                            [server_item],
+                            config,
+                            instruction=bi.instruction,
+                            task=task,
+                        )
+                        prepared_items = prepared_batch.items
+                    else:
+                        # Batching proxy only; authoritative text/page billing
+                        # comes from the adapter's ExtractOutput unit counts.
+                        prepared_items = build_extract_prepared_items([server_item])
                 timing.end_tokenization()
 
                 lora = self._extract_lora(options)

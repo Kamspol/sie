@@ -122,10 +122,41 @@ def test_bias_true_rejected(tmp_path: Path) -> None:
     assert chain is None
 
 
-def test_use_residual_true_rejected(tmp_path: Path) -> None:
-    path = _write_checkpoint(tmp_path / "ckpt", [(768, 128)], config_overrides={1: {"use_residual": True}})
+def test_dimension_changing_residual_is_composed(tmp_path: Path) -> None:
+    linear = torch.randn(6, 8)
+    residual = torch.randn(6, 8)
+    path = _write_checkpoint(
+        tmp_path / "ckpt",
+        [(8, 6)],
+        config_overrides={1: {"use_residual": True}},
+        state_overrides={1: {"linear.weight": linear, "residual.weight": residual}},
+    )
 
-    chain = load_pylate_dense_chain(path, hidden_size=768, token_dim=128, device="cpu", dtype=torch.float32)
+    chain = load_pylate_dense_chain(path, hidden_size=8, token_dim=6, device="cpu", dtype=torch.float32)
+
+    assert chain is not None
+    assert torch.equal(chain[0], linear + residual)
+
+
+def test_same_dimension_residual_is_composed_with_identity(tmp_path: Path) -> None:
+    linear = torch.randn(8, 8)
+    path = _write_checkpoint(
+        tmp_path / "ckpt",
+        [(8, 8)],
+        config_overrides={1: {"use_residual": True}},
+        state_overrides={1: {"linear.weight": linear}},
+    )
+
+    chain = load_pylate_dense_chain(path, hidden_size=8, token_dim=8, device="cpu", dtype=torch.float32)
+
+    assert chain is not None
+    assert torch.equal(chain[0], linear + torch.eye(8))
+
+
+def test_dimension_changing_residual_missing_weight_rejected(tmp_path: Path) -> None:
+    path = _write_checkpoint(tmp_path / "ckpt", [(8, 6)], config_overrides={1: {"use_residual": True}})
+
+    chain = load_pylate_dense_chain(path, hidden_size=8, token_dim=6, device="cpu", dtype=torch.float32)
 
     assert chain is None
 
@@ -142,9 +173,7 @@ def test_missing_use_residual_key_ok(tmp_path: Path) -> None:
 
 
 def test_non_identity_activation_rejected(tmp_path: Path) -> None:
-    """Reject a non-Identity activation_function: pylate never applies it, but its
-    presence means the checkpoint was trained with math we would not reproduce.
-    """
+    """Reject an activation that cannot be reduced to the stored linear weights."""
     path = _write_checkpoint(
         tmp_path / "ckpt",
         [(768, 128)],

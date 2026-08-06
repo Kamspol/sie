@@ -4366,10 +4366,8 @@ struct ChatRequestParams {
     /// in :mod:`openapi.rs` for the canonical use case (anti-stop-first
     /// fix on Qwen3.6 greedy decoding).
     min_tokens: Option<u32>,
-    /// Per-request chat-template kwargs (e.g. ``{"enable_thinking":
-    /// false}``); forwarded verbatim to the worker which merges them on
-    /// top of the model YAML's defaults at template-render time. Absent
-    /// → only the model YAML's defaults apply.
+    /// Per-request chat-template kwargs from the bounded public contract;
+    /// validated before publication and revalidated by the worker.
     chat_template_kwargs: Option<serde_json::Value>,
     /// Routing hints plumbed through to the work envelope.
     routing_key: Option<String>,
@@ -5082,7 +5080,7 @@ fn chat_params_from_json(body: &serde_json::Value) -> ChatParamsResult {
     let temperature = match obj.get("temperature") {
         None | Some(serde_json::Value::Null) => None,
         Some(v) => match v.as_f64() {
-            Some(f) if f.is_finite() && f >= 0.0 => Some(f as f32),
+            Some(f) if f.is_finite() && f >= 0.0 && f <= f32::MAX as f64 => Some(f as f32),
             _ => {
                 return bad(
                     "'temperature' must be a finite number >= 0",
@@ -5244,21 +5242,69 @@ fn chat_params_from_json(body: &serde_json::Value) -> ChatParamsResult {
             }
         }
     }
-    // -- chat_template_kwargs: opaque map of kwargs for the tokenizer's
-    //    ``apply_chat_template``. Validated only as an object (or null);
-    //    the worker merges it onto the model YAML defaults at render
-    //    time. Reject non-object values so a bad client doesn't smuggle
-    //    a string/array past the schema and then crash render in the
-    //    worker.
+    // -- chat_template_kwargs: bounded kwargs for the tokenizer's
+    //    ``apply_chat_template``. The worker merges them under the model
+    //    YAML defaults at render time. Unknown keys reject here rather than
+    //    crossing the queue as arbitrary tokenizer arguments.
     let mut chat_template_kwargs: Option<serde_json::Value> = None;
     if let Some(val) = obj.get("chat_template_kwargs") {
         if !val.is_null() {
-            if !val.is_object() {
+            let Some(kwargs) = val.as_object() else {
                 return bad(
                     "'chat_template_kwargs' must be an object",
                     Some("chat_template_kwargs"),
                     oai_code::INVALID_REQUEST,
                 );
+            };
+            for key in kwargs.keys() {
+                if !matches!(key.as_str(), "enable_thinking" | "guardian_config") {
+                    return bad(
+                        &format!("unsupported chat_template_kwargs key: {key}"),
+                        Some(&format!("chat_template_kwargs.{key}")),
+                        oai_code::UNSUPPORTED_FIELD,
+                    );
+                }
+            }
+            if let Some(enable_thinking) = kwargs.get("enable_thinking") {
+                if !enable_thinking.is_boolean() {
+                    return bad(
+                        "'chat_template_kwargs.enable_thinking' must be a boolean",
+                        Some("chat_template_kwargs.enable_thinking"),
+                        oai_code::INVALID_REQUEST,
+                    );
+                }
+            }
+            if let Some(guardian_config) = kwargs.get("guardian_config") {
+                let Some(guardian) = guardian_config.as_object() else {
+                    return bad(
+                        "'chat_template_kwargs.guardian_config' must be an object",
+                        Some("chat_template_kwargs.guardian_config"),
+                        oai_code::INVALID_REQUEST,
+                    );
+                };
+                for key in guardian.keys() {
+                    if key != "risk_name" {
+                        return bad(
+                            &format!("unsupported chat_template_kwargs.guardian_config key: {key}"),
+                            Some(&format!("chat_template_kwargs.guardian_config.{key}")),
+                            oai_code::UNSUPPORTED_FIELD,
+                        );
+                    }
+                }
+                match guardian
+                    .get("risk_name")
+                    .and_then(|risk_name| risk_name.as_str())
+                {
+                    Some(risk_name)
+                        if !risk_name.is_empty() && risk_name.chars().count() <= 128 => {}
+                    _ => {
+                        return bad(
+                            "'chat_template_kwargs.guardian_config.risk_name' must be a non-empty string of at most 128 characters",
+                            Some("chat_template_kwargs.guardian_config.risk_name"),
+                            oai_code::INVALID_REQUEST,
+                        );
+                    }
+                }
             }
             chat_template_kwargs = Some(val.clone());
         }
@@ -6708,6 +6754,7 @@ pub fn route_grammar_to_profile(
         (status = 200, description = "Chat completion response", body = crate::openapi::ChatCompletionResponse),
         (status = 400, description = "Invalid or unsupported request", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 404, description = "Model not found", body = crate::openapi::OpenAIErrorEnvelope),
+        (status = 413, description = "Request body is too large", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 500, description = "Worker emitted malformed response", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 503, description = "Provisioning in progress, queue unavailable, or model loading", body = crate::openapi::OpenAIErrorEnvelope),
     )
@@ -6861,7 +6908,7 @@ async fn proxy_chat_inner(
                 }
             }
         }
-        if let Some(cap) = info.info_extras.max_output_tokens {
+        if let Some(cap) = info.effective_max_output_tokens() {
             if cap > 0 && params.max_new_tokens > cap {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -7386,7 +7433,7 @@ fn completions_params_from_json(body: &serde_json::Value) -> CompletionsParamsRe
     let temperature = match obj.get("temperature") {
         None | Some(serde_json::Value::Null) => None,
         Some(v) => match v.as_f64() {
-            Some(f) if f.is_finite() && f >= 0.0 => Some(f as f32),
+            Some(f) if f.is_finite() && f >= 0.0 && f <= f32::MAX as f64 => Some(f as f32),
             _ => {
                 return bad(
                     "'temperature' must be a finite number >= 0",
@@ -7882,10 +7929,10 @@ fn responses_params_from_json(body: &serde_json::Value) -> ResponsesParamsResult
         }
     };
 
-    // Allowed roles mirror the chat parser. ``developer`` is normalized
-    // to ``system`` so the wire stays on the 4-role set the worker's
-    // chat template understands.
-    const ALLOWED_ROLES: &[&str] = &["system", "user", "assistant", "tool", "developer"];
+    // The stateless Responses MVP accepts ordinary text messages only.
+    // Tool outputs require the wider Responses item/tool contract, which is
+    // explicitly out of scope here. ``developer`` normalizes to ``system``.
+    const ALLOWED_ROLES: &[&str] = &["system", "user", "assistant", "developer"];
 
     let input = match obj.get("input") {
         Some(serde_json::Value::String(s)) => {
@@ -7910,6 +7957,16 @@ fn responses_params_from_json(body: &serde_json::Value) -> ResponsesParamsResult
                         oai_code::INVALID_REQUEST,
                     );
                 };
+                for key in o.keys() {
+                    if !matches!(key.as_str(), "role" | "content") {
+                        let param = format!("input[{i}].{key}");
+                        return bad(
+                            &format!("'{param}' is not supported by this endpoint"),
+                            Some(&param),
+                            oai_code::UNSUPPORTED_FIELD,
+                        );
+                    }
+                }
                 let role = match o.get("role").and_then(|v| v.as_str()) {
                     Some("developer") => "system".to_string(),
                     Some(r) if ALLOWED_ROLES.contains(&r) => r.to_string(),
@@ -7946,6 +8003,16 @@ fn responses_params_from_json(body: &serde_json::Value) -> ResponsesParamsResult
                                     oai_code::INVALID_REQUEST,
                                 );
                             };
+                            for key in part_obj.keys() {
+                                if !matches!(key.as_str(), "type" | "text") {
+                                    let param = format!("input[{i}].content[{j}].{key}");
+                                    return bad(
+                                        &format!("'{param}' is not supported by this endpoint"),
+                                        Some(&param),
+                                        oai_code::UNSUPPORTED_FIELD,
+                                    );
+                                }
+                            }
                             let ptype = match part_obj.get("type").and_then(|v| v.as_str()) {
                                 Some(t) => t,
                                 None => {
@@ -8060,7 +8127,7 @@ fn responses_params_from_json(body: &serde_json::Value) -> ResponsesParamsResult
     let temperature = match obj.get("temperature") {
         None | Some(serde_json::Value::Null) => None,
         Some(v) => match v.as_f64() {
-            Some(f) if f.is_finite() && f >= 0.0 => Some(f as f32),
+            Some(f) if f.is_finite() && f >= 0.0 && f <= f32::MAX as f64 => Some(f as f32),
             _ => {
                 return bad(
                     "'temperature' must be a finite number >= 0",
@@ -8176,6 +8243,7 @@ fn build_responses_body(
         (status = 200, description = "Response object"),
         (status = 400, description = "Invalid or unsupported request", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 404, description = "Model not found", body = crate::openapi::OpenAIErrorEnvelope),
+        (status = 413, description = "Request body is too large", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 500, description = "Worker emitted malformed response", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 503, description = "Provisioning in progress, queue unavailable, or model loading", body = crate::openapi::OpenAIErrorEnvelope),
     )
@@ -10878,7 +10946,7 @@ fn generate_params_from_json(
     let temperature = match parsed.get("temperature") {
         None | Some(serde_json::Value::Null) => None,
         Some(v) => match v.as_f64() {
-            Some(f) if f.is_finite() && f >= 0.0 => Some(f as f32),
+            Some(f) if f.is_finite() && f >= 0.0 && f <= f32::MAX as f64 => Some(f as f32),
             _ => {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -11281,7 +11349,7 @@ fn generate_params_from_rmpv(
     };
     let temperature = match parse_number("temperature")? {
         None => None,
-        Some(f) if f.is_finite() && f >= 0.0 => Some(f as f32),
+        Some(f) if f.is_finite() && f >= 0.0 && f <= f32::MAX as f64 => Some(f as f32),
         Some(_) => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -14219,6 +14287,7 @@ mod tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -19726,6 +19795,7 @@ mod tests {
 
         let registry = empty_registry();
         let mk = || ProfileConfig {
+            max_output_tokens: None,
             adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
             max_batch_tokens: Some(4096),
             compute_precision: None,
@@ -19814,6 +19884,7 @@ mod tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -19854,6 +19925,7 @@ mod tests {
 
         let registry = empty_registry();
         let default_profile = ProfileConfig {
+            max_output_tokens: None,
             adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
             max_batch_tokens: Some(4096),
             compute_precision: None,
@@ -19863,6 +19935,7 @@ mod tests {
             extends: None,
         };
         let nospec_profile = ProfileConfig {
+            max_output_tokens: None,
             adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
             max_batch_tokens: Some(4096),
             compute_precision: None,
@@ -19926,6 +19999,7 @@ mod tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -20401,7 +20475,10 @@ mod tests {
     #[test]
     fn test_chat_params_from_json_accepts_chat_template_kwargs_object() {
         let mut body = _chat_body_min("m");
-        body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
+        body["chat_template_kwargs"] = serde_json::json!({
+            "enable_thinking": false,
+            "guardian_config": {"risk_name": "harm"}
+        });
         let p = _expect_chat_ok(body);
         assert_eq!(
             p.chat_template_kwargs
@@ -20419,6 +20496,44 @@ mod tests {
         let v = _expect_chat_err(body).await;
         assert_eq!(v["error"]["code"], "invalid_request");
         assert_eq!(v["error"]["param"], "chat_template_kwargs");
+    }
+
+    /// Arbitrary tokenizer kwargs reject instead of crossing the queue.
+    #[tokio::test]
+    async fn test_chat_params_from_json_rejects_unknown_chat_template_kwarg() {
+        let mut body = _chat_body_min("m");
+        body["chat_template_kwargs"] = serde_json::json!({"arbitrary_tokenizer_kwarg": true});
+        let v = _expect_chat_err(body).await;
+        assert_eq!(v["error"]["code"], "unsupported_field");
+        assert_eq!(
+            v["error"]["param"],
+            "chat_template_kwargs.arbitrary_tokenizer_kwarg"
+        );
+    }
+
+    /// Accepted template kwargs keep their declared scalar types.
+    #[tokio::test]
+    async fn test_chat_params_from_json_rejects_non_boolean_enable_thinking() {
+        let mut body = _chat_body_min("m");
+        body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": "false"});
+        let v = _expect_chat_err(body).await;
+        assert_eq!(v["error"]["code"], "invalid_request");
+        assert_eq!(v["error"]["param"], "chat_template_kwargs.enable_thinking");
+    }
+
+    /// Granite Guardian config is closed to its one declared risk selector.
+    #[tokio::test]
+    async fn test_chat_params_from_json_rejects_unknown_guardian_config_kwarg() {
+        let mut body = _chat_body_min("m");
+        body["chat_template_kwargs"] = serde_json::json!({
+            "guardian_config": {"risk_name": "harm", "extra": true}
+        });
+        let v = _expect_chat_err(body).await;
+        assert_eq!(v["error"]["code"], "unsupported_field");
+        assert_eq!(
+            v["error"]["param"],
+            "chat_template_kwargs.guardian_config.extra"
+        );
     }
 
     /// ``repetition_penalty`` outside ``(0.0, 2.0]`` rejects (both ends).
@@ -21863,6 +21978,83 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    #[tokio::test]
+    async fn test_responses_shared_request_conformance_vectors() {
+        let raw = include_str!(
+            "../../../../conformance/openai_generation/responses_request_vectors.json"
+        );
+        let vectors: serde_json::Value = serde_json::from_str(raw).expect("valid conformance JSON");
+
+        for case in vectors["accepted"].as_array().expect("accepted vectors") {
+            let name = case["name"].as_str().expect("case name");
+            let params = match responses_params_from_json(&case["body"]) {
+                ResponsesParamsResult::Ok(params) => params,
+                ResponsesParamsResult::Err(_) => panic!("accepted case {name:?} was rejected"),
+            };
+            let (prompt, messages) = match params.input {
+                publisher::GenerateInput::Prompt { prompt } => {
+                    (Some(prompt), serde_json::Value::Null)
+                }
+                publisher::GenerateInput::Messages { messages } => (
+                    None,
+                    serde_json::Value::Array(
+                        messages
+                            .into_iter()
+                            .map(|message| {
+                                serde_json::json!({
+                                    "role": message.role,
+                                    "content": message.content,
+                                })
+                            })
+                            .collect(),
+                    ),
+                ),
+            };
+            let mut observed = serde_json::json!({
+                "model": params.model,
+                "prompt": prompt,
+                "messages": messages,
+                "max_output_tokens": params.max_new_tokens,
+                "temperature": params.temperature,
+                "top_p": params.top_p,
+                "seed": params.seed,
+            });
+            let mut expected = case["expected"].clone();
+            for field in ["temperature", "top_p"] {
+                match (observed[field].as_f64(), expected[field].as_f64()) {
+                    (Some(left), Some(right)) => assert!(
+                        (left - right).abs() <= f32::EPSILON as f64,
+                        "accepted case {name:?} field {field:?}: {left} != {right}"
+                    ),
+                    (None, None) if observed[field].is_null() && expected[field].is_null() => {}
+                    _ => panic!("accepted case {name:?} field {field:?} differs"),
+                }
+                observed
+                    .as_object_mut()
+                    .expect("observed object")
+                    .remove(field);
+                expected
+                    .as_object_mut()
+                    .expect("expected object")
+                    .remove(field);
+            }
+            assert_eq!(observed, expected, "accepted case {name:?}");
+        }
+
+        for case in vectors["rejected"].as_array().expect("rejected vectors") {
+            let name = case["name"].as_str().expect("case name");
+            let error = _responses_err(case["body"].clone()).await;
+            assert_eq!(
+                error["error"]["param"], case["param"],
+                "rejected case {name:?}"
+            );
+            assert_eq!(
+                error["error"]["code"], case["code"],
+                "rejected case {name:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_responses_params_ok_string_input() {
         match responses_params_from_json(&_responses_body_min("m")) {
@@ -22728,6 +22920,7 @@ mod tests {
             max_sequence_length: None,
             revision: None,
             max_output_tokens: None,
+            profile_max_output_tokens: std::collections::HashMap::new(),
             grammar_capabilities: None,
             grammar_profile: None,
             profile_parents: std::collections::HashMap::new(),
@@ -22741,6 +22934,8 @@ mod tests {
         };
         ModelEntry {
             name: "acme/multi".to_string(),
+            canonical_base_model: "acme/multi".to_string(),
+            canonical_profile: "default".to_string(),
             pool: None,
             bundles: Vec::new(),
             adapter_modules: std::collections::HashSet::new(),
@@ -23145,6 +23340,8 @@ mod tests {
         use crate::types::model::{ModelEntry, ModelInfoExtras};
         let entry = ModelEntry {
             name: "acme/bare".to_string(),
+            canonical_base_model: "acme/bare".to_string(),
+            canonical_profile: "default".to_string(),
             pool: None,
             bundles: Vec::new(),
             adapter_modules: std::collections::HashSet::new(),

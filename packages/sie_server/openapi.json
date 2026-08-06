@@ -3,28 +3,9 @@
   "info": {
     "title": "SIE Server",
     "description": "Search Inference Engine - GPU inference server for search workloads",
-    "version": "0.6.26"
+    "version": "0.6.27"
   },
   "paths": {
-    "/": {
-      "get": {
-        "summary": "Root",
-        "description": "Basic HTML status page for the root endpoint.",
-        "operationId": "root__get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "text/html": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/healthz": {
       "get": {
         "tags": [
@@ -747,6 +728,162 @@
                 "schema": {
                   "$ref": "#/components/schemas/HTTPValidationError"
                 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/completions": {
+      "post": {
+        "tags": [
+          "openai-compat"
+        ],
+        "summary": "Completions",
+        "description": "Generate one raw-prompt OpenAI legacy completion.",
+        "operationId": "completions_v1_completions_post",
+        "parameters": [
+          {
+            "name": "X-SIE-MACHINE-PROFILE",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Sie-Machine-Profile"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OpenAI text completion, or text_completion Server-Sent Events when stream is true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAICompletionResponseModel"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "description": "OpenAI text_completion events ending in [DONE]"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or unsupported request"
+          },
+          "404": {
+            "description": "Model not found"
+          },
+          "413": {
+            "description": "Request body or prompt is too large"
+          },
+          "500": {
+            "description": "Generation failed"
+          },
+          "503": {
+            "description": "Model loading or temporarily unavailable"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenAICompletionRequestModel"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/responses": {
+      "post": {
+        "tags": [
+          "openai-compat"
+        ],
+        "summary": "Responses",
+        "description": "Create one stateless, text-only OpenAI Responses result.",
+        "operationId": "responses_v1_responses_post",
+        "parameters": [
+          {
+            "name": "X-SIE-MACHINE-PROFILE",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Sie-Machine-Profile"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAIResponsesResponseModel"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or unsupported request"
+          },
+          "404": {
+            "description": "Model not found"
+          },
+          "413": {
+            "description": "Request body or rendered input is too large"
+          },
+          "500": {
+            "description": "Generation failed"
+          },
+          "503": {
+            "description": "Model loading or temporarily unavailable"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenAIResponsesRequestModel"
               }
             }
           }
@@ -1476,6 +1613,83 @@
         "title": "MultiVectorModel",
         "description": "Multi-vector (token-level) embedding."
       },
+      "OpenAICompletionChoiceModel": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "index": {
+            "type": "integer",
+            "title": "Index"
+          },
+          "finish_reason": {
+            "type": "string",
+            "title": "Finish Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "text",
+          "index",
+          "finish_reason"
+        ],
+        "title": "OpenAICompletionChoiceModel",
+        "description": "One choice in a blocking OpenAI legacy completion."
+      },
+      "OpenAICompletionResponseModel": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "object": {
+            "type": "string",
+            "const": "text_completion",
+            "title": "Object"
+          },
+          "created": {
+            "type": "integer",
+            "title": "Created"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "choices": {
+            "items": {
+              "$ref": "#/components/schemas/OpenAICompletionChoiceModel"
+            },
+            "type": "array",
+            "title": "Choices"
+          },
+          "system_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "System Fingerprint"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/GenerateUsageModel"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices",
+          "usage"
+        ],
+        "title": "OpenAICompletionResponseModel",
+        "description": "Blocking OpenAI legacy-completions response."
+      },
       "OpenAIEmbeddingData": {
         "properties": {
           "object": {
@@ -1636,6 +1850,147 @@
         ],
         "title": "OpenAIEmbeddingResponse",
         "description": "OpenAI-compatible embedding response."
+      },
+      "OpenAIResponseOutputMessageModel": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "message",
+            "title": "Type"
+          },
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "role": {
+            "type": "string",
+            "const": "assistant",
+            "title": "Role"
+          },
+          "status": {
+            "type": "string",
+            "const": "completed",
+            "title": "Status"
+          },
+          "content": {
+            "items": {
+              "$ref": "#/components/schemas/OpenAIResponseOutputTextModel"
+            },
+            "type": "array",
+            "title": "Content"
+          }
+        },
+        "type": "object",
+        "required": [
+          "type",
+          "id",
+          "role",
+          "status",
+          "content"
+        ],
+        "title": "OpenAIResponseOutputMessageModel"
+      },
+      "OpenAIResponseOutputTextModel": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "output_text",
+            "title": "Type"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "annotations": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Annotations"
+          }
+        },
+        "type": "object",
+        "required": [
+          "type",
+          "text",
+          "annotations"
+        ],
+        "title": "OpenAIResponseOutputTextModel"
+      },
+      "OpenAIResponseUsageModel": {
+        "properties": {
+          "input_tokens": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Input Tokens"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Output Tokens"
+          },
+          "total_tokens": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Total Tokens"
+          }
+        },
+        "type": "object",
+        "required": [
+          "input_tokens",
+          "output_tokens",
+          "total_tokens"
+        ],
+        "title": "OpenAIResponseUsageModel"
+      },
+      "OpenAIResponsesResponseModel": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "object": {
+            "type": "string",
+            "const": "response",
+            "title": "Object"
+          },
+          "created_at": {
+            "type": "integer",
+            "title": "Created At"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "status": {
+            "type": "string",
+            "const": "completed",
+            "title": "Status"
+          },
+          "output": {
+            "items": {
+              "$ref": "#/components/schemas/OpenAIResponseOutputMessageModel"
+            },
+            "type": "array",
+            "title": "Output"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/OpenAIResponseUsageModel"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "object",
+          "created_at",
+          "model",
+          "status",
+          "output",
+          "usage"
+        ],
+        "title": "OpenAIResponsesResponseModel",
+        "description": "One completed direct OpenAI Responses result."
       },
       "OpenAIUsage": {
         "properties": {
@@ -2869,6 +3224,377 @@
           "max_new_tokens"
         ],
         "title": "GenerateRequestModel",
+        "type": "object"
+      },
+      "OpenAICompletionStreamOptionsModel": {
+        "additionalProperties": false,
+        "description": "Supported OpenAI legacy-completions stream controls.",
+        "properties": {
+          "include_usage": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Emit one usage-only chunk immediately before the [DONE] terminator",
+            "title": "Include Usage"
+          }
+        },
+        "title": "OpenAICompletionStreamOptionsModel",
+        "type": "object"
+      },
+      "OpenAICompletionRequestModel": {
+        "additionalProperties": false,
+        "description": "Strict single-candidate subset of the OpenAI legacy Completions API.",
+        "properties": {
+          "model": {
+            "description": "Generation model id",
+            "minLength": 1,
+            "title": "Model",
+            "type": "string"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ],
+            "description": "One raw prompt string, or a one-element string array; no chat template is applied",
+            "title": "Prompt"
+          },
+          "max_tokens": {
+            "anyOf": [
+              {
+                "maximum": 4294967295,
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": 16,
+            "description": "Maximum generated tokens",
+            "title": "Max Tokens"
+          },
+          "temperature": {
+            "anyOf": [
+              {
+                "maximum": 3.4028234663852886e+38,
+                "minimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Sampling temperature override",
+            "title": "Temperature"
+          },
+          "top_p": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "maximum": 1,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Nucleus-sampling probability override",
+            "title": "Top P"
+          },
+          "stop": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "One stop sequence or an array of stop sequences",
+            "title": "Stop"
+          },
+          "frequency_penalty": {
+            "anyOf": [
+              {
+                "maximum": 2,
+                "minimum": -2,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Frequency penalty",
+            "title": "Frequency Penalty"
+          },
+          "presence_penalty": {
+            "anyOf": [
+              {
+                "maximum": 2,
+                "minimum": -2,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Presence penalty",
+            "title": "Presence Penalty"
+          },
+          "seed": {
+            "anyOf": [
+              {
+                "maximum": 9223372036854775807,
+                "minimum": -9223372036854775808,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional signed 64-bit sampling seed",
+            "format": "int64",
+            "title": "Seed"
+          },
+          "stream": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Return OpenAI text_completion Server-Sent Events",
+            "title": "Stream"
+          },
+          "stream_options": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OpenAICompletionStreamOptionsModel"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "n": {
+            "anyOf": [
+              {
+                "const": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Only one completion candidate is supported",
+            "title": "N"
+          }
+        },
+        "required": [
+          "model",
+          "prompt"
+        ],
+        "title": "OpenAICompletionRequestModel",
+        "type": "object"
+      },
+      "OpenAIResponseInputContentPartModel": {
+        "additionalProperties": false,
+        "description": "One text-only content part accepted by the Responses MVP.",
+        "properties": {
+          "type": {
+            "enum": [
+              "text",
+              "input_text",
+              "output_text"
+            ],
+            "title": "Type",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "text"
+        ],
+        "title": "OpenAIResponseInputContentPartModel",
+        "type": "object"
+      },
+      "OpenAIResponseInputMessageModel": {
+        "additionalProperties": false,
+        "description": "One stateless text message accepted by the Responses MVP.",
+        "properties": {
+          "role": {
+            "enum": [
+              "system",
+              "user",
+              "assistant",
+              "developer"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "$ref": "#/components/schemas/OpenAIResponseInputContentPartModel"
+                },
+                "type": "array"
+              }
+            ],
+            "title": "Content"
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ],
+        "title": "OpenAIResponseInputMessageModel",
+        "type": "object"
+      },
+      "OpenAIResponsesRequestModel": {
+        "additionalProperties": false,
+        "description": "Strict stateless, text-only subset of the OpenAI Responses API.",
+        "properties": {
+          "model": {
+            "description": "Generation model id",
+            "minLength": 1,
+            "title": "Model",
+            "type": "string"
+          },
+          "input": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "$ref": "#/components/schemas/OpenAIResponseInputMessageModel"
+                },
+                "minItems": 1,
+                "type": "array"
+              }
+            ],
+            "title": "Input"
+          },
+          "max_output_tokens": {
+            "anyOf": [
+              {
+                "maximum": 4294967295,
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": 16,
+            "description": "Maximum generated tokens",
+            "title": "Max Output Tokens"
+          },
+          "temperature": {
+            "anyOf": [
+              {
+                "maximum": 3.4028234663852886e+38,
+                "minimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Sampling temperature override",
+            "title": "Temperature"
+          },
+          "top_p": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "maximum": 1,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Nucleus-sampling probability override",
+            "title": "Top P"
+          },
+          "seed": {
+            "anyOf": [
+              {
+                "maximum": 9223372036854775807,
+                "minimum": -9223372036854775808,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional signed 64-bit sampling seed",
+            "format": "int64",
+            "title": "Seed"
+          },
+          "stream": {
+            "anyOf": [
+              {
+                "const": false,
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Responses streaming is not supported",
+            "title": "Stream"
+          }
+        },
+        "required": [
+          "model",
+          "input"
+        ],
+        "title": "OpenAIResponsesRequestModel",
         "type": "object"
       },
       "ScoreRequestModel": {

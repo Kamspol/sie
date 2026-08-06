@@ -14,6 +14,8 @@ from sie_server.types.openapi import (
     ExtractRequestModel,
     GenerateChunk,
     GenerateRequestModel,
+    OpenAICompletionRequestModel,
+    OpenAIResponsesRequestModel,
     ScoreRequestModel,
 )
 
@@ -65,6 +67,8 @@ def _add_request_body_schemas(openapi_schema: dict[str, Any]) -> None:
         ExtractRequestModel,
         GenerateChunk,
         GenerateRequestModel,
+        OpenAICompletionRequestModel,
+        OpenAIResponsesRequestModel,
         ScoreRequestModel,
     ]:
         model_name = model_class.__name__

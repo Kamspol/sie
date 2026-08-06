@@ -1254,6 +1254,148 @@ class RateIdentity(TypedDict):
     region: str
 
 
+class ConnectorJobValidation(TypedDict, total=False):
+    """Planner proofs safe to expose to a connector caller."""
+
+    source: str
+    identity: str
+    sink: str
+
+
+class ConnectorJobCapabilities(TypedDict, total=False):
+    """The bounded behavior proven for one connector plan revision."""
+
+    incremental_inference: bool
+    incremental_source_scan: bool
+    source_scan: str
+    source_proof: str
+    checkpoint_profile: str
+    incremental_selection: bool
+    inference: str
+    sink_targets: Any
+    snapshot: str
+    ordering: str
+    deletion_handling: str
+    publication: str
+
+
+class ConnectorPlanOutputShape(TypedDict):
+    """Redacted, canonical output shape for one connector plan."""
+
+    result_kind: Literal["vector"]
+    output_field: Literal["embedding"]
+    output_types: list[Literal["dense"]]
+    dimensions: int | None
+
+
+class ConnectorJobPlan(TypedDict, total=False):
+    """A durable inspect-first plan. It contains metadata, never source rows."""
+
+    revision: int
+    expires_at: float
+    executable: bool
+    executor_available: bool | None
+    executor_availability: str
+    blocking_code: str | None
+    rows: int
+    mapped_bytes: int
+    input_bytes: int
+    eligible_count: int
+    eligible_count_quality: str
+    eligible_input_byte_count: int
+    matched_checkpoint_count: int
+    skipped_unchanged_count: int
+    deleted_preserved_count: int
+    output_dimensions: int | None
+    output: Required[ConnectorPlanOutputShape]
+    cost_basis: str
+    max_reservation_credits: int
+    validation: ConnectorJobValidation
+    capabilities: ConnectorJobCapabilities
+
+
+class ConnectorJobCheckpoint(TypedDict, total=False):
+    """Public checkpoint/fence position for the connector profile."""
+
+    profile: str
+    profile_version: int
+    region: str
+    expected_generation: int
+    generation: int
+    published_revision: int
+
+
+class ConnectorJobItemOutcomes(TypedDict, total=False):
+    """Bounded item counters for one connector attempt."""
+
+    claimed: int
+    dispatched: int
+    inferred: int
+    staged: int
+    published: int
+    failed: int
+    reexecution_required: int
+    skipped_unchanged: int
+
+
+class ConnectorJobPublication(TypedDict, total=False):
+    """Public evidence for one atomic sink publication."""
+
+    attempt_ordinal: int
+    revision: int
+    published: int
+    skipped_unchanged: int
+    deleted: int
+    failed: int
+    reexecuted: int
+    committed_at: float
+
+
+class ConnectorJobOverlapOwner(TypedDict, total=False):
+    """The exact earlier attempt that already owns an overlapping cutoff."""
+
+    job_id: str
+    attempt_ordinal: int
+
+
+class ConnectorJobAttempt(TypedDict, total=False):
+    """One public execute/repair attempt; private dispatch authority is omitted."""
+
+    ordinal: Required[int]
+    action: Required[Literal["execute", "repair"]]
+    state: Required[str]
+    recovery_attempt_ordinal: int
+    outcome: str | None
+    error_code: str | None
+    replayed: bool
+    billed_credits: int | None
+    overlap_owner: ConnectorJobOverlapOwner | None
+    item_outcomes: ConnectorJobItemOutcomes
+    publication: ConnectorJobPublication | None
+    created_at: float
+    finished_at: float | None
+
+
+class ConnectorJobRepairWindow(TypedDict, total=False):
+    """Bounded repair budget for the current recovery-required cutoff."""
+
+    expires_at: float | None
+    attempts_used: int | None
+    attempts_remaining: int | None
+    attempts_max: int | None
+
+
+class ConnectorJobRecovery(TypedDict, total=False):
+    """Public crash-recovery posture; tokens and receipt MACs never appear."""
+
+    required: bool
+    state: str | None
+    outcome: str | None
+    error_code: str | None
+    reexecution_required: bool
+    repair: ConnectorJobRepairWindow
+
+
 class JobChunk(TypedDict, total=False):
     """One spawned chunk's settle metadata (``output.chunks[]``; results-as-refs).
 
@@ -1287,20 +1429,41 @@ class JobSubmitResult(TypedDict, total=False):
     total_items: int
     chunks: int
     preflight: JobPreflight
-    # Connector jobs echo the resolved ends instead of total_items.
-    input_source: str
-    source: str
-    sink: str
+    # Connector source/sink URIs and SQL are deliberately absent from public
+    # responses; the governed plan exposes only bounded aggregate evidence.
+    execution: Literal["plan", "run"]
+    phase: str
+    plan_revision: int
+    plan_expires_at: float
+    idempotency_expires_at: float
+    plan: ConnectorJobPlan
+    checkpoint: ConnectorJobCheckpoint
+    attempt: ConnectorJobAttempt
+    publication: ConnectorJobPublication | None
+    recovery: ConnectorJobRecovery
 
 
 class JobStatus(TypedDict, total=False):
     """A job's public status doc from ``GET /v1/jobs/{id}`` (refs, never payloads)."""
 
-    id: str
-    object: str
-    operation: str
-    model: str
-    state: JobState
+    id: Required[str]
+    object: Required[str]
+    operation: Required[str]
+    model: Required[str]
+    state: Required[JobState]
+    execution: Literal["plan", "run"]
+    phase: str
+    outcome: str | None
+    error_code: str | None
+    plan_revision: int | None
+    plan_expires_at: float | None
+    idempotency_expires_at: float | None
+    plan: ConnectorJobPlan | None
+    checkpoint: ConnectorJobCheckpoint
+    attempt: ConnectorJobAttempt
+    attempts: list[ConnectorJobAttempt]
+    publication: ConnectorJobPublication | None
+    recovery: ConnectorJobRecovery
     total_items: int
     completed_items: int
     preflight: JobPreflight
@@ -1351,6 +1514,9 @@ class Connection(TypedDict, total=False):
     id: int
     type: str
     name: str
+    authorization_generation: int
+    source_schema: str | None
+    sink_schema: str | None
     created_at: float
 
 
@@ -1362,6 +1528,9 @@ class ConnectionCreated(TypedDict, total=False):
     id: int
     type: str
     name: str
+    authorization_generation: int
+    source_schema: str | None
+    sink_schema: str | None
     created_at: float
 
 

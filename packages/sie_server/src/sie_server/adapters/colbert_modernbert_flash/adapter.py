@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -30,6 +31,39 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _ERR_CPU_NOT_SUPPORTED = "ColBERTModernBERTFlashAdapter requires CUDA for Flash Attention."
+
+
+def _nested_rope_theta(config: Any, layer_kind: str) -> float | None:
+    """Return ``rope_theta`` for ``layer_kind`` from a transformers>=5 nested
+    ``rope_parameters`` mapping, or None when it is absent or malformed.
+
+    transformers 5.x re-serializes ModernBERT rope as
+    ``rope_parameters[{"full_attention", "sliding_attention"}]["rope_theta"]``
+    and drops the flat ``global_rope_theta``/``local_rope_theta`` keys. This
+    bundle's 4.x config class does not ingest the nested mapping —
+    ``PretrainedConfig`` retains it as an opaque attribute while the flat attrs
+    fill in from class defaults — so without this read a 5.x-serialized
+    checkpoint is silently served with sliding-window layers at the
+    class-default theta 10000 instead of its trained value (mLateOn trains
+    both layer kinds at 160000; the #2807 parity probe measured per-token
+    cosine vs pylate down to 0.588 from this alone).
+
+    Precedence: nested-when-present wins — a 5.x-serialized config is
+    authoritative about itself, and 4.x-written configs carry no
+    ``rope_parameters`` key, so their flat-attr path stays byte-identical. A
+    malformed nested declaration (non-mapping, missing layer kind, non-numeric
+    theta) falls back to the flat attrs rather than failing the load.
+    """
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if not isinstance(rope_parameters, Mapping):
+        return None
+    entry = rope_parameters.get(layer_kind)
+    if not isinstance(entry, Mapping):
+        return None
+    theta = entry.get("rope_theta")
+    if isinstance(theta, bool) or not isinstance(theta, (int, float)):
+        return None
+    return float(theta)
 
 
 class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
@@ -506,6 +540,9 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         ModernBERT uses different rope_theta values for global vs local attention
         layers: ``global_rope_theta`` (default 160000) for global layers and
         ``local_rope_theta`` (default 10000) for local (sliding-window) layers.
+        A transformers>=5 nested ``rope_parameters`` declaration takes
+        precedence over the flat attrs when present (see ``_nested_rope_theta``
+        for the rationale and fallback contract).
 
         Args:
             position_ids: Packed position IDs [total_tokens].
@@ -518,9 +555,13 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         cfg = self._model.config
 
         if use_global:
-            base = getattr(cfg, "global_rope_theta", getattr(cfg, "rope_theta", 160000.0))
+            base = _nested_rope_theta(cfg, "full_attention")
+            if base is None:
+                base = getattr(cfg, "global_rope_theta", getattr(cfg, "rope_theta", 160000.0))
         else:
-            base = getattr(cfg, "local_rope_theta", getattr(cfg, "rope_theta", 10000.0))
+            base = _nested_rope_theta(cfg, "sliding_attention")
+            if base is None:
+                base = getattr(cfg, "local_rope_theta", getattr(cfg, "rope_theta", 10000.0))
 
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=self._device).float() / head_dim))
 

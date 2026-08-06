@@ -15,7 +15,9 @@ from sie_server.api.health import router as health_router
 from sie_server.api.models import router as models_router
 from sie_server.api.openai_audio import router as openai_audio_router
 from sie_server.api.openai_compat import router as openai_router
+from sie_server.api.openai_completions import router as openai_completions_router
 from sie_server.api.openai_local import router as openai_local_router
+from sie_server.api.openai_responses import router as openai_responses_router
 from sie_server.api.openapi import setup_custom_openapi_schema
 from sie_server.api.root import router as root_router
 from sie_server.api.score import router as score_router
@@ -90,7 +92,7 @@ class AppFactory:
         # Queue is the only supported routing mode: the worker-sidecar
         # drives NATS and talks to Python over UDS IPC. We still mount
         # the HTTP routers for /healthz and /readyz (K8s probes), the
-        # landing page, and /ws/status — which is
+        # root redirect to /docs, and /ws/status — which is
         # the gateway's worker-registration channel: the gateway dials
         # `ws://<pod>/ws/status` to learn pool_name, bundle,
         # machine_profile, and readiness. The inference endpoints
@@ -110,6 +112,8 @@ class AppFactory:
         app.include_router(models_router)
         app.include_router(openai_audio_router)  # OpenAI-compatible /v1/audio/transcriptions
         app.include_router(openai_router)  # OpenAI-compatible /v1/embeddings
+        app.include_router(openai_completions_router)  # OpenAI-compatible /v1/completions
+        app.include_router(openai_responses_router)  # OpenAI-compatible /v1/responses
         # Local-only convenience (single-node/dev); intentionally NOT in the published
         # openapi.json — see cli.openapi_export. The Rust gateway is the prod API authority.
         app.include_router(openai_local_router)  # local /v1/chat/completions + /v1/rerank

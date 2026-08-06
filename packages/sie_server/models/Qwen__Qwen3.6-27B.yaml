@@ -16,20 +16,18 @@ tasks:
   generate:
     # Native context length is 262,144 tokens (YaRN extends to ~1M).
     # Keep the base model contract at the 8K launch window. The managed
-    # tester rollout exposes the 32K surface only through the
-    # ``:rtx-pro-6000`` variant below, whose profile-level ``max_seq_length``
-    # is promoted into the generated variant config by the loader.
+    # tester rollout exposes the 32K surface through the
+    # ``:rtx-pro-6000`` shape and its semantic ``:long-context`` alias below;
+    # profile-level ``max_seq_length`` is promoted into each generated variant
+    # config by the loader.
     context_length: 8192
     max_output_tokens: 4096
-    # NEXTN cannot safely run Outlines grammar decoding. The gateway rewrites
+    # NEXTN cannot safely run constrained decoding. The gateway rewrites
     # grammar-constrained requests to this non-speculative sibling, which is
     # deployed on the same H100 machine class as the default lane.
     grammar_profile: no-spec
     capabilities:
-      # Same constraint as Qwen3.5-4B: SGLang's outlines_backend does
-      # not implement ebnf. xgrammar smoke would pass all three; flip
-      # ``grammar_backend: xgrammar`` and re-add ``"ebnf"`` here if a
-      # consumer needs it.
+      # EBNF remains unadvertised until it has model-specific runtime evidence.
       grammar: ["json_schema", "regex"]
       streaming: true
       tools: true
@@ -53,9 +51,8 @@ tasks:
     chat_template_kwargs:
       enable_thinking: false
     prewarm_grammars:
-      # Bare pattern, NOT anchored — Outlines regexes are implicitly
-      # anchored and its FSM engine rejects ``^``/``$``. See the
-      # Qwen3.5-4B model card for the full back-story.
+      # Keep the prewarm pattern bare so it has the same portable semantics
+      # across the worker preflight and SGLang's xgrammar runtime.
       - name: yes_no
         kind: regex
         value: "(yes|no)"
@@ -102,7 +99,7 @@ profiles:
         served_model_name: Qwen/Qwen3.6-27B
         disable_cuda_graph: true
         attention_backend: triton
-        grammar_backend: outlines
+        grammar_backend: xgrammar
         reasoning_parser: qwen3
         tool_call_parser: qwen3_coder
         # Preserve the smaller 2/2 H100 draft shape for a future validated
@@ -118,6 +115,8 @@ profiles:
         # Keep it paired with ``--disable-overlap-schedule`` for all NEXTN
         # launch profiles.
         extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
           - "--mamba-scheduler-strategy"
           - "extra_buffer"
           - "--disable-overlap-schedule"
@@ -147,7 +146,7 @@ profiles:
         served_model_name: Qwen/Qwen3.6-27B
         disable_cuda_graph: true
         attention_backend: triton
-        grammar_backend: outlines
+        grammar_backend: xgrammar
         reasoning_parser: qwen3
         tool_call_parser: qwen3_coder
         speculative:
@@ -160,6 +159,8 @@ profiles:
         # NEXTN + mamba-scheduler ``extra_buffer`` on the hybrid Gated-
         # DeltaNet architecture (same constraint as Qwen3.5-4B).
         extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
           - "--mamba-scheduler-strategy"
           - "extra_buffer"
           - "--disable-overlap-schedule"
@@ -194,12 +195,14 @@ profiles:
         served_model_name: Qwen/Qwen3.6-27B
         disable_cuda_graph: true
         attention_backend: triton
-        grammar_backend: outlines
+        grammar_backend: xgrammar
         reasoning_parser: qwen3
         tool_call_parser: qwen3_coder
         speculative:
           enabled: false
         extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
           - "--quantization"
           - "fp8"
   # RTX PRO 6000 (96 GB GDDR7, Blackwell Server Edition, sm_120) profile.
@@ -252,7 +255,7 @@ profiles:
         # the boot smoke verifies; switch to flashinfer here if triton lacks
         # sm_120 coverage in the pinned SGLang build.
         attention_backend: triton
-        grammar_backend: outlines
+        grammar_backend: xgrammar
         reasoning_parser: qwen3
         tool_call_parser: qwen3_coder
         # Model-card NEXTN 3/4 — restored here (vs ``default``'s conservative
@@ -269,6 +272,8 @@ profiles:
         # companions on the hybrid Gated-DeltaNet architecture. List is the
         # FULL set (production full-replaces ``extra_launch_args``, not merge).
         extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
           - "--quantization"
           - "fp8"
           - "--mamba-scheduler-strategy"
@@ -297,6 +302,122 @@ profiles:
           min_new_tokens: 10
         stop_tokens:
           - "<|im_end|>"
+  # Explicit native-window candidate for one H100-80GB admission. Keep this
+  # standalone (rather than extending ``h100-fp8``) so the matching
+  # ``long-context-thinking`` child can inherit it without forbidden profile
+  # chaining. Online FP8 limits weight memory; KV remains BF16 until measured
+  # H100 evidence proves a lower-precision cache is necessary and faithful.
+  long-context:
+    # Qwen's official non-thinking serving recipe uses max_tokens=32768.
+    # Keep the bare 8K profile at 4096 while exposing that decode ceiling only
+    # on variants whose total context can accommodate it.
+    max_output_tokens: 32768
+    max_batch_tokens: 262144
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    kv_budget_tokens: 262144
+    adapter_options:
+      loadtime:
+        max_seq_length: 262144
+        mem_fraction_static: 0.95
+        served_model_name: Qwen/Qwen3.6-27B
+        disable_cuda_graph: true
+        attention_backend: triton
+        grammar_backend: xgrammar
+        reasoning_parser: qwen3
+        tool_call_parser: qwen3_coder
+        speculative:
+          enabled: false
+        extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
+          - "--quantization"
+          - "fp8"
+          - "--mamba-scheduler-strategy"
+          - "extra_buffer"
+          - "--disable-overlap-schedule"
+      runtime:
+        first_chunk_timeout_s: 900
+        inter_chunk_timeout_s: 30
+        overall_timeout_s: 1800
+        default_sampling:
+          temperature: 0.7
+          top_p: 0.8
+          top_k: 20
+          presence_penalty: 1.5
+          min_new_tokens: 10
+        stop_tokens:
+          - "<|im_end|>"
+  # Same measured 256K launch/admission envelope with Qwen thinking enabled.
+  long-context-thinking:
+    extends: long-context
+    # Official Qwen3.6 thinking examples use max_tokens=81920.
+    max_output_tokens: 81920
+    # SGLang 0.5.13's strict-thinking token filter prevents a premature EOS
+    # from leaving the whole answer inside the private reasoning channel.
+    adapter_path: sie_server.adapters.sglang.cuda13:SGLangStrictThinkingAdapter
+    chat_template_kwargs:
+      enable_thinking: true
+    adapter_options:
+      runtime:
+        first_chunk_timeout_s: 900
+        inter_chunk_timeout_s: 30
+        overall_timeout_s: 1800
+        default_sampling:
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          min_new_tokens: 10
+        stop_tokens:
+          - "<|im_end|>"
+  # Hardware-explicit aliases for the exact H100-80GB native-window shape.
+  # Machine placement remains a separate gateway decision; these names make
+  # the validated context/GPU pairing discoverable to callers.
+  h100-256k:
+    extends: long-context
+  h100-256k-thinking:
+    extends: long-context
+    max_output_tokens: 81920
+    adapter_path: sie_server.adapters.sglang.cuda13:SGLangStrictThinkingAdapter
+    chat_template_kwargs:
+      enable_thinking: true
+    adapter_options:
+      runtime:
+        first_chunk_timeout_s: 900
+        inter_chunk_timeout_s: 30
+        overall_timeout_s: 1800
+        default_sampling:
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          min_new_tokens: 10
+        stop_tokens:
+          - "<|im_end|>"
+  # Explicit reasoning mode uses the validated native-window H100 lane. Qwen's
+  # model card recommends at least 128K context for thinking; keeping this alias
+  # on the 8K base lane would expose a mode that routinely truncates before its
+  # private thought closes. The bare model remains non-thinking and answer-only.
+  thinking:
+    extends: long-context
+    max_output_tokens: 81920
+    adapter_path: sie_server.adapters.sglang.cuda13:SGLangStrictThinkingAdapter
+    chat_template_kwargs:
+      enable_thinking: true
+    adapter_options:
+      runtime:
+        first_chunk_timeout_s: 900
+        inter_chunk_timeout_s: 30
+        overall_timeout_s: 1800
+        default_sampling:
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          min_new_tokens: 10
+        stop_tokens:
+          - "<|im_end|>"
   # Throughput profile (H100-80GB) — the flagship's batch story. The
   # ``default`` NEXTN-spec shape is latency-optimized single-stream and
   # throughput-FLAT (~44 tok/s aggregate c=1→32, effective batch ≈1 —
@@ -318,7 +439,7 @@ profiles:
   #     0.90 leaves headroom on top of the ~54 GB BF16 weights.
   #   * ``--cuda-graph-max-bs 32``: pin graph coverage through the measured
   #     c=32 operating point so deep decode batches stay on graphs.
-  #   * triton attention + outlines grammar kept for Qwen3.x family parity.
+  #   * triton attention + xgrammar structured decoding.
   #
   # UX story: ``Qwen/Qwen3.6-27B`` (default, latency / single-stream) ·
   # ``:batch`` (this profile, throughput) · ``:thinking`` (reasoning).
@@ -333,12 +454,14 @@ profiles:
         mem_fraction_static: 0.90
         served_model_name: Qwen/Qwen3.6-27B
         attention_backend: triton
-        grammar_backend: outlines
+        grammar_backend: xgrammar
         reasoning_parser: qwen3
         tool_call_parser: qwen3_coder
         speculative:
           enabled: false
         extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
           - "--cuda-graph-max-bs"
           - "32"
       runtime:
@@ -369,12 +492,14 @@ profiles:
         served_model_name: Qwen/Qwen3.6-27B
         disable_cuda_graph: true
         attention_backend: triton
-        grammar_backend: outlines
+        grammar_backend: xgrammar
         reasoning_parser: qwen3
         tool_call_parser: qwen3_coder
         speculative:
           enabled: false
         extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
           - "--mamba-scheduler-strategy"
           - "extra_buffer"
           - "--disable-overlap-schedule"
@@ -382,11 +507,12 @@ profiles:
         first_chunk_timeout_s: 90
         inter_chunk_timeout_s: 15
         overall_timeout_s: 600
+        # A strict grammar may complete valid JSON in fewer than ten tokens.
+        # Do not force post-schema tokens on grammar-routed profiles.
         default_sampling:
           temperature: 0.7
           top_p: 0.8
           top_k: 20
           presence_penalty: 1.5
-          min_new_tokens: 10
         stop_tokens:
           - "<|im_end|>"

@@ -61,7 +61,11 @@ pub struct WorkItem {
     #[serde(default)]
     pub output_schema: Option<serde_json::Value>,
     #[serde(default)]
-    pub generate: Option<serde_json::Value>,
+    /// Generation parameters use the same msgpack-native value as media
+    /// items. Legacy producers still serialize ordinary JSON maps, while
+    /// sidecar-prepared vision requests can carry image data as msgpack
+    /// binary without a second base64 allocation in Python.
+    pub generate: Option<WireValue>,
     #[serde(default)]
     pub routing_key: Option<String>,
     #[serde(default)]

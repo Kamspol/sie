@@ -156,6 +156,19 @@ def _encode_image_data(images: list[ImageInput] | None) -> list[str] | None:
     return encoded
 
 
+def _raise_for_sglang_event_error(event: Any) -> None:
+    """Propagate an error carried inside SGLang's HTTP-200 SSE stream."""
+    if not isinstance(event, dict) or "error" not in event:
+        return
+    error = event["error"]
+    message = error.get("message") if isinstance(error, dict) else error
+    if not isinstance(message, str) or not message.strip():
+        message = "unknown in-band SGLang error"
+    message = message.strip()[:500]
+    logger.error("SGLang /generate in-band error: %s", message)
+    raise RuntimeError(f"SGLang /generate error: {message}")
+
+
 def _tail_file(path: str, *, max_lines: int = 200) -> str:
     """Return the final lines from a startup log for diagnostics."""
     try:
@@ -402,6 +415,33 @@ class SGLangGenerationAdapter(GenerationAdapter):
         )
         return MLXGenerationAdapter(**_translate_to_mlx_kwargs(kwargs))
 
+    @property
+    def server_url(self) -> str | None:
+        """Return the managed child's loopback base URL when loaded."""
+        return self._server_url
+
+    @property
+    def served_model_name(self) -> str:
+        """Return the exact model identity registered with the SGLang child."""
+        return self._served_model_name
+
+    @property
+    def reasoning_parser(self) -> str | None:
+        """Return the child parser used to separate private reasoning output."""
+        return self._reasoning_parser
+
+    def _compat_pythonpath_entries(self) -> tuple[str, ...]:
+        """Return trusted compatibility paths for the SGLang child.
+
+        Model configuration may supply other child environment variables, but
+        it must not select interpreter startup hooks through ``PYTHONPATH``.
+        Subclasses can prepend code-owned compatibility directories by
+        overriding this method with paths derived from their own source tree.
+        """
+        compat_dir = os.path.join(os.path.dirname(__file__), "_compat")
+        inherited_pythonpath = os.environ.get("PYTHONPATH", "")
+        return tuple(path for path in (compat_dir, inherited_pythonpath) if path)
+
     def load(self, device: str) -> None:
         self._device = device
         device_index = _server.parse_device_index(device)
@@ -498,6 +538,10 @@ class SGLangGenerationAdapter(GenerationAdapter):
                     "speculative_needs_extra_buffer=false (non-DeltaNet models e.g. Gemma 4 "
                     "MTP), or disable speculative.enabled in the model config."
                 )
+        # Keep SIE compatibility hooks deterministic and code-owned: Python
+        # auto-imports sitecustomize from PYTHONPATH during child startup.
+        extra_env["PYTHONPATH"] = os.pathsep.join(self._compat_pythonpath_entries())
+        extra_env["SIE_SGLANG_MM_PROCESS_CONFIG_COMPAT"] = "1"
         logger.warning(
             "Resolved SGLang generation command: %s",
             " ".join(shlex.quote(str(arg)) for arg in cmd),
@@ -959,6 +1003,16 @@ class SGLangGenerationAdapter(GenerationAdapter):
             "temperature": temperature,
             "top_p": top_p,
         }
+        if self._reasoning_parser == "gemma4":
+            # Gemma 4's private reasoning boundary uses special channel
+            # tokens. SGLang's default detokenization drops those tokens from
+            # the native /generate text while leaving the ordinary
+            # ``thought\n`` label and reasoning body visible, so SIE's
+            # family-aware privacy filter can no longer identify the block.
+            # Preserve the markers at this internal boundary; every public
+            # generation surface removes the complete reasoning block before
+            # returning content to the caller.
+            sampling_params["skip_special_tokens"] = False
         # SGLang accepts ``top_k`` (int) and ``repetition_penalty`` (float)
         # natively under ``sampling_params``. Forward only when the gateway
         # provided a value so model defaults stay in effect otherwise.
@@ -1112,6 +1166,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    _raise_for_sglang_event_error(event)
                     idx = int(event.get("index", 0))
                     cumulative = event.get("text", "")
                     if not isinstance(cumulative, str):
@@ -1402,6 +1457,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
                         logger.warning("SGLang stream: skipping non-JSON line: %s", line[:200])
                         continue
 
+                    _raise_for_sglang_event_error(event)
                     chunk = _chunk_from_sglang_event(
                         event,
                         previous_cumulative_text=last_cumulative_text,

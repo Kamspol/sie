@@ -34,6 +34,52 @@ describe("client.connections", () => {
     });
   });
 
+  it("add posts a validated PostgreSQL schema policy", async () => {
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          org: "acme",
+          account_id: 7,
+          id: 1,
+          type: "postgres",
+          name: "wh",
+          authorization_generation: 1,
+          source_schema: "source_data",
+          sink_schema: "sink_data",
+        },
+        201,
+      ),
+    );
+    const client = new SIEClient(GW, { apiKey: "sk-sie-x", controlPlaneUrl: CP, org: "acme" });
+    const out = await client.connections.add("wh", "postgres", "postgres://u:p@h/db", {
+      sourceSchema: "source_data",
+      sinkSchema: "sink_data",
+    });
+    expect(out.source_schema).toBe("source_data");
+    const [, init] = mockFetch.mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({
+      type: "postgres",
+      name: "wh",
+      secret: "postgres://u:p@h/db",
+      source_schema: "source_data",
+      sink_schema: "sink_data",
+    });
+  });
+
+  it.each([
+    ["postgres", { sourceSchema: "source" }],
+    ["postgres", { sinkSchema: "sink" }],
+    ["s3", { sourceSchema: "source", sinkSchema: "sink" }],
+    ["postgres", { sourceSchema: "source.bad", sinkSchema: "sink" }],
+    ["postgres", { sourceSchema: "source", sinkSchema: "sink-bad" }],
+    ["postgres", { sourceSchema: "source", sinkSchema: "sink\n" }],
+    ["postgres", { sourceSchema: "source", sinkSchema: "s".repeat(64) }],
+  ])("rejects invalid schema policy for %s before I/O", async (type, options) => {
+    const client = new SIEClient(GW, { apiKey: "sk-sie-x", controlPlaneUrl: CP, org: "acme" });
+    await expect(client.connections.add("wh", type, "dsn", options)).rejects.toThrow(/Schema/);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it("list returns the connections array", async () => {
     mockFetch.mockResolvedValueOnce(
       jsonResponse({
@@ -56,6 +102,24 @@ describe("client.connections", () => {
     const [url, init] = mockFetch.mock.calls[0];
     expect(url).toBe("http://cp:9000/internal/orgs/acme/connections/wh");
     expect(init.method).toBe("DELETE");
+  });
+
+  it.each([
+    "../other",
+    "warehouse/name",
+    "warehouse%2fname",
+    "warehouse\n",
+    "warehouse\r",
+    "warehouse\u2028",
+    "café",
+    "a".repeat(129),
+  ])("rejects non-canonical connection name %s before I/O", async (name) => {
+    const client = new SIEClient(GW, { controlPlaneUrl: CP, org: "acme" });
+    await expect(client.connections.add(name, "postgres", "dsn")).rejects.toThrow(
+      /connection name/,
+    );
+    await expect(client.connections.revoke(name)).rejects.toThrow(/connection name/);
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it("throws when controlPlaneUrl is not configured", async () => {

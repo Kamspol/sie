@@ -20,7 +20,8 @@ inputs:
   video: false
 tasks:
   generate:
-    # Conservative contract pending calibration on a Gemma-4-capable engine.
+    # Conservative bare contract; ``:long-context`` exposes a 32K opt-in
+    # window, well below this edge model's native 128K limit.
     context_length: 8192
     max_output_tokens: 4096
     # Grammar (response_format / json_schema / regex) is served by the
@@ -85,6 +86,27 @@ profiles:
   # ``grammar_profile`` can point here (the validator forbids naming ``default``).
   no-spec:
     extends: default
+  # Gemma 4 supports an explicit tokenizer thinking switch. Keep it opt-in so
+  # the bare/OpenAI-compatible response remains answer-only.
+  thinking:
+    extends: default
+    chat_template_kwargs:
+      enable_thinking: true
+  # Full 128K requires a dedicated KV calibration. Start with a conservative
+  # 32K profile and a matching one-request admission budget.
+  long-context:
+    extends: default
+    kv_budget_tokens: 32768
+    adapter_options:
+      loadtime:
+        max_seq_length: 32768
+        mem_fraction_static: 0.85
+        served_model_name: google/gemma-4-E4B-it
+        disable_cuda_graph: true
+        attention_backend: triton
+        grammar_backend: xgrammar
+        reasoning_parser: gemma4
+        tool_call_parser: gemma4
   # ``mtp`` variant — Gemma 4 multi-token prediction (speculative decoding):
   # NEXTN with the paired external draft ``google/gemma-4-E4B-it-assistant``
   # (sglang 0.5.12+ Gemma 4 MTP; cookbook recipe num_steps=5 / num_draft_tokens=6

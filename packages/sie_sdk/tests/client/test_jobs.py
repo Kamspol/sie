@@ -63,6 +63,7 @@ def test_submit_inline_maps_items_and_posts_v1_jobs() -> None:
         body = mock_client.return_value.request.call_args.kwargs["json"]
         assert (method, url) == ("POST", "/v1/jobs")
         assert body == {"operation": "encode", "model": "BAAI/bge-m3", "items": [{"text": "a"}, {"text": "b"}]}
+        assert "Idempotency-Key" not in mock_client.return_value.request.call_args.kwargs["headers"]
         client.close()
 
 
@@ -74,12 +75,32 @@ def test_submit_connector_job_body() -> None:
             source="postgres://warehouse?query=x",
             model="BAAI/bge-m3",
             sink="s3://out/vecs",
+            execution="plan",
+            idempotency_key="plan-postgres-1",
         )
-        body = mock_client.return_value.request.call_args.kwargs["json"]
+        call = mock_client.return_value.request.call_args
+        body = call.kwargs["json"]
         assert body["src"] == "postgres://warehouse?query=x"
         assert body["connection"] == "warehouse"
         assert body["sink"] == "s3://out/vecs"
         assert body["sink_connection"] == "out"
+        assert body["execution"] == "plan"
+        assert [(key, value) for key, value in call.kwargs["headers"].items() if key.lower() == "idempotency-key"] == [
+            ("Idempotency-Key", "plan-postgres-1")
+        ]
+        client.close()
+
+
+def test_submit_connector_requires_retry_stable_idempotency_key_before_io() -> None:
+    with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+        client = SIEClient(GW, api_key=KEY)
+        with pytest.raises(ValueError, match="idempotency_key"):
+            client.jobs.submit(
+                source="postgres://warehouse?query=x",
+                model="BAAI/bge-m3",
+                execution="plan",
+            )
+        mock_client.return_value.request.assert_not_called()
         client.close()
 
 
@@ -94,6 +115,8 @@ def test_submit_field_map_job_body() -> None:
             sink="upload://file-out",
             field_map={"id_field": "doc_id", "input_field": "text", "carry": ["source_url"], "input_type": "text"},
             output_field="embedding",
+            execution="run",
+            idempotency_key="run-upload-1",
         )
         body = mock_client.return_value.request.call_args.kwargs["json"]
         assert body["src"] == "upload://file-abc?format=csv"
@@ -120,6 +143,8 @@ def test_submit_score_options_query_rides_the_wire() -> None:
             operation="score",
             sink="postgres://warehouse?table=scores",
             options={"query": "rank these documents"},
+            execution="run",
+            idempotency_key="run-score-1",
         )
         body = mock_client.return_value.request.call_args.kwargs["json"]
         assert body["operation"] == "score"
@@ -136,6 +161,73 @@ def test_get_and_cancel_hit_expected_urls() -> None:
         out = client.jobs.cancel("job-1")
         assert mock_client.return_value.request.call_args.args == ("POST", "/v1/jobs/job-1/cancel")
         assert out["state"] == "cancelled"
+        client.close()
+
+
+@pytest.mark.parametrize(
+    ("job_id", "encoded_job_id"),
+    [
+        ("job-victim/cancel", "job-victim%2Fcancel"),
+        ("job-victim?next=/cancel", "job-victim%3Fnext%3D%2Fcancel"),
+        ("job-victim#cancel", "job-victim%23cancel"),
+    ],
+)
+def test_sync_job_id_is_one_percent_encoded_path_segment(job_id: str, encoded_job_id: str) -> None:
+    response = {"id": "job-victim", "state": "succeeded", "output": {"kind": "refs", "chunks": []}}
+    with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+        mock_client.return_value.request = MagicMock(return_value=_resp(200, response))
+        client = SIEClient(GW, api_key=KEY)
+
+        client.jobs.get(job_id)
+        assert mock_client.return_value.request.call_args.args == ("GET", f"/v1/jobs/{encoded_job_id}")
+        client.jobs.cancel(job_id)
+        assert mock_client.return_value.request.call_args.args == ("POST", f"/v1/jobs/{encoded_job_id}/cancel")
+        client.jobs.execute(job_id, 3, "execute-plan-3")
+        assert mock_client.return_value.request.call_args.args == ("POST", f"/v1/jobs/{encoded_job_id}/execute")
+        client.jobs.repair(job_id, 3, 2, "repair-plan-3-attempt-2")
+        assert mock_client.return_value.request.call_args.args == ("POST", f"/v1/jobs/{encoded_job_id}/repair")
+        client.jobs.results(job_id)
+        assert mock_client.return_value.request.call_args.args == ("GET", f"/v1/jobs/{encoded_job_id}")
+        client.close()
+
+
+def test_execute_posts_exact_revision_and_one_idempotency_key() -> None:
+    with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+        mock_client.return_value.request = MagicMock(return_value=_resp(200, {"id": "job-1", "state": "queued"}))
+        client = SIEClient(GW, api_key=KEY)
+        result = client.jobs.execute("job-1", 3, "execute-plan-3")
+        call = mock_client.return_value.request.call_args
+        assert call.args == ("POST", "/v1/jobs/job-1/execute")
+        assert call.kwargs["json"] == {"plan_revision": 3}
+        assert [(key, value) for key, value in call.kwargs["headers"].items() if key.lower() == "idempotency-key"] == [
+            ("Idempotency-Key", "execute-plan-3")
+        ]
+        assert result["id"] == "job-1"
+        client.close()
+
+
+def test_repair_posts_exact_revision_predecessor_and_one_idempotency_key() -> None:
+    with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+        mock_client.return_value.request = MagicMock(return_value=_resp(202, {"id": "job-1", "state": "running"}))
+        client = SIEClient(GW, api_key=KEY)
+        result = client.jobs.repair("job-1", 3, 2, "repair-plan-3-attempt-2")
+        call = mock_client.return_value.request.call_args
+        assert call.args == ("POST", "/v1/jobs/job-1/repair")
+        assert call.kwargs["json"] == {"plan_revision": 3, "recovery_attempt_ordinal": 2}
+        assert [(key, value) for key, value in call.kwargs["headers"].items() if key.lower() == "idempotency-key"] == [
+            ("Idempotency-Key", "repair-plan-3-attempt-2")
+        ]
+        assert result["id"] == "job-1"
+        client.close()
+
+
+def test_wait_returns_stable_planned_phase_without_polling() -> None:
+    planned = {"id": "job-plan-1", "state": "queued", "execution": "plan", "phase": "planned"}
+    with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+        mock_client.return_value.request = MagicMock(return_value=_resp(200, planned))
+        client = SIEClient(GW, api_key=KEY)
+        assert client.jobs.wait("job-plan-1", poll_s=0)["phase"] == "planned"
+        mock_client.return_value.request.assert_called_once()
         client.close()
 
 
@@ -200,6 +292,18 @@ async def test_async_submit_serializes_json_body() -> None:
     call = client._post.call_args
     assert call.args[0] == "/v1/jobs"
     assert json.loads(call.kwargs["data"]) == {"operation": "encode", "model": "m", "items": [{"text": "a"}]}
+    assert "Idempotency-Key" not in call.kwargs["headers"]
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_async_wait_returns_stable_planned_phase_without_polling() -> None:
+    client = SIEAsyncClient(GW, api_key=KEY)
+    client._get = AsyncMock(
+        return_value=_FakeAio(200, {"id": "job-plan-1", "state": "queued", "execution": "plan", "phase": "planned"})
+    )
+    assert (await client.jobs.wait("job-plan-1", poll_s=0))["phase"] == "planned"
+    client._get.assert_awaited_once()
     await client.close()
 
 
@@ -223,11 +327,29 @@ async def test_async_submit_field_map_body() -> None:
         sink="postgres://wh?table=doc_vectors",
         field_map={"id_field": "id", "input_field": "body", "carry": ["source_url"]},
         output_field="embedding",
+        execution="plan",
+        idempotency_key="async-plan-postgres-1",
     )
     body = json.loads(client._post.call_args.kwargs["data"])
     assert body["field_map"] == {"id_field": "id", "input_field": "body", "carry": ["source_url"]}
     assert body["output_field"] == "embedding"
     assert body["connection"] == "wh"
+    assert body["execution"] == "plan"
+    assert client._post.call_args.kwargs["headers"]["Idempotency-Key"] == "async-plan-postgres-1"
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_async_submit_connector_requires_retry_stable_idempotency_key_before_io() -> None:
+    client = SIEAsyncClient(GW, api_key=KEY)
+    client._post = AsyncMock()
+    with pytest.raises(ValueError, match="idempotency_key"):
+        await client.jobs.submit(
+            source="postgres://wh?query=select id, body from docs",
+            model="BAAI/bge-m3",
+            execution="plan",
+        )
+    client._post.assert_not_awaited()
     await client.close()
 
 
@@ -257,4 +379,62 @@ async def test_async_list_and_cancel() -> None:
     out = await client.jobs.cancel("job-9")
     assert out["state"] == "cancelled"
     assert client._post.call_args.args[0] == "/v1/jobs/job-9/cancel"
+    await client.close()
+
+
+@pytest.mark.parametrize(
+    ("job_id", "encoded_job_id"),
+    [
+        ("job-victim/cancel", "job-victim%2Fcancel"),
+        ("job-victim?next=/cancel", "job-victim%3Fnext%3D%2Fcancel"),
+        ("job-victim#cancel", "job-victim%23cancel"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_async_job_id_is_one_percent_encoded_path_segment(job_id: str, encoded_job_id: str) -> None:
+    response = {"id": "job-victim", "state": "succeeded", "output": {"kind": "refs", "chunks": []}}
+    client = SIEAsyncClient(GW, api_key=KEY)
+    client._get = AsyncMock(return_value=_FakeAio(200, response))
+    client._post = AsyncMock(return_value=_FakeAio(200, response))
+
+    await client.jobs.get(job_id)
+    assert client._get.call_args.args[0] == f"/v1/jobs/{encoded_job_id}"
+    await client.jobs.cancel(job_id)
+    assert client._post.call_args.args[0] == f"/v1/jobs/{encoded_job_id}/cancel"
+    await client.jobs.execute(job_id, 3, "execute-plan-3")
+    assert client._post.call_args.args[0] == f"/v1/jobs/{encoded_job_id}/execute"
+    await client.jobs.repair(job_id, 3, 2, "repair-plan-3-attempt-2")
+    assert client._post.call_args.args[0] == f"/v1/jobs/{encoded_job_id}/repair"
+    await client.jobs.results(job_id)
+    assert client._get.call_args.args[0] == f"/v1/jobs/{encoded_job_id}"
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_async_execute_posts_exact_revision_and_one_idempotency_key() -> None:
+    client = SIEAsyncClient(GW, api_key=KEY)
+    client._post = AsyncMock(return_value=_FakeAio(200, {"id": "job-9", "state": "queued"}))
+    result = await client.jobs.execute("job-9", 2, "async-execute-plan-2")
+    call = client._post.call_args
+    assert call.args[0] == "/v1/jobs/job-9/execute"
+    assert json.loads(call.kwargs["data"]) == {"plan_revision": 2}
+    assert [(key, value) for key, value in call.kwargs["headers"].items() if key.lower() == "idempotency-key"] == [
+        ("Idempotency-Key", "async-execute-plan-2")
+    ]
+    assert result["id"] == "job-9"
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_async_repair_posts_exact_revision_predecessor_and_one_idempotency_key() -> None:
+    client = SIEAsyncClient(GW, api_key=KEY)
+    client._post = AsyncMock(return_value=_FakeAio(202, {"id": "job-9", "state": "running"}))
+    result = await client.jobs.repair("job-9", 2, 1, "async-repair-plan-2-attempt-1")
+    call = client._post.call_args
+    assert call.args[0] == "/v1/jobs/job-9/repair"
+    assert json.loads(call.kwargs["data"]) == {"plan_revision": 2, "recovery_attempt_ordinal": 1}
+    assert [(key, value) for key, value in call.kwargs["headers"].items() if key.lower() == "idempotency-key"] == [
+        ("Idempotency-Key", "async-repair-plan-2-attempt-1")
+    ]
+    assert result["id"] == "job-9"
     await client.close()

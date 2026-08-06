@@ -1268,6 +1268,45 @@ class TestProcessScoreBatch:
 
 class TestProcessExtractBatch:
     @pytest.mark.asyncio
+    async def test_image_item_uses_registered_preprocessor_payload(self) -> None:
+        reg = _make_registry()
+        worker = AsyncMock()
+        prepared_item = MagicMock(cost=1024, original_index=0, payload=object())
+        reg.preprocessor_registry.has_preprocessor.return_value = True
+        reg.preprocessor_registry.prepare = AsyncMock(return_value=MagicMock(items=[prepared_item], total_cost=1024))
+        fut: asyncio.Future[WorkerResult] = asyncio.Future()
+        fut.set_result(WorkerResult(output=ExtractOutput(entities=[[]], objects=[[]]), timing=RequestTiming()))
+        worker.submit_extract_preformed_batch = AsyncMock(return_value=[fut])
+        reg.start_worker = AsyncMock(return_value=worker)
+
+        await QueueExecutor(reg).process_extract_batch(
+            ProcessExtractBatchRequest(
+                model_id="test/model",
+                items=[
+                    ExtractBatchItem(
+                        work_item_id="req-1.0",
+                        request_id="req-1",
+                        item_index=0,
+                        total_items=1,
+                        timestamp=time.time(),
+                        item={"images": [{"data": b"image-bytes"}]},
+                        labels=["bottle"],
+                        instruction="find bottles",
+                        options={"task": "detect"},
+                    )
+                ],
+            )
+        )
+
+        reg.preprocessor_registry.prepare.assert_awaited_once()
+        prepare_call = reg.preprocessor_registry.prepare.await_args
+        assert prepare_call.args[0] == "test/model"
+        assert prepare_call.args[1][0].images[0]["data"] == b"image-bytes"
+        assert prepare_call.kwargs == {"instruction": "find bottles", "task": "detect"}
+        requests = worker.submit_extract_preformed_batch.await_args.args[0]
+        assert requests[0].prepared_items == [prepared_item]
+
+    @pytest.mark.asyncio
     async def test_single_item_publish_and_ack(self) -> None:
         reg = _make_registry()
         worker = AsyncMock()

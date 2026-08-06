@@ -126,6 +126,8 @@ class TestAllRoutersAlwaysMounted:
             "/v1/score/{model:path}",
             "/v1/extract/{model:path}",
             "/v1/embeddings",
+            "/v1/completions",
+            "/v1/responses",
             "/v1/models",
         ):
             assert path in paths, f"{path} router missing"

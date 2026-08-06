@@ -198,6 +198,32 @@ def _expand_profile_variants(configs: dict[str, ModelConfig]) -> None:
     remove_base_names: list[str] = []
 
     for base_name, config in configs.items():
+        default_profile = config.profiles.get("default")
+        if (
+            default_profile is not None
+            and config.tasks.generate is not None
+            and (default_profile.chat_template_kwargs is not None or default_profile.max_output_tokens is not None)
+        ):
+            generate_updates: dict[str, Any] = {}
+            if default_profile.chat_template_kwargs is not None:
+                generate_updates["chat_template_kwargs"] = {
+                    **config.tasks.generate.chat_template_kwargs,
+                    **default_profile.chat_template_kwargs,
+                }
+            if default_profile.max_output_tokens is not None:
+                generate_updates["max_output_tokens"] = default_profile.max_output_tokens
+            bare_config = config.model_copy(
+                update={
+                    "tasks": config.tasks.model_copy(
+                        update={
+                            "generate": config.tasks.generate.model_copy(update=generate_updates),
+                        },
+                    ),
+                },
+            )
+            bare_config._resolved_cache = {}
+            bare_config._resolved_lock = threading.Lock()
+            configs[base_name] = bare_config
         if "default" not in config.profiles:
             remove_base_names.append(base_name)
         for profile_name, profile in config.profiles.items():
@@ -220,6 +246,10 @@ def _expand_profile_variants(configs: dict[str, ModelConfig]) -> None:
                     adaptive_batching=resolved.adaptive_batching,
                     kv_budget_tokens=resolved.kv_budget_tokens,
                     admission_enabled=resolved.admission_enabled,
+                    max_output_tokens=resolved.max_output_tokens,
+                    chat_template_kwargs=(
+                        dict(resolved.chat_template_kwargs) if resolved.chat_template_kwargs is not None else None
+                    ),
                 )
             else:
                 variant_default = profile.model_copy(update={"extends": None})
@@ -234,17 +264,31 @@ def _expand_profile_variants(configs: dict[str, ModelConfig]) -> None:
                 "profiles": variant_profiles,
             }
             loadtime = resolved.loadtime if resolved is not None else profile.adapter_options.loadtime
+            profile_chat_template_kwargs = (
+                resolved.chat_template_kwargs if resolved is not None else profile.chat_template_kwargs
+            )
+            generate_updates: dict[str, Any] = {}
             profile_max_seq = loadtime.get("max_seq_length")
             if isinstance(profile_max_seq, int) and profile_max_seq > 0:
                 variant_updates["max_sequence_length"] = profile_max_seq
                 if config.tasks.generate is not None:
-                    variant_updates["tasks"] = config.tasks.model_copy(
-                        update={
-                            "generate": config.tasks.generate.model_copy(
-                                update={"context_length": profile_max_seq},
-                            ),
-                        },
-                    )
+                    generate_updates["context_length"] = profile_max_seq
+            if profile_chat_template_kwargs is not None and config.tasks.generate is not None:
+                generate_updates["chat_template_kwargs"] = {
+                    **config.tasks.generate.chat_template_kwargs,
+                    **dict(profile_chat_template_kwargs),
+                }
+            profile_max_output_tokens = (
+                resolved.max_output_tokens if resolved is not None else profile.max_output_tokens
+            )
+            if profile_max_output_tokens is not None and config.tasks.generate is not None:
+                generate_updates["max_output_tokens"] = profile_max_output_tokens
+            if generate_updates and config.tasks.generate is not None:
+                variant_updates["tasks"] = config.tasks.model_copy(
+                    update={
+                        "generate": config.tasks.generate.model_copy(update=generate_updates),
+                    },
+                )
             variant_config = config.model_copy(
                 update=variant_updates,
             )

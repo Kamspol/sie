@@ -841,6 +841,7 @@ mod tests {
             profiles: HashMap::from([(
                 "default".to_string(),
                 crate::types::model::ProfileConfig {
+                    max_output_tokens: None,
                     adapter_path: Some(
                         "sie_server.adapters.sentence_transformer:Adapter".to_string(),
                     ),

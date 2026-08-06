@@ -50,6 +50,60 @@ pub enum ResolveError {
     BundleConflict(BundleConflictError),
 }
 
+/// Immutable encode-routing evidence captured from one registry snapshot.
+///
+/// Connector planning persists this as output identity, so every field must
+/// come from the same `ArcSwap` generation.  In particular, a config reload
+/// must never pair revision A with bundle hash B or dense dimension C.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the managed gateway wrapper, not the standalone binary
+pub struct ModelExecutionEvidence {
+    /// Canonical base model used by rate-book identity.
+    pub model: String,
+    /// Canonical routed model id (the base or one explicit profile variant).
+    pub served_model: String,
+    pub profile: String,
+    pub revision: String,
+    pub served_bundle: String,
+    pub engine: String,
+    pub adapter_path: String,
+    pub pool: String,
+    pub config_sha256: String,
+    pub output_dimensions: u32,
+    /// Hard post-tokenization sequence bound for one encode item. Connector
+    /// reservations use this instead of treating UTF-8 bytes as tokens.
+    pub max_sequence_length: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the managed gateway wrapper, not the standalone binary
+pub enum ModelExecutionEvidenceError {
+    ModelUnavailable,
+    BundleUnavailable,
+    AdapterUnavailable,
+    MutableRevision,
+    ConfigUnavailable,
+    DenseOutputUnavailable,
+    TokenCeilingUnavailable,
+}
+
+impl std::fmt::Display for ModelExecutionEvidenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::ModelUnavailable => "model is unavailable",
+            Self::BundleUnavailable => "model is unavailable in the selected bundle",
+            Self::AdapterUnavailable => "model profile has no concrete adapter",
+            Self::MutableRevision => "model revision is not immutable",
+            Self::ConfigUnavailable => "bundle configuration identity is unavailable",
+            Self::DenseOutputUnavailable => "model has no fixed dense output shape",
+            Self::TokenCeilingUnavailable => "model has no bounded encode sequence length",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for ModelExecutionEvidenceError {}
+
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -69,6 +123,8 @@ pub type AddModelConfigOutcome = (Vec<String>, Vec<String>, Vec<String>);
 
 const DEFAULT_MODEL_POOL: &str = "default";
 const MAX_POOL_NAME_LEN: usize = 128;
+/// Largest release-governed sequence length accepted as execution evidence.
+pub const MAX_MODEL_SEQUENCE_LENGTH: u64 = 1_000_000;
 
 /// Outcome of resolving where a grammar-constrained request must dispatch.
 ///
@@ -466,6 +522,8 @@ impl ModelRegistry {
             }
             entries.push(ModelEntry {
                 name: format!("{}:{}", base_entry.name, profile_name),
+                canonical_base_model: base_entry.canonical_base_model.clone(),
+                canonical_profile: profile_name,
                 pool: base_entry.pool.clone(),
                 bundles: Vec::new(),
                 adapter_modules: variant_adapters,
@@ -599,7 +657,9 @@ impl ModelRegistry {
         let adapter_modules = Self::base_route_adapter_modules_from_profiles(&config.profiles);
 
         Ok(ModelEntry {
-            name: model_name,
+            name: model_name.clone(),
+            canonical_base_model: model_name,
+            canonical_profile: "default".to_string(),
             pool,
             bundles: Vec::new(),
             adapter_modules,
@@ -680,6 +740,8 @@ impl ModelRegistry {
             }
             entries.push(ModelEntry {
                 name: format!("{}:{}", base_entry.name, profile_name),
+                canonical_base_model: base_entry.canonical_base_model.clone(),
+                canonical_profile: profile_name,
                 pool: base_entry.pool.clone(),
                 bundles: Vec::new(),
                 adapter_modules: variant_adapters,
@@ -708,6 +770,7 @@ impl ModelRegistry {
 
     fn empty_profile_config() -> crate::types::model::ProfileConfig {
         crate::types::model::ProfileConfig {
+            max_output_tokens: None,
             adapter_path: None,
             max_batch_tokens: None,
             compute_precision: None,
@@ -744,6 +807,9 @@ impl ModelRegistry {
             if profile.compute_precision.is_some() {
                 resolved.compute_precision = profile.compute_precision.clone();
             }
+            if profile.max_output_tokens.is_some() {
+                resolved.max_output_tokens = profile.max_output_tokens;
+            }
             resolved.adapter_options = ModelRegistry::merge_adapter_options(
                 resolved.adapter_options,
                 profile.adapter_options.clone(),
@@ -770,6 +836,7 @@ impl ModelRegistry {
     /// re-evaluate them — the stored CanonicalProfile would be stale.
     fn merge_profiles_for_resolution(
         existing: &HashMap<String, CanonicalProfile>,
+        existing_output_caps: &HashMap<String, u32>,
         incoming: &HashMap<String, crate::types::model::ProfileConfig>,
     ) -> HashMap<String, crate::types::model::ProfileConfig> {
         let mut merged: HashMap<String, crate::types::model::ProfileConfig> = existing
@@ -778,6 +845,7 @@ impl ModelRegistry {
                 (
                     name.clone(),
                     crate::types::model::ProfileConfig {
+                        max_output_tokens: existing_output_caps.get(name).copied(),
                         adapter_path: canon.adapter_path.clone(),
                         max_batch_tokens: canon.max_batch_tokens,
                         compute_precision: canon.compute_precision.clone(),
@@ -1369,6 +1437,99 @@ impl ModelRegistry {
         (bundle_config_hash, revision)
     }
 
+    /// Resolve one connector encode identity from a single registry snapshot.
+    ///
+    /// Unlike the compatibility tuple above, this fails closed when any
+    /// output-affecting value is absent.  A durable connector checkpoint may
+    /// only name a model whose weights, route config, and dense shape are all
+    /// immutable and known before source admission.
+    #[allow(dead_code)] // consumed by the managed gateway wrapper, not the standalone binary
+    pub fn resolve_execution_evidence(
+        &self,
+        model: &str,
+        bundle_id: &str,
+    ) -> Result<ModelExecutionEvidence, ModelExecutionEvidenceError> {
+        let snap = self.snapshot.load();
+        let served_model = Self::canonical_model_name(&snap, model)
+            .ok_or(ModelExecutionEvidenceError::ModelUnavailable)?;
+        let entry = snap
+            .models
+            .get(&served_model)
+            .ok_or(ModelExecutionEvidenceError::ModelUnavailable)?;
+        if !entry.bundles.iter().any(|bundle| bundle == bundle_id) {
+            return Err(ModelExecutionEvidenceError::BundleUnavailable);
+        }
+        let engine = snap
+            .bundles
+            .get(bundle_id)
+            .map(|bundle| bundle.engine.clone())
+            .filter(|engine| !engine.is_empty())
+            .ok_or(ModelExecutionEvidenceError::BundleUnavailable)?;
+        let adapter_path = Self::effective_adapter_path_from_entry(entry, "default")
+            .map(str::to_string)
+            .ok_or(ModelExecutionEvidenceError::AdapterUnavailable)?;
+
+        let base_model = entry.canonical_base_model.clone();
+        let profile = entry.canonical_profile.clone();
+        let revision = Self::immutable_model_revision(entry)
+            .ok_or(ModelExecutionEvidenceError::MutableRevision)?;
+        // A batch lane is a scheduling class over the model's catalog pool;
+        // use the registry-owned pool from this same snapshot rather than the
+        // lane's `batch` admission label or a caller-supplied second lookup.
+        let pool = Self::entry_pool_name(entry).to_string();
+        let config_sha256 = snap
+            .bundle_pool_config_hashes
+            .get(&(bundle_id.to_string(), pool.clone()))
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .ok_or(ModelExecutionEvidenceError::ConfigUnavailable)?;
+        if config_sha256.len() != 64
+            || !config_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(ModelExecutionEvidenceError::ConfigUnavailable);
+        }
+        let output_dimensions = entry
+            .info_extras
+            .dims
+            .get("dense")
+            .copied()
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or(ModelExecutionEvidenceError::DenseOutputUnavailable)?;
+        if !entry
+            .info_extras
+            .outputs
+            .iter()
+            .any(|output| output == "dense")
+        {
+            return Err(ModelExecutionEvidenceError::DenseOutputUnavailable);
+        }
+        let max_sequence_length = entry
+            .profile_configs
+            .get("default")
+            .and_then(Self::profile_max_sequence_length)
+            .or(entry.info_extras.max_sequence_length)
+            .filter(|value| (1..=MAX_MODEL_SEQUENCE_LENGTH).contains(value))
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or(ModelExecutionEvidenceError::TokenCeilingUnavailable)?;
+
+        Ok(ModelExecutionEvidence {
+            model: base_model,
+            served_model,
+            profile,
+            revision,
+            served_bundle: bundle_id.to_string(),
+            engine,
+            adapter_path,
+            pool,
+            config_sha256,
+            output_dimensions,
+            max_sequence_length,
+        })
+    }
+
     fn normalize_pool_name(pool_name: &str) -> String {
         let pool_name = pool_name.trim().to_lowercase();
         if pool_name.is_empty() {
@@ -1528,6 +1689,15 @@ impl ModelRegistry {
 
         let bundle_adapter_set: HashSet<&str> =
             bundle.adapters.iter().map(|s| s.as_str()).collect();
+        let has_profile_for_bundle = |entry: &ModelEntry| {
+            entry.profile_configs.values().any(|profile| {
+                profile
+                    .adapter_path
+                    .as_deref()
+                    .map(|path| path.split(':').next().unwrap_or(path))
+                    .is_some_and(|module| bundle_adapter_set.contains(module))
+            })
+        };
 
         let mut items: Vec<serde_json::Value> = Vec::new();
 
@@ -1537,10 +1707,7 @@ impl ModelRegistry {
         for model_name in model_names {
             let synthetic_variant = Self::synthetic_profile_variant_parts(model_name, models);
             if let Some((base_name, _)) = synthetic_variant {
-                if models
-                    .get(base_name)
-                    .is_some_and(|base_entry| base_entry.bundles.iter().any(|b| b == bundle_id))
-                {
+                if models.get(base_name).is_some_and(&has_profile_for_bundle) {
                     // The base entry already carries all profiles compatible with this
                     // bundle. Only hash synthetic variants when they are the sole
                     // routing identity for this bundle, e.g. `model:candle`.
@@ -1562,14 +1729,10 @@ impl ModelRegistry {
                 } else {
                     (model_name.as_str(), None)
                 };
-            if !model_entry.bundles.contains(&bundle_id.to_string()) {
-                continue;
-            }
-            let has_overlap = model_entry
-                .adapter_modules
-                .iter()
-                .any(|a| bundle_adapter_set.contains(a.as_str()));
-            if !has_overlap {
+            // `entry.bundles` describes the base/default route. Hashing must
+            // additionally include bundles selected only by named profiles so
+            // workers and gateways canonicalize those profiles identically.
+            if !has_profile_for_bundle(model_entry) {
                 continue;
             }
 
@@ -1877,8 +2040,11 @@ impl ModelRegistry {
             // ``default``). Build a temporary ``ProfileConfig`` map combining
             // already-stored canonical profiles with the incoming ones —
             // incoming wins on collisions — and resolve against that.
-            let merged_profiles =
-                Self::merge_profiles_for_resolution(&existing.profile_configs, &config.profiles);
+            let merged_profiles = Self::merge_profiles_for_resolution(
+                &existing.profile_configs,
+                &existing.info_extras.profile_max_output_tokens,
+                &config.profiles,
+            );
 
             for profile_name in config.profiles.keys() {
                 if existing.profile_names.contains(profile_name) {
@@ -1949,6 +2115,8 @@ impl ModelRegistry {
                 sie_id.clone(),
                 ModelEntry {
                     name: sie_id.clone(),
+                    canonical_base_model: sie_id.clone(),
+                    canonical_profile: "default".to_string(),
                     pool: incoming_pool,
                     bundles: Vec::new(),
                     adapter_modules: Self::base_route_adapter_modules_from_profiles(
@@ -2093,6 +2261,7 @@ impl ModelRegistry {
             let lora_refreshed = ModelInfoExtras::from_model_config(&merged_config);
             existing.lora_adapters = lora_refreshed.lora_adapters;
             existing.profile_lora_adapters = lora_refreshed.profile_lora_adapters;
+            existing.profile_max_output_tokens = lora_refreshed.profile_max_output_tokens;
         }
     }
 }
@@ -2118,6 +2287,7 @@ mod tests {
         extends: Option<&str>,
     ) -> crate::types::model::ProfileConfig {
         crate::types::model::ProfileConfig {
+            max_output_tokens: None,
             adapter_path: adapter_path.map(str::to_string),
             max_batch_tokens,
             compute_precision: None,
@@ -2219,6 +2389,7 @@ mod tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -2256,6 +2427,7 @@ mod tests {
         let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
 
         let mk = || ProfileConfig {
+            max_output_tokens: None,
             adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
             max_batch_tokens: Some(4096),
             compute_precision: None,
@@ -2396,6 +2568,7 @@ mod tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -2481,6 +2654,7 @@ profiles:
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -2532,6 +2706,7 @@ profiles:
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -2544,6 +2719,7 @@ profiles:
         profiles.insert(
             "bad/name".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -2651,6 +2827,12 @@ profiles:
             models_dir.join("org__profile-only.yaml"),
             r#"
 sie_id: org/profile-only
+hf_revision: 0123456789abcdef0123456789abcdef01234567
+max_sequence_length: 512
+tasks:
+  encode:
+    dense:
+      dim: 384
 profiles:
   experimental:
     adapter_path: sie_server_rust.adapters.candle:CandleEmbeddingAdapter
@@ -2674,6 +2856,12 @@ profiles:
                 .unwrap(),
             "candle"
         );
+        let evidence = registry
+            .resolve_execution_evidence("ORG/PROFILE-ONLY:EXPERIMENTAL", "candle")
+            .expect("profile-only variant retains canonical execution identity");
+        assert_eq!(evidence.model, "org/profile-only");
+        assert_eq!(evidence.served_model, "org/profile-only:experimental");
+        assert_eq!(evidence.profile, "experimental");
     }
 
     #[test]
@@ -2693,6 +2881,7 @@ profiles:
         profiles.insert(
             "experimental".to_string(),
             ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some(
                     "sie_server_rust.adapters.candle:CandleEmbeddingAdapter".to_string(),
                 ),
@@ -2705,14 +2894,17 @@ profiles:
         registry
             .add_model_config(ModelConfig {
                 name: "org/profile-only".to_string(),
-                hf_revision: None,
+                hf_revision: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
                 profiles,
                 inputs: None,
-                tasks: None,
-                max_sequence_length: None,
+                tasks: Some(
+                    serde_yaml::from_str("encode:\n  dense:\n    dim: 384\n")
+                        .expect("valid task fixture"),
+                ),
+                max_sequence_length: Some(512),
             })
             .unwrap();
 
@@ -2729,6 +2921,12 @@ profiles:
                 .unwrap(),
             "candle"
         );
+        let evidence = registry
+            .resolve_execution_evidence("ORG/PROFILE-ONLY:EXPERIMENTAL", "candle")
+            .expect("delta profile-only variant retains canonical execution identity");
+        assert_eq!(evidence.model, "org/profile-only");
+        assert_eq!(evidence.served_model, "org/profile-only:experimental");
+        assert_eq!(evidence.profile, "experimental");
     }
 
     #[test]
@@ -3159,6 +3357,7 @@ profiles:
                     profiles.insert(
                         "default".to_string(),
                         ProfileConfig {
+                            max_output_tokens: None,
                             adapter_path: Some(
                                 "sie_server.adapters.sentence_transformer:Adapter".to_string(),
                             ),
@@ -3431,6 +3630,7 @@ adapters:
                 m.insert(
                     "default".to_string(),
                     crate::types::model::ProfileConfig {
+                        max_output_tokens: None,
                         adapter_path: Some(
                             "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
                                 .to_string(),
@@ -3478,6 +3678,7 @@ adapters:
         profiles.insert(
             "default".to_string(),
             crate::types::model::ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -3517,6 +3718,7 @@ encode:
         profiles.insert(
             "default".to_string(),
             crate::types::model::ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -3527,6 +3729,7 @@ encode:
         profiles.insert(
             "alt".to_string(),
             crate::types::model::ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(2048),
                 compute_precision: None,
@@ -3585,6 +3788,7 @@ adapters:
         profiles.insert(
             "default".to_string(),
             crate::types::model::ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -3619,6 +3823,7 @@ encode:
         profiles.insert(
             "default".to_string(),
             crate::types::model::ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -3629,6 +3834,7 @@ encode:
         profiles.insert(
             "alt".to_string(),
             crate::types::model::ProfileConfig {
+                max_output_tokens: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(2048),
                 compute_precision: None,
@@ -3673,6 +3879,7 @@ encode:
                 m.insert(
                     "default".to_string(),
                     crate::types::model::ProfileConfig {
+                        max_output_tokens: None,
                         adapter_path: Some(adapter_path.to_string()),
                         max_batch_tokens: Some(max_batch_tokens),
                         compute_precision: None,
@@ -3812,12 +4019,13 @@ adapters:
         let seed: ModelConfig = serde_yaml::from_str(
             r#"
 sie_id: test/model
-tasks: {generate: {grammar_profile: no-spec}}
+tasks: {generate: {grammar_profile: no-spec, max_output_tokens: 4096}}
 profiles:
   default: {adapter_path: "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter", max_batch_tokens: 4096}
   no-spec:
     adapter_path: "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
     max_batch_tokens: 4096
+    max_output_tokens: 32768
     adapter_options: {loadtime: {grammar_backend: outlines, speculative: {enabled: false}}}
 "#,
         )
@@ -3848,6 +4056,20 @@ profiles:
         assert_eq!(
             registry.grammar_route_variant("test/model:h100-fp8"),
             GrammarRoute::Keep,
+        );
+        assert_eq!(
+            registry
+                .get_model_info("test/model:h100-fp8")
+                .and_then(|entry| entry.effective_max_output_tokens()),
+            Some(32768),
+            "delta child must inherit the stored parent's profile output cap",
+        );
+        assert_eq!(
+            registry
+                .get_model_info("test/model")
+                .and_then(|entry| entry.effective_max_output_tokens()),
+            Some(4096),
+            "profile cap must not widen the bare route",
         );
 
         // Same delta under the test-only authoritative path must also succeed
@@ -3902,6 +4124,7 @@ adapters:
                 m.insert(
                     "default".to_string(),
                     crate::types::model::ProfileConfig {
+                        max_output_tokens: None,
                         adapter_path: Some(
                             "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
                                 .to_string(),
@@ -3960,6 +4183,7 @@ adapters:
                 m.insert(
                     "a100-40gb".to_string(),
                     crate::types::model::ProfileConfig {
+                        max_output_tokens: None,
                         adapter_path: Some(
                             "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
                                 .to_string(),
@@ -4129,6 +4353,160 @@ profiles:
         let second = registry.compute_bundle_config_hash("default");
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn test_resolve_execution_evidence_is_one_snapshot_and_profile_exact() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            "name: default\nadapters:\n  - sie_server.adapters.sentence_transformer\n",
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join("revisioned.yaml"),
+            r#"
+sie_id: org/revisioned
+hf_revision: 0123456789abcdef0123456789abcdef01234567
+max_sequence_length: 4096
+tasks:
+  encode:
+    dense:
+      dim: 384
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sentence_transformer:Adapter
+  quality:
+    adapter_path: sie_server.adapters.sentence_transformer:Adapter
+    adapter_options:
+      loadtime:
+        max_seq_length: 32768
+"#,
+        )
+        .unwrap();
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        let evidence = registry
+            .resolve_execution_evidence("ORG/REVISIONED:QUALITY", "default")
+            .expect("pinned dense profile has executable evidence");
+        assert_eq!(evidence.model, "org/revisioned");
+        assert_eq!(evidence.served_model, "org/revisioned:quality");
+        assert_eq!(evidence.profile, "quality");
+        assert_eq!(
+            evidence.revision,
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(evidence.served_bundle, "default");
+        assert_eq!(evidence.engine, "pytorch");
+        assert_eq!(
+            evidence.adapter_path,
+            "sie_server.adapters.sentence_transformer:Adapter"
+        );
+        assert_eq!(evidence.pool, "default");
+        assert_eq!(evidence.config_sha256.len(), 64);
+        assert!(evidence
+            .config_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')));
+        assert_eq!(evidence.output_dimensions, 384);
+        assert_eq!(evidence.max_sequence_length, 32768);
+    }
+
+    #[test]
+    fn test_resolve_execution_evidence_fails_closed() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            "name: default\nadapters:\n  - sie_server.adapters.sentence_transformer\n",
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join("mutable.yaml"),
+            r#"
+sie_id: org/mutable
+hf_revision: main
+max_sequence_length: 512
+tasks:
+  encode:
+    dense:
+      dim: 384
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sentence_transformer:Adapter
+"#,
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join("unpinned-shape.yaml"),
+            r#"
+sie_id: org/no-dense-shape
+hf_revision: 0123456789abcdef0123456789abcdef01234567
+max_sequence_length: 512
+tasks:
+  score: {}
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sentence_transformer:Adapter
+"#,
+        )
+        .unwrap();
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        assert_eq!(
+            registry.resolve_execution_evidence("org/mutable", "default"),
+            Err(ModelExecutionEvidenceError::MutableRevision)
+        );
+        assert_eq!(
+            registry.resolve_execution_evidence("org/no-dense-shape", "default"),
+            Err(ModelExecutionEvidenceError::DenseOutputUnavailable)
+        );
+        assert_eq!(
+            registry.resolve_execution_evidence("org/mutable", "missing"),
+            Err(ModelExecutionEvidenceError::BundleUnavailable)
+        );
+
+        fs::write(
+            models_dir.join("unbounded.yaml"),
+            r#"
+sie_id: org/unbounded
+hf_revision: 0123456789abcdef0123456789abcdef01234567
+tasks:
+  encode:
+    dense:
+      dim: 384
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sentence_transformer:Adapter
+"#,
+        )
+        .unwrap();
+        registry.reload();
+        assert_eq!(
+            registry.resolve_execution_evidence("org/unbounded", "default"),
+            Err(ModelExecutionEvidenceError::TokenCeilingUnavailable)
+        );
+
+        fs::write(
+            models_dir.join("oversized-bound.yaml"),
+            r#"
+sie_id: org/oversized-bound
+hf_revision: 0123456789abcdef0123456789abcdef01234567
+max_sequence_length: 1000001
+tasks:
+  encode:
+    dense:
+      dim: 384
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sentence_transformer:Adapter
+"#,
+        )
+        .unwrap();
+        registry.reload();
+        assert_eq!(
+            registry.resolve_execution_evidence("org/oversized-bound", "default"),
+            Err(ModelExecutionEvidenceError::TokenCeilingUnavailable)
+        );
     }
 
     #[test]
@@ -4312,7 +4690,7 @@ profiles:
     }
 
     #[test]
-    fn test_compute_bundle_config_hash_includes_candle_profile_variant() {
+    fn test_compute_bundle_config_hash_collates_profile_specific_bundle_variants() {
         let (_dir, bundles_dir, models_dir) = create_test_dirs();
 
         fs::write(
@@ -4352,6 +4730,13 @@ profiles:
       runtime:
         pooling: cls
         normalize: true
+  candle-fast:
+    adapter_path: "sie_server_rust.adapters.candle:CandleEmbeddingAdapter"
+    max_batch_tokens: 1024
+    adapter_options:
+      runtime:
+        pooling: mean
+        normalize: false
 "#,
         )
         .unwrap();
@@ -4361,8 +4746,11 @@ profiles:
         let candle_pool_hash = registry.compute_bundle_config_hash_for_pool("candle", "default");
 
         assert!(registry.model_exists("BAAI/bge-m3:candle"));
-        assert!(!candle_hash.is_empty());
-        assert_eq!(candle_hash.len(), 64);
+        assert!(registry.model_exists("BAAI/bge-m3:candle-fast"));
+        assert_eq!(
+            candle_hash,
+            "8ba96ca592759bd243500067acf12ec261b442ac0059aea51dffdaf271f45f8a"
+        );
         assert_eq!(candle_pool_hash, candle_hash);
         assert_ne!(candle_hash, registry.compute_bundle_config_hash("default"));
     }
@@ -4454,6 +4842,7 @@ adapters:
                         m.insert(
                             "default".to_string(),
                             crate::types::model::ProfileConfig {
+                                max_output_tokens: None,
                                 adapter_path: Some(
                                     "sie_server.adapters.sentence_transformer:A".to_string(),
                                 ),

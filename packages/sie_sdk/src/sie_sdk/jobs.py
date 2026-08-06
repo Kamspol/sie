@@ -14,8 +14,9 @@ unit-testable without a gateway:
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
 
 import msgpack
@@ -42,6 +43,18 @@ _INTERNAL_SCHEMES = frozenset({"upload"})
 _FIELD_MAP_KEYS = frozenset({"id_field", "input_field", "carry", "input_type"})
 _INPUT_TYPES = frozenset({"text", "document"})
 
+# One canonical path segment across the SDK, gateway, dispatcher, and control
+# plane. This is deliberately ASCII-only: connection names cross credential
+# resolution and HTTP routing boundaries and must not have decoded aliases.
+_CONNECTION_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII)
+_POSTGRES_SCHEMA_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_$]{0,62}\Z", re.ASCII)
+
+# Public connector actions share the gateway's bounded printable-ASCII header
+# contract.  Callers own this value so a logical retry can reuse the same key;
+# generating it inside ``submit``/``execute`` would turn a retry into a new
+# mutation.
+_CONNECTOR_IDEMPOTENCY_KEY_MAX_BYTES = 256
+
 # msgpack + the numpy codec are hard deps of the SDK, so always importable here.
 _RESULT_OBJECT_HOOK = msgpack_numpy.decode
 
@@ -61,6 +74,54 @@ def _is_connector_uri(value: Any) -> bool:
     return isinstance(value, str) and "://" in value
 
 
+def require_connection_name(name: str) -> str:
+    """Return a canonical named-connection path segment or fail before I/O."""
+    if _CONNECTION_NAME_PATTERN.fullmatch(name) is None:
+        msg = "connection name must be 1-128 ASCII letters, digits, '.', '_', or '-', and start with a letter or digit"
+        raise ValueError(msg)
+    return name
+
+
+def require_connection_schema_policy(
+    connection_type: str,
+    source_schema: str | None,
+    sink_schema: str | None,
+) -> tuple[str, str] | None:
+    """Validate the optional Postgres source/sink namespace pair before I/O."""
+    if (source_schema is None) != (sink_schema is None):
+        msg = "source_schema and sink_schema must be supplied together"
+        raise ValueError(msg)
+    if source_schema is None or sink_schema is None:
+        return None
+    if connection_type != "postgres":
+        msg = "source_schema and sink_schema apply only to postgres connections"
+        raise ValueError(msg)
+    if (
+        _POSTGRES_SCHEMA_PATTERN.fullmatch(source_schema) is None
+        or _POSTGRES_SCHEMA_PATTERN.fullmatch(sink_schema) is None
+    ):
+        msg = "source_schema and sink_schema must be canonical Postgres identifiers of at most 63 ASCII bytes"
+        raise ValueError(msg)
+    return source_schema, sink_schema
+
+
+def require_connector_idempotency_key(key: str | None) -> str:
+    """Return a valid retry-stable connector action idempotency key.
+
+    The gateway requires exactly one ``Idempotency-Key`` header containing
+    1-256 printable ASCII bytes.  Keeping the same validation in the SDK fails
+    before I/O without weakening the gateway's authoritative check.
+    """
+    if (
+        not isinstance(key, str)
+        or not 1 <= len(key) <= _CONNECTOR_IDEMPOTENCY_KEY_MAX_BYTES
+        or not all(0x20 <= ord(char) <= 0x7E for char in key)
+    ):
+        msg = f"connector idempotency_key must contain 1-{_CONNECTOR_IDEMPOTENCY_KEY_MAX_BYTES} printable ASCII bytes"
+        raise ValueError(msg)
+    return key
+
+
 def connection_name(uri: str) -> str:
     """The connection an org registered, referenced by the URI authority.
 
@@ -68,12 +129,15 @@ def connection_name(uri: str) -> str:
     → ``customer-bucket``. Credentials never appear in the call — the job only
     names the connection; the runner resolves it org-scoped.
     """
-    parts = urlsplit(uri)
-    name = parts.netloc or parts.path.lstrip("/").split("/", 1)[0]
+    # Read the raw authority rather than a URL parser's normalized netloc:
+    # control characters must fail, not disappear into an alias before the
+    # canonical path-segment check.
+    after_scheme = uri.split("://", 1)[1] if "://" in uri else ""
+    name = re.split(r"[/?#]", after_scheme, maxsplit=1)[0]
     if not name:
         msg = f"connector URI {uri!r} names no connection (expected 'scheme://<connection>/…')"
         raise ValueError(msg)
-    return name
+    return require_connection_name(name)
 
 
 def _is_internal_uri(uri: str) -> bool:
@@ -95,8 +159,14 @@ def _resolve_source(source: Any, connection: str | None) -> dict[str, Any]:
         return {"items": [_norm_item(item, i) for i, item in enumerate(source)]}
     if _is_connector_uri(source):
         if _is_internal_uri(source):
-            return {"src": source, **({"connection": connection} if connection else {})}
-        return {"src": source, "connection": connection or connection_name(source)}
+            return {
+                "src": source,
+                **({"connection": require_connection_name(connection)} if connection else {}),
+            }
+        return {
+            "src": source,
+            "connection": require_connection_name(connection) if connection else connection_name(source),
+        }
     if isinstance(source, str) and source.strip():
         # A bare string is one inline text item (the "embed this text" case).
         return {"items": [{"text": source}]}
@@ -115,9 +185,9 @@ def _resolve_sink(sink: Any, *, source_connection: str | None, sink_connection: 
         if _is_internal_uri(sink):
             # Internal scheme: OUR Files store, no connection to name.
             if sink_connection is not None:
-                body["sink_connection"] = sink_connection
+                body["sink_connection"] = require_connection_name(sink_connection)
             return body
-        resolved = sink_connection if sink_connection is not None else connection_name(sink)
+        resolved = require_connection_name(sink_connection) if sink_connection is not None else connection_name(sink)
         # Thread the sink connection when explicitly overridden or distinct from
         # the source's (the common "index my own store" case reuses the source).
         if sink_connection is not None or resolved != source_connection:
@@ -170,21 +240,10 @@ def _resolve_field_map(field_map: Mapping[str, Any] | None, output_field: str | 
 
 
 def _resolve_when(when: Any) -> dict[str, Any]:
-    """Map the ``when`` trigger: now (default) | schedule(cron) | watch(source)."""
-    if when is None or not isinstance(when, str) or when.strip().lower() in {"", "now"}:
+    """Accept the only trigger implemented by the strict public jobs schema."""
+    if when is None or (isinstance(when, str) and when.strip().lower() in {"", "now"}):
         return {}
-    text = when.strip()
-    if text.lower().startswith("schedule:"):
-        return {"when": "schedule", "schedule": text.split(":", 1)[1].strip()}
-    if text.lower().startswith("watch:"):
-        return {"when": "watch", "watch": text.split(":", 1)[1].strip()}
-    if text.lower() == "schedule":
-        msg = "schedule trigger needs a cron expr: when='schedule:<cron>'"
-        raise ValueError(msg)
-    # A bare cron expression (5 whitespace-separated fields) is a schedule.
-    if len(text.split()) == 5:
-        return {"when": "schedule", "schedule": text}
-    msg = f"unrecognized when {when!r}: use 'now', 'schedule:<cron>', or 'watch:<source>'"
+    msg = f"scheduled and watched jobs are not available; omit when or use 'now', got {when!r}"
     raise ValueError(msg)
 
 
@@ -198,6 +257,7 @@ def build_job_body(
     sink_connection: str | None = None,
     field_map: Mapping[str, Any] | None = None,
     output_field: str | None = None,
+    execution: Literal["plan", "run"] | None = None,
     when: Any = None,
     output_types: Sequence[str] | None = None,
     options: Mapping[str, Any] | None = None,
@@ -209,13 +269,15 @@ def build_job_body(
     ``sink_connection`` override the names derived from the URIs; ``field_map``
     + ``output_field`` are the uniform mapping slots (connector jobs
     only — per-connector ``id_column``/``text_column``/``column`` params keep
-    working as aliases). ``options`` is the opaque per-item options map plus
-    the op inputs (operation matrix: score → ``options.query``,
+    working as aliases). ``options`` is one opaque job-level operation map,
+    applied uniformly to every item (operation matrix: score → ``options.query``,
     extract → ``options.labels`` / ``options.output_schema``, generate →
     sampling such as ``max_new_tokens``); it is forwarded as-is. Only the
     fields that are set ride the wire, so an inline submit is byte-for-byte
     the realtime POC body and the connector body is additive (``/v1``
-    additive-only rule).
+    additive-only rule). The public contract requires every connector-src
+    request to set ``execution``; inline requests must omit it, including for
+    callers outside this repository.
 
     Raises:
         ValueError: If the source/sink/when/field_map/options slots cannot be
@@ -224,7 +286,26 @@ def build_job_body(
     body: dict[str, Any] = {"operation": operation, "model": model}
     source_fields = _resolve_source(source, connection)
     body.update(source_fields)
-    body.update(_resolve_sink(sink, source_connection=source_fields.get("connection"), sink_connection=sink_connection))
+    sink_fields = _resolve_sink(
+        sink,
+        source_connection=source_fields.get("connection"),
+        sink_connection=sink_connection,
+    )
+    if "items" in source_fields and (connection is not None or sink_fields or sink_connection is not None):
+        msg = "connection/sink/sink_connection apply only to connector-src jobs; inline items return results"
+        raise ValueError(msg)
+    body.update(sink_fields)
+    if "src" in body:
+        if execution not in {"plan", "run"}:
+            msg = "connector jobs require execution='plan' or execution='run'"
+            raise ValueError(msg)
+        if execution != "run" and (_is_internal_uri(str(source)) or (isinstance(sink, str) and _is_internal_uri(sink))):
+            msg = "upload:// connector jobs are run-only; set execution='run'"
+            raise ValueError(msg)
+        body["execution"] = execution
+    elif execution is not None:
+        msg = "execution applies only to connector-src jobs; inline items must omit it"
+        raise ValueError(msg)
     mapping_fields = _resolve_field_map(field_map, output_field)
     if mapping_fields and "src" not in body:
         msg = "field_map/output_field apply to connector-src jobs; an inline items job maps nothing"
@@ -235,7 +316,7 @@ def build_job_body(
         body["output_types"] = list(output_types)
     if options is not None:
         if not isinstance(options, Mapping):
-            msg = f"options must be a mapping (per-item options + op inputs), got {type(options).__name__}"
+            msg = f"options must be a mapping (one job-level operation map), got {type(options).__name__}"
             raise ValueError(msg)
         if options:
             body["options"] = dict(options)

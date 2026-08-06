@@ -204,13 +204,11 @@ impl Default for GenerateInput {
 /// One image attached to a chat message, extracted from an OpenAI
 /// ``image_url`` data URI at the gateway.
 ///
-/// ``data`` is the **base64 payload string**, NOT raw bytes. This is
-/// deliberate: the generate work item travels through the sidecar's
-/// ``WorkItem.generate: serde_json::Value``, and ``serde_json::Value``
-/// cannot hold a msgpack ``bin`` (rmp_serde rejects it with "invalid type:
-/// byte array"). A base64 string round-trips cleanly through
-/// ``serde_json::Value`` with no sidecar changes. The worker base64-decodes
-/// it back to bytes (see ``_parse_message_images_field``).
+/// ``data`` remains a base64 payload string at gateway ingress so the public
+/// JSON shape and existing queue publishers stay compatible. The Rust
+/// sidecar validates and normalizes it to bounded msgpack binary before
+/// Python model execution; mixed-version Python workers accept both binary
+/// and the legacy base64 representation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatImage {
     /// Base64-encoded image bytes (standard alphabet, no ``data:`` prefix).
@@ -365,9 +363,10 @@ pub struct GenerateParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_tokens: Option<u32>,
     /// Per-request kwargs forwarded to the tokenizer's
-    /// ``apply_chat_template``. Worker merges them on top of the model
-    /// YAML defaults (YAML wins on conflict). Validated as a JSON
-    /// object by the gateway. Absent → only YAML defaults apply.
+    /// ``apply_chat_template``. Worker merges them under the model YAML
+    /// defaults (YAML wins on conflict). The gateway accepts only the
+    /// bounded public schema and the worker revalidates it after dequeue.
+    /// Absent → only YAML defaults apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Structured-output spec. Absent when the request omitted the

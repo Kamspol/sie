@@ -48,8 +48,8 @@ tasks:
       # to ``grammar`` above (behind an xgrammar profile + via-SIE EBNF smoke)
       # to enable grammar-constrained SQL. Informational (not request-gated).
       sql: true
-    # Forwarded verbatim to ``tokenizer.apply_chat_template(**kwargs)`` when
-    # the worker renders an OpenAI-shaped ``messages`` request.
+    # Forwarded through the bounded template-kwargs contract to
+    # ``tokenizer.apply_chat_template(**kwargs)`` for OpenAI-shaped messages.
     # Qwen3's chat template emits a ``<think>``/``</think>`` reasoning block
     # unless this flag suppresses it.
     chat_template_kwargs:

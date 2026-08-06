@@ -13,8 +13,8 @@ inputs:
   video: false
 tasks:
   generate:
-    # Native context is 262,144 tokens. Keep the initial served contract at 8K
-    # until the H100 FP8 smoke calibrates KV capacity and long-context quality.
+    # Native context is 262,144 tokens. Keep the bare served contract at 8K
+    # and expose the native-window candidates through explicit profiles below.
     context_length: 8192
     max_output_tokens: 4096
     capabilities:
@@ -62,3 +62,110 @@ profiles:
   # Caller-visible FP8 alias; select the H100-80GB machine profile separately.
   h100-fp8:
     extends: default
+  # Gemma 4 supports an explicit tokenizer thinking switch. Use the measured
+  # H100 96K shape so the generic reasoning alias has the same decode budget as
+  # its hardware-explicit twin; the bare route remains answer-only.
+  thinking:
+    extends: h100-96k
+    max_output_tokens: 32768
+    chat_template_kwargs:
+      enable_thinking: true
+  # Explicit native-window candidate for one H200 admission. Keep the profile
+  # standalone so the thinking and hardware-explicit aliases can inherit the
+  # exact CUDA 13 launch shape without profile chaining. Online FP8 limits
+  # weight memory, and FP8 E4M3 limits KV memory; the release gate separately
+  # validates near-boundary decode and quality instead of weakening the
+  # conservative bare-model contract.
+  long-context:
+    max_batch_tokens: 262144
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.gemma:SGLangGemmaAdapter
+    kv_budget_tokens: 262144
+    adapter_options:
+      loadtime:
+        max_seq_length: 262144
+        # Leave transient FP8 GEMM workspace outside SGLang's static pool.
+        mem_fraction_static: 0.90
+        served_model_name: google/gemma-4-31B-it
+        disable_cuda_graph: true
+        attention_backend: triton
+        grammar_backend: xgrammar
+        reasoning_parser: gemma4
+        tool_call_parser: gemma4
+        speculative:
+          enabled: false
+        extra_launch_args:
+          - "--quantization"
+          - "fp8"
+          - "--kv-cache-dtype"
+          - "fp8_e4m3"
+      runtime:
+        first_chunk_timeout_s: 900
+        inter_chunk_timeout_s: 30
+        overall_timeout_s: 1800
+        default_sampling:
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 64
+          min_new_tokens: 1
+        stop_tokens:
+          - "<end_of_turn>"
+  # Same measured 256K launch/admission envelope with Gemma thinking enabled.
+  long-context-thinking:
+    extends: long-context
+    # The 4K control truncated otherwise-correct reasoning on 2/10 MMLU-Pro
+    # rows. A 32K cap leaves ample room for the final answer without changing
+    # the profile's sampling defaults or forcing callers to request it.
+    max_output_tokens: 32768
+    chat_template_kwargs:
+      enable_thinking: true
+  # H200 has enough memory for the native window. These aliases expose the
+  # tested hardware/context pairing while machine placement remains separate.
+  h200-256k:
+    extends: long-context
+  h200-256k-thinking:
+    extends: long-context
+    max_output_tokens: 32768
+    chat_template_kwargs:
+      enable_thinking: true
+  # On H100-80GB this launch shape measured a 107,538-token KV capacity. Cap
+  # the public profile at 96K to leave room for the chat template and decode;
+  # never use SGLang auto-truncation to simulate a larger accepted context.
+  h100-96k:
+    max_batch_tokens: 98304
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.gemma:SGLangGemmaAdapter
+    kv_budget_tokens: 98304
+    adapter_options:
+      loadtime:
+        max_seq_length: 98304
+        mem_fraction_static: 0.90
+        served_model_name: google/gemma-4-31B-it
+        disable_cuda_graph: true
+        attention_backend: triton
+        grammar_backend: xgrammar
+        reasoning_parser: gemma4
+        tool_call_parser: gemma4
+        speculative:
+          enabled: false
+        extra_launch_args:
+          - "--quantization"
+          - "fp8"
+          - "--kv-cache-dtype"
+          - "fp8_e4m3"
+      runtime:
+        first_chunk_timeout_s: 900
+        inter_chunk_timeout_s: 30
+        overall_timeout_s: 1800
+        default_sampling:
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 64
+          min_new_tokens: 1
+        stop_tokens:
+          - "<end_of_turn>"
+  h100-96k-thinking:
+    extends: h100-96k
+    max_output_tokens: 32768
+    chat_template_kwargs:
+      enable_thinking: true

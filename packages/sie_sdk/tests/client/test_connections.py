@@ -49,6 +49,37 @@ def test_add_posts_to_control_plane_with_secret() -> None:
         client.close()
 
 
+@pytest.mark.parametrize(
+    ("connection_type", "source_schema", "sink_schema"),
+    [
+        ("postgres", "source", None),
+        ("postgres", None, "sink"),
+        ("s3", "source", "sink"),
+        ("postgres", "source.bad", "sink"),
+        ("postgres", "source", "sink-bad"),
+        ("postgres", "source", "sink\n"),
+        ("postgres", "source", "s" * 64),
+    ],
+)
+def test_invalid_schema_policy_fails_before_sync_io(
+    connection_type: str,
+    source_schema: str | None,
+    sink_schema: str | None,
+) -> None:
+    with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+        client = SIEClient(GW, api_key=KEY, control_plane_url=CP, org="acme")
+        with pytest.raises(ValueError, match="schema"):
+            client.connections.add(
+                name="wh",
+                type=connection_type,
+                secret="dsn",  # noqa: S106
+                source_schema=source_schema,
+                sink_schema=sink_schema,
+            )
+        mock_client.return_value.request.assert_not_called()
+        client.close()
+
+
 def test_list_returns_connections_array() -> None:
     payload = {"org": "acme", "account_id": 7, "connections": [{"id": 1, "type": "postgres", "name": "wh"}]}
     with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
@@ -69,6 +100,30 @@ def test_revoke_deletes_named_connection() -> None:
         out = client.connections.revoke("wh")
         assert out["state"] == "revoked"
         assert mock_client.return_value.request.call_args.args == ("DELETE", f"{CP}/internal/orgs/acme/connections/wh")
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_name",
+    [
+        "../other",
+        "warehouse/name",
+        "warehouse%2fname",
+        "warehouse\n",
+        "warehouse\r",
+        "warehouse\u2028",
+        "café",
+        "a" * 129,
+    ],
+)
+def test_invalid_connection_name_fails_before_sync_io(invalid_name: str) -> None:
+    with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+        client = SIEClient(GW, api_key=KEY, control_plane_url=CP, org="acme")
+        with pytest.raises(ValueError, match="connection name"):
+            client.connections.add(name=invalid_name, type="postgres", secret="dsn")  # noqa: S106
+        with pytest.raises(ValueError, match="connection name"):
+            client.connections.revoke(invalid_name)
+        mock_client.return_value.request.assert_not_called()
         client.close()
 
 
@@ -101,4 +156,33 @@ async def test_async_add_and_revoke() -> None:
     revoked = await client.connections.revoke("wh")
     assert revoked["state"] == "revoked"
     assert client._delete.call_args.args[0] == f"{CP}/internal/orgs/acme/connections/wh"
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_schema_policy_fails_before_async_io() -> None:
+    client = SIEAsyncClient(GW, api_key=KEY, control_plane_url=CP, org="acme")
+    client._post = AsyncMock()
+    with pytest.raises(ValueError, match="supplied together"):
+        await client.connections.add(
+            name="wh",
+            type="postgres",
+            secret="dsn",  # noqa: S106
+            source_schema="source_data",
+        )
+    client._post.assert_not_awaited()
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_connection_name_fails_before_async_io() -> None:
+    client = SIEAsyncClient(GW, api_key=KEY, control_plane_url=CP, org="acme")
+    client._post = AsyncMock()
+    client._delete = AsyncMock()
+    with pytest.raises(ValueError, match="connection name"):
+        await client.connections.add(name="../other", type="postgres", secret="dsn")  # noqa: S106
+    with pytest.raises(ValueError, match="connection name"):
+        await client.connections.revoke("../other")
+    client._post.assert_not_awaited()
+    client._delete.assert_not_awaited()
     await client.close()

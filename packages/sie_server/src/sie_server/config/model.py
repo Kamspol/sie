@@ -7,7 +7,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from sie_server.config.engine import ComputePrecision
 from sie_server.config.package_artifacts import (
@@ -23,6 +23,48 @@ PoolingStrategy = Literal["cls", "mean", "last_token", "splade", "none"]
 
 _MODALITY_NAMES = ("text", "image", "audio", "video", "document")
 _MAX_POOL_NAME_LEN = 128
+_CHAT_TEMPLATE_KWARGS = frozenset({"enable_thinking", "guardian_config"})
+_GUARDIAN_CONFIG_KWARGS = frozenset({"risk_name"})
+_MAX_GUARDIAN_RISK_NAME_LEN = 128
+
+
+def validate_chat_template_kwargs(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Validate the bounded operator-owned tokenizer template contract.
+
+    These values cross from model YAML into ``apply_chat_template(**kwargs)``.
+    Keeping the accepted keys and nested shapes explicit prevents a catalog
+    edit from silently enabling a tokenizer-specific extension with arbitrary
+    behavior or unbounded data.
+    """
+    if value is None:
+        return None
+
+    unsupported = set(value) - _CHAT_TEMPLATE_KWARGS
+    if unsupported:
+        names = ", ".join(sorted(unsupported))
+        raise ValueError(f"unsupported chat_template_kwargs key(s): {names}")
+
+    enable_thinking = value.get("enable_thinking")
+    if "enable_thinking" in value and not isinstance(enable_thinking, bool):
+        raise ValueError("chat_template_kwargs.enable_thinking must be a boolean")
+
+    guardian_config = value.get("guardian_config")
+    if "guardian_config" in value:
+        if not isinstance(guardian_config, dict):
+            raise ValueError("chat_template_kwargs.guardian_config must be an object")
+        unsupported_guardian = set(guardian_config) - _GUARDIAN_CONFIG_KWARGS
+        if unsupported_guardian:
+            names = ", ".join(sorted(unsupported_guardian))
+            raise ValueError(f"unsupported chat_template_kwargs.guardian_config key(s): {names}")
+        risk_name = guardian_config.get("risk_name")
+        if not isinstance(risk_name, str) or not risk_name or len(risk_name) > _MAX_GUARDIAN_RISK_NAME_LEN:
+            raise ValueError(
+                "chat_template_kwargs.guardian_config.risk_name must be a non-empty string "
+                f"of at most {_MAX_GUARDIAN_RISK_NAME_LEN} characters"
+            )
+
+    return value
+
 
 # Served-model version identity. An *immutable* HF revision is a full 40-char git
 # commit SHA (SHA-1, lowercase hex). Branch/tag names ("main", "v1.0") resolve to
@@ -173,12 +215,12 @@ class GenerateTask(BaseModel):
     model can process. ``max_output_tokens`` is the per-request hard cap on
     ``max_new_tokens`` enforced by the gateway.
 
-    ``chat_template_kwargs`` are forwarded verbatim to the tokenizer's
-    ``apply_chat_template(**kwargs)`` call when the worker renders an
-    OpenAI-shaped ``messages`` request. The Qwen3 family for
-    example accepts ``enable_thinking: false`` to suppress its reasoning
-    block. Empty dict by default — non-chat / prompt-shape requests
-    ignore the field.
+    ``chat_template_kwargs`` are a bounded operator-owned mapping forwarded
+    to the tokenizer's ``apply_chat_template(**kwargs)`` call when the worker
+    renders an OpenAI-shaped ``messages`` request. The accepted schema covers
+    ``enable_thinking`` and Granite Guardian's bounded ``guardian_config``;
+    unknown keys and invalid nested shapes fail at config load. Empty dict by
+    default — non-chat / prompt-shape requests ignore the field.
 
     ``prewarm_grammars`` is an optional list of grammars to compile at
     model-load time so the cold-start TTFT for these schemas excludes
@@ -217,6 +259,11 @@ class GenerateTask(BaseModel):
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     prewarm_grammars: list[PrewarmGrammar] = Field(default_factory=list)
     grammar_profile: str | None = None
+
+    @field_validator("chat_template_kwargs")
+    @classmethod
+    def validate_chat_template_kwargs(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return validate_chat_template_kwargs(value) or {}
 
 
 class Tasks(BaseModel):
@@ -321,6 +368,18 @@ class ProfileConfig(BaseModel):
     var (default-off until the calibration ablation flips it); explicit
     ``True`` / ``False`` wins unless the env var is set to ``on`` or
     ``off`` (which override the profile in both directions).
+
+    ``max_output_tokens`` optionally overrides the model-level generation cap
+    for the materialized ``model:profile`` variant. This lets a long-context
+    reasoning profile expose the checkpoint's supported decode budget without
+    weakening the conservative cap on the bare model or shorter profiles.
+
+    ``chat_template_kwargs`` optionally overrides the same bounded model-level
+    :class:`GenerateTask` defaults for the materialized ``model:profile``
+    variant. This keeps tokenizer render presets such as explicit thinking
+    mode on the profile identity while preserving the bare model's safer
+    non-thinking default. The profile mapping is merged over the task mapping;
+    request-time kwargs are still applied later by the generation processor.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -333,6 +392,13 @@ class ProfileConfig(BaseModel):
     adaptive_batching: ProfileAdaptiveBatching | None = None
     kv_budget_tokens: int | None = None
     admission_enabled: bool | None = None
+    max_output_tokens: int | None = Field(default=None, gt=0)
+    chat_template_kwargs: dict[str, Any] | None = None
+
+    @field_validator("chat_template_kwargs")
+    @classmethod
+    def validate_chat_template_kwargs(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        return validate_chat_template_kwargs(value)
 
 
 class ResolvedProfile(BaseModel):
@@ -346,6 +412,8 @@ class ResolvedProfile(BaseModel):
     adaptive_batching: ProfileAdaptiveBatching | None = None
     kv_budget_tokens: int | None = None
     admission_enabled: bool | None = None
+    max_output_tokens: int | None = None
+    chat_template_kwargs: MappingProxyType[str, Any] | None = None
 
 
 # Coarse per-family KV-bytes-per-token constants used by the derived-budget
@@ -637,6 +705,12 @@ class ModelConfig(BaseModel):
                 raise ValueError(msg)
 
         for name, profile in self.profiles.items():
+            if profile.chat_template_kwargs is not None and self.tasks.generate is None:
+                msg = f"Profile '{name}' sets 'chat_template_kwargs' on a model without a generation task"
+                raise ValueError(msg)
+            if profile.max_output_tokens is not None and self.tasks.generate is None:
+                msg = f"Profile '{name}' sets 'max_output_tokens' on a model without a generation task"
+                raise ValueError(msg)
             if profile.extends is not None:
                 if profile.extends not in self.profiles:
                     msg = f"Profile '{name}' extends unknown profile '{profile.extends}'"
@@ -697,6 +771,30 @@ class ModelConfig(BaseModel):
                     profile=profile,
                     parent=self.profiles[profile.extends] if profile.extends is not None else None,
                 )
+
+                parent = self.profiles[profile.extends] if profile.extends is not None else None
+                effective_output_cap = (
+                    profile.max_output_tokens
+                    if profile.max_output_tokens is not None
+                    else parent.max_output_tokens
+                    if parent is not None
+                    else None
+                )
+                if effective_output_cap is not None:
+                    effective_loadtime = profile.adapter_options.loadtime or (
+                        parent.adapter_options.loadtime if parent is not None else {}
+                    )
+                    effective_context = effective_loadtime.get(
+                        "max_seq_length",
+                        self.tasks.generate.context_length,
+                    )
+                    if effective_output_cap > effective_context:
+                        msg = (
+                            f"Profile '{name}' on generation model '{self.sie_id}' sets "
+                            f"max_output_tokens={effective_output_cap}, exceeding its "
+                            f"context_length={effective_context}"
+                        )
+                        raise ValueError(msg)
         return self
 
     @model_validator(mode="after")
@@ -759,6 +857,12 @@ class ModelConfig(BaseModel):
                 adaptive_batching=profile.adaptive_batching,
                 kv_budget_tokens=profile.kv_budget_tokens,
                 admission_enabled=profile.admission_enabled,
+                max_output_tokens=profile.max_output_tokens,
+                chat_template_kwargs=(
+                    MappingProxyType(dict(profile.chat_template_kwargs))
+                    if profile.chat_template_kwargs is not None
+                    else None
+                ),
             )
 
         # Resolve via parent — validators guarantee parent exists and has no chaining
@@ -794,6 +898,12 @@ class ModelConfig(BaseModel):
         admission_enabled = (
             profile.admission_enabled if profile.admission_enabled is not None else parent.admission_enabled
         )
+        max_output_tokens = (
+            profile.max_output_tokens if profile.max_output_tokens is not None else parent.max_output_tokens
+        )
+        chat_template_kwargs = (
+            profile.chat_template_kwargs if profile.chat_template_kwargs is not None else parent.chat_template_kwargs
+        )
 
         if max_batch_tokens is None:
             msg = f"Resolved profile '{name}': max_batch_tokens must be set"
@@ -811,6 +921,10 @@ class ModelConfig(BaseModel):
             adaptive_batching=adaptive_batching,
             kv_budget_tokens=kv_budget_tokens,
             admission_enabled=admission_enabled,
+            max_output_tokens=max_output_tokens,
+            chat_template_kwargs=(
+                MappingProxyType(dict(chat_template_kwargs)) if chat_template_kwargs is not None else None
+            ),
         )
 
     @property
