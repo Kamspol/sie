@@ -52,7 +52,7 @@ def test_evaluation_reports_exact_top_level_and_macro_hierarchical_f1() -> None:
         candidate_union=["A > Two", "A > One"],
         text_scores=[0.1, 0.2, 0.3, 0.4],
         image_plus_copy_scores=[0.4, 0.3, 0.2, 0.1],
-        verifier_response_id="chat-1",
+        verifier_response_id="generate-1",
     )
 
     assert evaluation_metrics([source], [decision]) == {
@@ -88,7 +88,7 @@ def test_classify_listing_runs_two_rankings_then_verifies_the_union() -> None:
     class FakeClient:
         def __init__(self) -> None:
             self.score_calls: list[dict[str, Any]] = []
-            self.chat_calls: list[dict[str, Any]] = []
+            self.generate_calls: list[dict[str, Any]] = []
 
         def score(
             self,
@@ -117,24 +117,18 @@ def test_classify_listing_runs_two_rankings_then_verifies_the_union() -> None:
                 ]
             }
 
-        def chat_completions(
+        def generate(
             self,
             model: str,
-            messages: list[dict[str, Any]],
+            prompt: str,
             **kwargs: Any,
         ) -> dict[str, Any]:
-            self.chat_calls.append(
-                {"model": model, "messages": messages, "kwargs": kwargs}
+            self.generate_calls.append(
+                {"model": model, "prompt": prompt, "kwargs": kwargs}
             )
             return {
-                "id": "chat-54",
-                "choices": [
-                    {
-                        "message": {
-                            "content": ('{"selected_index": 0, "needs_review": false}')
-                        }
-                    }
-                ],
+                "text": '{"selected_index": 0, "needs_review": false}',
+                "request": {"id": "generate-54"},
             }
 
     client = FakeClient()
@@ -143,7 +137,17 @@ def test_classify_listing_runs_two_rankings_then_verifies_the_union() -> None:
     assert len(client.score_calls) == 2
     assert "images" not in client.score_calls[0]["query"]
     assert client.score_calls[1]["query"]["images"][0]["format"] == "jpeg"
-    assert len(client.chat_calls) == 1
+    assert len(client.generate_calls) == 1
+    generate_call = client.generate_calls[0]
+    assert generate_call["model"] == catalog_agent.VERIFIER_MODEL
+    assert "TITLE\nManual floor sweeper" in generate_call["prompt"]
+    assert generate_call["kwargs"]["images"][0]["data"] == source.image_bytes
+    assert generate_call["kwargs"]["images"][0]["format"] == source.image_format
+    assert (
+        generate_call["kwargs"]["grammar"]["json_schema"]["additionalProperties"]
+        is False
+    )
+    assert generate_call["kwargs"]["grammar"]["strict"] is True
     assert decision.candidate_union == [
         "Home & Garden > Household Supplies > Power Sweepers",
         "Hardware > Tools > Brooms",
@@ -153,7 +157,7 @@ def test_classify_listing_runs_two_rankings_then_verifies_the_union() -> None:
         "Home & Garden > Household Supplies > Power Sweepers"
     )
     assert decision.needs_review is False
-    assert decision.verifier_response_id == "chat-54"
+    assert decision.verifier_response_id == "generate-54"
 
 
 def test_verify_candidates_rejects_an_empty_union() -> None:
@@ -161,6 +165,32 @@ def test_verify_candidates_rejects_an_empty_union() -> None:
 
     with pytest.raises(ValueError, match="No candidate paths supplied for row 7"):
         verify_candidates(object(), source, [])  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("response", "match"),
+    [
+        ({"text": None}, "SIE verifier returned non-text content"),
+        (
+            {"text": '{"selected_index": 2, "needs_review": false}'},
+            "Invalid selected_index: 2",
+        ),
+    ],
+)
+def test_verify_candidates_rejects_invalid_native_output(
+    response: dict[str, Any],
+    match: str,
+) -> None:
+    class FakeClient:
+        def generate(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return response
+
+    with pytest.raises(ValueError, match=match):
+        verify_candidates(
+            FakeClient(),  # type: ignore[arg-type]
+            listing(reference="A > One"),
+            ["A > One", "A > Two"],
+        )
 
 
 def test_image_cache_key_includes_the_dataset_revision(
@@ -214,7 +244,7 @@ def test_eval_resumes_completed_rows_from_its_checkpoint(
         candidate_union=["A > One"],
         text_scores=[1.0],
         image_plus_copy_scores=[1.0],
-        verifier_response_id="chat-7",
+        verifier_response_id="generate-7",
     )
     output_path = tmp_path / "evaluation.json"
     checkpoint = catalog_agent._evaluation_output(
@@ -232,7 +262,7 @@ def test_eval_resumes_completed_rows_from_its_checkpoint(
             candidate_union=["A > Two"],
             text_scores=[1.0],
             image_plus_copy_scores=[1.0],
-            verifier_response_id="chat-8",
+            verifier_response_id="generate-8",
         )
 
     @contextmanager
@@ -286,7 +316,7 @@ def test_predict_honors_the_requested_limit(monkeypatch: pytest.MonkeyPatch) -> 
         candidate_union=["A > One"],
         text_scores=[1.0],
         image_plus_copy_scores=[1.0],
-        verifier_response_id="chat-7",
+        verifier_response_id="generate-7",
     )
     monkeypatch.setattr(catalog_agent, "load_shopify_rows", fake_load)
     monkeypatch.setattr(catalog_agent, "create_sie_client", fake_client)
