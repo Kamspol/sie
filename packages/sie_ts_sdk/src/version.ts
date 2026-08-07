@@ -1,1 +1,1 @@
-export const SDK_VERSION = "0.6.28"; // x-release-please-version
+export const SDK_VERSION = "0.6.29"; // x-release-please-version

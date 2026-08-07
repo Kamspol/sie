@@ -116,9 +116,9 @@ def test_long_context_thinking_profile_preserves_256k_contract(
     assert non_thinking.tasks.generate.max_output_tokens == expected_non_thinking_cap
     assert thinking.tasks.generate.max_output_tokens == expected_thinking_cap
     assert non_thinking.max_sequence_length == thinking.max_sequence_length == 262144
-    if model_id in {"Qwen/Qwen3.6-27B", "google/gemma-4-31B-it"}:
-        # The first optimized release is intentionally non-thinking only. Keep
-        # the existing conservative thinking launch until its separate gate.
+    if model_id == "Qwen/Qwen3.6-27B":
+        # Keep the conservative Qwen thinking launch until its speculative path
+        # passes the separate correctness gate.
         assert non_thinking.resolve_profile("default").loadtime["speculative"]["enabled"] is True
         assert thinking.resolve_profile("default").loadtime["speculative"] == {"enabled": False}
         assert thinking.resolve_profile("default").loadtime["disable_cuda_graph"] is True
@@ -184,7 +184,15 @@ def test_gemma_31b_profiles_use_measured_mtp_shape_with_grammar_fallback() -> No
         "draft_model": "google/gemma-4-31B-it-assistant",
         "draft_model_revision": "627c5ec1458b9086b841a91e0512fd31fd2fbbf1",
     }
-    for profile_name in ("default", "h100-96k", "long-context"):
+    for profile_name in (
+        "default",
+        "h100-96k",
+        "h100-96k-thinking",
+        "thinking",
+        "long-context",
+        "long-context-thinking",
+        "h200-256k-thinking",
+    ):
         loadtime = config.resolve_profile(profile_name).loadtime
         assert loadtime["speculative"] == expected
         assert loadtime["speculative_needs_extra_buffer"] is False

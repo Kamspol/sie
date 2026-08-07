@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.29
+
+- chore(release): refresh locks and generated sources
+- chore(main): release 0.6.29
+- feat(server): optimize Gemma thinking profiles
+
 ## v0.6.28
 
 - chore(release): refresh locks and generated sources
