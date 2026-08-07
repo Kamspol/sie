@@ -1416,7 +1416,7 @@ class DetectionPreprocessor:
         }
 
 
-# Canonical task -> prompt mapping from the PaddleOCR-VL-1.5 model card
+# Canonical task -> prompt mapping from the PaddleOCR-VL model card
 # (PROMPTS dict in the README; trailing colons included). Keep in sync with
 # PaddleOCRVLAdapter._VALID_TASKS.
 _PADDLEOCR_VL_TASK_PROMPTS: dict[str, str] = {

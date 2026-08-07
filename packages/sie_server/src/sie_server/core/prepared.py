@@ -301,7 +301,7 @@ LightOnOCRPreparedItem = PreparedItem[LightOnOCRPayload]
 class PaddleOCRVLPayload(Payload):
     """Preprocessed PaddleOCR-VL input ready for extraction.
 
-    PaddleOCR-VL-1.5 combines a NaViT-style SigLIP vision encoder with an
+    PaddleOCR-VL combines a NaViT-style SigLIP vision encoder with an
     ERNIE-4.5-0.3B decoder. The processor tokenizes a chat-template prompt
     and emits a Qwen-VL-style ``image_grid_thw`` alongside ``pixel_values``.
     """
