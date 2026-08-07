@@ -245,32 +245,47 @@ class ModelLoader:
         """
         from sie_sdk.cache import ensure_model_cached, get_cache_config
 
-        # Only applies to HF models (not local weights_path)
         model_id = config.hf_id
-        if model_id is None:
-            return  # Local weights, no caching needed
-
-        # Check disk pressure and evict LRU models if needed before download
-        if self._disk_cache is not None:
-            evicted = self._disk_cache.ensure_space_before_download(model_id)
-            if evicted:
-                logger.info(
-                    "Pre-download disk eviction: freed %d model(s): %s",
-                    len(evicted),
-                    evicted,
-                )
-
         cache_config = get_cache_config()
 
-        # Ensure model is cached (downloads if needed)
-        # This now handles the full 3-tier hierarchy internally
-        cached_path = ensure_model_cached(model_id, cache_config)
+        # Base-model caching applies only to HF models, while an external
+        # speculative assistant still needs staging for local weights_path.
+        if model_id is not None:
+            if self._disk_cache is not None:
+                evicted = self._disk_cache.ensure_space_before_download(model_id)
+                if evicted:
+                    logger.info(
+                        "Pre-download disk eviction: freed %d model(s): %s",
+                        len(evicted),
+                        evicted,
+                    )
 
-        # Update access time for LRU tracking
-        if self._disk_cache is not None:
-            self._disk_cache.touch(model_id)
+            cached_path = ensure_model_cached(model_id, cache_config, revision=config.hf_revision)
+            if self._disk_cache is not None:
+                self._disk_cache.touch(model_id)
+            logger.debug("Model %s available at %s", model_id, cached_path)
 
-        logger.debug("Model %s available at %s", model_id, cached_path)
+        # External speculative assistants are separate checkpoints. Stage each
+        # enabled draft before starting SGLang so a worker never depends on an
+        # engine-owned, moving-branch download during launch.
+        for draft_model, revision in config.speculative_draft_revisions().items():
+            if self._disk_cache is not None:
+                evicted = self._disk_cache.ensure_space_before_download(draft_model)
+                if evicted:
+                    logger.info(
+                        "Pre-download disk eviction for speculative draft: freed %d model(s): %s",
+                        len(evicted),
+                        evicted,
+                    )
+            draft_path = ensure_model_cached(draft_model, cache_config, revision=revision)
+            if self._disk_cache is not None:
+                self._disk_cache.touch(draft_model)
+            logger.debug(
+                "Speculative draft %s@%s available at %s",
+                draft_model,
+                revision or "default",
+                draft_path,
+            )
 
     async def ensure_weights_cached_async(self, name: str, config: ModelConfig) -> None:
         """Async version of :meth:`ensure_weights_cached`.

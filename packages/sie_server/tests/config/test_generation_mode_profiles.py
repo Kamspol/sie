@@ -40,9 +40,14 @@ _LONG_CONTEXT_THINKING_MODELS = (
 _LONG_CONTEXT_THINKING_IDS = {model_id for _, model_id in _LONG_CONTEXT_THINKING_MODELS}
 
 _HARDWARE_THINKING_PROFILES = {
-    "Qwen/Qwen3.6-27B": ("h100-256k-thinking",),
+    "Qwen/Qwen3.6-27B": ("h100-256k-thinking", "long-context-thinking-no-spec"),
     "Qwen/Qwen3.6-35B-A3B": ("h100-256k-thinking",),
-    "google/gemma-4-31B-it": ("h100-96k-thinking", "h200-256k-thinking"),
+    "google/gemma-4-31B-it": (
+        "h100-96k-thinking",
+        "h200-256k-thinking",
+        "long-context-thinking-no-spec",
+        "h100-96k-thinking-no-spec",
+    ),
 }
 
 
@@ -94,7 +99,7 @@ def test_long_context_profile_promotes_request_and_adapter_limits(
 
 
 @pytest.mark.parametrize(("model_file", "model_id"), _LONG_CONTEXT_THINKING_MODELS)
-def test_long_context_thinking_profile_reuses_256k_launch_shape(
+def test_long_context_thinking_profile_preserves_256k_contract(
     model_file: str,
     model_id: str,
 ) -> None:
@@ -111,7 +116,14 @@ def test_long_context_thinking_profile_reuses_256k_launch_shape(
     assert non_thinking.tasks.generate.max_output_tokens == expected_non_thinking_cap
     assert thinking.tasks.generate.max_output_tokens == expected_thinking_cap
     assert non_thinking.max_sequence_length == thinking.max_sequence_length == 262144
-    assert non_thinking.resolve_profile("default").loadtime == thinking.resolve_profile("default").loadtime
+    if model_id in {"Qwen/Qwen3.6-27B", "google/gemma-4-31B-it"}:
+        # The first optimized release is intentionally non-thinking only. Keep
+        # the existing conservative thinking launch until its separate gate.
+        assert non_thinking.resolve_profile("default").loadtime["speculative"]["enabled"] is True
+        assert thinking.resolve_profile("default").loadtime["speculative"] == {"enabled": False}
+        assert thinking.resolve_profile("default").loadtime["disable_cuda_graph"] is True
+    else:
+        assert non_thinking.resolve_profile("default").loadtime == thinking.resolve_profile("default").loadtime
     assert non_thinking.resolve_profile("default").kv_budget_tokens == 262144
     assert thinking.resolve_profile("default").kv_budget_tokens == 262144
     assert non_thinking.tasks.generate.chat_template_kwargs == {"enable_thinking": False}
@@ -155,6 +167,50 @@ def test_gemma_31b_large_context_profiles_use_measured_kv_precision() -> None:
             "--kv-cache-dtype",
             "fp8_e4m3",
         ]
+
+
+def test_gemma_31b_profiles_use_measured_mtp_shape_with_grammar_fallback() -> None:
+    config = load_model_config(MODELS_DIR / "google__gemma-4-31B-it.yaml")
+    assert config.tasks.generate is not None
+    assert config.tasks.generate.grammar_profile == "no-spec"
+    assert config.resolve_profile("no-spec").loadtime["speculative"] == {"enabled": False}
+
+    expected = {
+        "enabled": True,
+        "algorithm": "nextn",
+        "num_steps": 3,
+        "eagle_topk": 1,
+        "num_draft_tokens": 4,
+        "draft_model": "google/gemma-4-31B-it-assistant",
+        "draft_model_revision": "627c5ec1458b9086b841a91e0512fd31fd2fbbf1",
+    }
+    for profile_name in ("default", "h100-96k", "long-context"):
+        loadtime = config.resolve_profile(profile_name).loadtime
+        assert loadtime["speculative"] == expected
+        assert loadtime["speculative_needs_extra_buffer"] is False
+        assert "disable_cuda_graph" not in loadtime
+
+    for source_name, fallback_name, thinking in (
+        ("long-context", "long-context-no-spec", False),
+        ("h200-256k", "long-context-no-spec", False),
+        ("long-context-thinking", "long-context-thinking-no-spec", True),
+        ("h200-256k-thinking", "long-context-thinking-no-spec", True),
+        ("h100-96k", "h100-96k-no-spec", False),
+        ("h100-96k-thinking", "h100-96k-thinking-no-spec", True),
+        ("thinking", "h100-96k-thinking-no-spec", True),
+    ):
+        source = config.resolve_profile(source_name)
+        fallback = config.resolve_profile(fallback_name)
+        assert source.grammar_profile == fallback_name
+        assert fallback.grammar_profile is None
+        assert source.adapter_path == fallback.adapter_path
+        assert source.compute_precision == fallback.compute_precision
+        assert source.max_batch_tokens == fallback.max_batch_tokens
+        assert source.loadtime | {"speculative": None} == fallback.loadtime | {"speculative": None}
+        assert fallback.loadtime["speculative"] == {"enabled": False}
+        assert source.chat_template_kwargs == fallback.chat_template_kwargs
+        effective_mode = source.chat_template_kwargs or config.tasks.generate.chat_template_kwargs
+        assert effective_mode == {"enable_thinking": thinking}
 
 
 @pytest.mark.parametrize(

@@ -93,7 +93,11 @@ def get_cache_config() -> CacheConfig:
     )
 
 
-def is_model_cached(model_id: str, config: CacheConfig | None = None) -> bool:
+def is_model_cached(
+    model_id: str,
+    config: CacheConfig | None = None,
+    revision: str | None = None,
+) -> bool:
     """Check if a model is already in local cache.
 
     Uses HuggingFace Hub's cache structure to check for the model.
@@ -101,6 +105,8 @@ def is_model_cached(model_id: str, config: CacheConfig | None = None) -> bool:
     Args:
         model_id: HuggingFace model ID (e.g., "BAAI/bge-m3").
         config: Cache configuration. If None, reads from environment.
+        revision: Exact snapshot commit, branch, or tag to require. Branches
+            and tags resolve through the local Hugging Face ``refs`` cache.
 
     Returns:
         True if model appears to be cached locally.
@@ -113,10 +119,30 @@ def is_model_cached(model_id: str, config: CacheConfig | None = None) -> bool:
     if not cache_dir.exists():
         return False
 
-    # Check for any snapshot directory with files
+    # Check for a snapshot directory with files. When a revision is requested,
+    # do not let an unrelated cached snapshot satisfy the immutable pin.
     snapshots_dir = cache_dir / "snapshots"
     if not snapshots_dir.exists():
         return False
+
+    if revision is not None:
+        revision_path = Path(revision)
+        if not revision_path.parts or revision == "." or revision_path.is_absolute() or ".." in revision_path.parts:
+            return False
+        resolved_revision = revision
+        ref_path = cache_dir / "refs" / revision
+        if ref_path.is_file():
+            resolved_revision = ref_path.read_text().strip()
+        resolved_path = Path(resolved_revision)
+        if (
+            not resolved_path.parts
+            or resolved_revision == "."
+            or resolved_path.is_absolute()
+            or ".." in resolved_path.parts
+        ):
+            return False
+        snapshot = snapshots_dir / resolved_revision
+        return snapshot.is_dir() and any(snapshot.iterdir())
 
     return any(snapshot.is_dir() and any(snapshot.iterdir()) for snapshot in snapshots_dir.iterdir())
 
@@ -149,13 +175,13 @@ def ensure_model_cached(
         config = get_cache_config()
 
     # Check local cache first
-    if is_model_cached(model_id, config):
+    if is_model_cached(model_id, config, revision=revision):
         logger.debug("Model %s found in local cache", model_id)
         return _get_model_cache_path(model_id, config)
 
     # Try cluster cache if configured
     if config.cluster_cache:
-        if _download_from_cluster_cache(model_id, config):
+        if _download_from_cluster_cache(model_id, config) and is_model_cached(model_id, config, revision=revision):
             logger.info("Downloaded %s from cluster cache", model_id)
             return _get_model_cache_path(model_id, config)
 

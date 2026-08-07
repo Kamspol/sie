@@ -10,6 +10,7 @@ from transformers import Qwen2VLImageProcessorFast
 
 _QWEN35_MODEL_PATH = Path(__file__).resolve().parents[2] / "models" / "Qwen__Qwen3.5-4B.yaml"
 _ADAPTER = "sie_server.adapters.sglang.generation:SGLangGenerationAdapter"
+_CUDA13_ADAPTER = "sie_server.adapters.sglang.cuda13:SGLangCuda13Adapter"
 _STRICT_THINKING_ADAPTER = "sie_server.adapters.sglang.cuda13:SGLangStrictThinkingAdapter"
 _MLX_REPO = "mlx-community/Qwen3.5-4B-4bit"
 _QWEN36_MODEL_PATH = Path(__file__).resolve().parents[2] / "models" / "Qwen__Qwen3.6-27B.yaml"
@@ -196,7 +197,7 @@ def test_all_qwen_vlm_profiles_pair_pinned_image_bounds() -> None:
         assert config.inputs.image is True
         for profile_name in config.profiles:
             profile = config.resolve_profile(profile_name)
-            if profile.adapter_path not in {_ADAPTER, _STRICT_THINKING_ADAPTER}:
+            if profile.adapter_path not in {_ADAPTER, _CUDA13_ADAPTER, _STRICT_THINKING_ADAPTER}:
                 continue
             args = profile.loadtime["extra_launch_args"]
             assert args.count("--mm-process-config") == 1, (model_path.name, profile_name, args)
@@ -209,6 +210,57 @@ def test_all_qwen_vlm_profiles_pair_pinned_image_bounds() -> None:
                     "max_pixels": _QWEN_IMAGE_MAX_PIXELS,
                 }
             }
+
+
+def test_qwen36_native_window_uses_measured_cuda13_eagle_shape() -> None:
+    config = ModelConfig.model_validate(yaml.safe_load(_QWEN36_MODEL_PATH.read_text()))
+    profile = config.resolve_profile("long-context")
+
+    assert profile.adapter_path == _CUDA13_ADAPTER
+    assert profile.loadtime["max_seq_length"] == 262144
+    assert profile.loadtime["mem_fraction_static"] == 0.90
+    assert "disable_cuda_graph" not in profile.loadtime
+    assert profile.loadtime["speculative"] == {
+        "enabled": True,
+        "algorithm": "eagle",
+        "num_steps": 3,
+        "eagle_topk": 1,
+        "num_draft_tokens": 4,
+    }
+    assert profile.loadtime["extra_launch_args"] == [
+        *_MM_PROCESS_CONFIG_ARGS,
+        "--quantization",
+        "fp8",
+        "--mamba-scheduler-strategy",
+        "extra_buffer",
+        "--page-size",
+        "64",
+    ]
+
+
+def test_qwen36_native_window_grammar_twins_preserve_launch_shape_and_mode() -> None:
+    config = ModelConfig.model_validate(yaml.safe_load(_QWEN36_MODEL_PATH.read_text()))
+
+    for source_name, fallback_name, thinking in (
+        ("long-context", "long-context-no-spec", False),
+        ("h100-256k", "long-context-no-spec", False),
+        ("long-context-thinking", "long-context-thinking-no-spec", True),
+        ("h100-256k-thinking", "long-context-thinking-no-spec", True),
+        ("thinking", "long-context-thinking-no-spec", True),
+    ):
+        source = config.resolve_profile(source_name)
+        fallback = config.resolve_profile(fallback_name)
+        assert source.grammar_profile == fallback_name
+        assert fallback.grammar_profile is None
+        assert source.adapter_path == fallback.adapter_path
+        assert source.compute_precision == fallback.compute_precision
+        assert source.max_batch_tokens == fallback.max_batch_tokens
+        assert source.loadtime | {"speculative": None} == fallback.loadtime | {"speculative": None}
+        assert source.loadtime["speculative"]["enabled"] is (not thinking)
+        assert fallback.loadtime["speculative"] == {"enabled": False}
+        assert source.chat_template_kwargs == fallback.chat_template_kwargs
+        effective_mode = source.chat_template_kwargs or config.tasks.generate.chat_template_kwargs
+        assert effective_mode == {"enable_thinking": thinking}
 
 
 def test_qwen_fast_processor_applies_paired_image_bounds() -> None:

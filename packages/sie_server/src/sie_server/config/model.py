@@ -240,9 +240,10 @@ class GenerateTask(BaseModel):
     When set, the gateway rewrites such a request's model id to the
     ``{sie_id}:{grammar_profile}`` variant so it is served by that profile,
     while unconstrained requests keep the request's resolved profile. A
-    directly inheriting explicit variant may remain selected only when its
-    resolved adapter/backend and launch settings preserve the gateway's
-    grammar-safe contract; incompatible descendants still rewrite. This exists
+    profile may override this with its own grammar-safe sibling so context,
+    hardware launch shape, and thinking mode remain unchanged. A directly
+    inheriting explicit variant may remain selected when its resolved launch
+    settings are already grammar-safe. This exists
     because some throughput optimisations are incompatible with
     decode-time grammar enforcement — notably NEXTN/MTP speculative decoding
     bypasses SGLang's Outlines FSM (leaks out-of-schema keys, truncates
@@ -327,6 +328,28 @@ class AdapterOptions(BaseModel):
                     raise ValueError(msg)
         return self
 
+    @model_validator(mode="after")
+    def validate_speculative_draft_model(self) -> "AdapterOptions":
+        """Validate the optional immutable speculative-draft checkpoint pin."""
+        speculative = self.loadtime.get("speculative")
+        if not isinstance(speculative, Mapping):
+            return self
+
+        revision = speculative.get("draft_model_revision")
+        if revision is None:
+            return self
+        draft_model = speculative.get("draft_model")
+        if not isinstance(draft_model, str) or not draft_model:
+            msg = "loadtime.speculative.draft_model_revision requires a non-empty draft_model repo id"
+            raise ValueError(msg)
+        if not isinstance(revision, str) or not is_immutable_revision(revision):
+            msg = (
+                f"loadtime.speculative.draft_model_revision={revision!r} is not an immutable "
+                "40-char commit SHA; pin the resolved draft checkpoint commit"
+            )
+            raise ValueError(msg)
+        return self
+
 
 class ProfileAdaptiveBatching(BaseModel):
     """Per-model adaptive batching overrides.
@@ -380,6 +403,12 @@ class ProfileConfig(BaseModel):
     mode on the profile identity while preserving the bare model's safer
     non-thinking default. The profile mapping is merged over the task mapping;
     request-time kwargs are still applied later by the generation processor.
+
+    ``grammar_profile`` optionally overrides the model-level grammar fallback
+    for this concrete profile. It must name a non-default sibling profile. The
+    gateway uses it only for constrained requests, allowing a long-context or
+    thinking profile to route to a non-speculative twin without losing its
+    context window, hardware launch shape, or tokenizer mode.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -394,6 +423,7 @@ class ProfileConfig(BaseModel):
     admission_enabled: bool | None = None
     max_output_tokens: int | None = Field(default=None, gt=0)
     chat_template_kwargs: dict[str, Any] | None = None
+    grammar_profile: str | None = None
 
     @field_validator("chat_template_kwargs")
     @classmethod
@@ -414,6 +444,7 @@ class ResolvedProfile(BaseModel):
     admission_enabled: bool | None = None
     max_output_tokens: int | None = None
     chat_template_kwargs: MappingProxyType[str, Any] | None = None
+    grammar_profile: str | None = None
 
 
 # Coarse per-family KV-bytes-per-token constants used by the derived-budget
@@ -676,11 +707,37 @@ class ModelConfig(BaseModel):
                         raise ValueError(msg)
         return refs
 
+    def speculative_draft_revisions(self) -> dict[str, str | None]:
+        """Enabled speculative draft repos mapped to their optional immutable pins."""
+        refs: dict[str, str | None] = {}
+        for name, profile in self.profiles.items():
+            speculative = profile.adapter_options.loadtime.get("speculative")
+            if not isinstance(speculative, Mapping) or not speculative.get("enabled"):
+                continue
+            draft_model = speculative.get("draft_model")
+            if not isinstance(draft_model, str) or not draft_model:
+                continue
+            revision = speculative.get("draft_model_revision")
+            if draft_model not in refs or refs[draft_model] is None:
+                refs[draft_model] = revision
+            elif revision is not None and refs[draft_model] != revision:
+                msg = (
+                    f"Model '{self.sie_id}' pins speculative draft '{draft_model}' to two different "
+                    f"revisions ({refs[draft_model]} vs {revision}, latest seen in profile '{name}')"
+                )
+                raise ValueError(msg)
+        return refs
+
     @model_validator(mode="after")
     def validate_lora_revision_consistency(self) -> "ModelConfig":
         # Surfaces the conflicting-pin error at register/config-load time rather
         # than first at model load. See :meth:`lora_revisions` for the policy.
         self.lora_revisions()
+        return self
+
+    @model_validator(mode="after")
+    def validate_speculative_draft_revision_consistency(self) -> "ModelConfig":
+        self.speculative_draft_revisions()
         return self
 
     @model_validator(mode="after")
@@ -703,8 +760,37 @@ class ModelConfig(BaseModel):
             if gp == "default":
                 msg = "tasks.generate.grammar_profile must not be 'default' (it names a non-default variant profile)"
                 raise ValueError(msg)
+            if self.profiles[gp].grammar_profile is not None:
+                msg = f"tasks.generate.grammar_profile target '{gp}' must not declare another grammar_profile"
+                raise ValueError(msg)
 
         for name, profile in self.profiles.items():
+            if profile.grammar_profile is not None:
+                grammar_profile = profile.grammar_profile
+                if self.tasks.generate is None:
+                    msg = f"Profile '{name}' sets grammar_profile on a model without a generation task"
+                    raise ValueError(msg)
+                if name == "default":
+                    msg = "Profile 'default' must use tasks.generate.grammar_profile rather than a profile-scoped fallback"
+                    raise ValueError(msg)
+                if grammar_profile not in self.profiles:
+                    msg = (
+                        f"Profile '{name}' grammar_profile '{grammar_profile}' is not defined. "
+                        f"Available: {list(self.profiles)}"
+                    )
+                    raise ValueError(msg)
+                if grammar_profile in {"default", name}:
+                    msg = (
+                        f"Profile '{name}' grammar_profile must name a non-default sibling profile, "
+                        f"got '{grammar_profile}'"
+                    )
+                    raise ValueError(msg)
+                if self.profiles[grammar_profile].grammar_profile is not None:
+                    msg = (
+                        f"Profile '{name}' grammar_profile target '{grammar_profile}' "
+                        "must not declare another grammar_profile"
+                    )
+                    raise ValueError(msg)
             if profile.chat_template_kwargs is not None and self.tasks.generate is None:
                 msg = f"Profile '{name}' sets 'chat_template_kwargs' on a model without a generation task"
                 raise ValueError(msg)
@@ -726,6 +812,44 @@ class ModelConfig(BaseModel):
                 if profile.max_batch_tokens is None:
                     msg = f"Profile '{name}' must have 'max_batch_tokens' set (or use 'extends')"
                     raise ValueError(msg)
+
+        if self.tasks.generate is not None and self.tasks.generate.grammar_profile is not None:
+            grammar_profile = self.tasks.generate.grammar_profile
+            target = self._resolve_profile_uncached(grammar_profile)
+            target_speculative = target.loadtime.get("speculative")
+            if target_speculative is not None and (
+                not isinstance(target_speculative, dict) or target_speculative.get("enabled") is not False
+            ):
+                msg = f"tasks.generate.grammar_profile target '{grammar_profile}' must not enable speculation"
+                raise ValueError(msg)
+
+        for name, profile in self.profiles.items():
+            if profile.grammar_profile is None:
+                continue
+            source = self._resolve_profile_uncached(name)
+            target = self._resolve_profile_uncached(profile.grammar_profile)
+            source_loadtime = dict(source.loadtime)
+            target_loadtime = dict(target.loadtime)
+            source_loadtime.pop("speculative", None)
+            target_loadtime.pop("speculative", None)
+            target_speculative = target.loadtime.get("speculative")
+            compatible = (
+                source.adapter_path == target.adapter_path
+                and source.max_batch_tokens == target.max_batch_tokens
+                and source.compute_precision == target.compute_precision
+                and source.kv_budget_tokens == target.kv_budget_tokens
+                and source.max_output_tokens == target.max_output_tokens
+                and source.chat_template_kwargs == target.chat_template_kwargs
+                and target_speculative == {"enabled": False}
+                and source_loadtime == target_loadtime
+            )
+            if not compatible:
+                msg = (
+                    f"Profile '{name}' grammar_profile '{profile.grammar_profile}' must preserve "
+                    "adapter, precision, batch, KV/output limits, tokenizer mode, and load-time "
+                    "settings while explicitly disabling speculation"
+                )
+                raise ValueError(msg)
 
         # KV-budget admission control. For models declaring
         # ``tasks.generate``, every profile (after parent merge) must
@@ -863,6 +987,7 @@ class ModelConfig(BaseModel):
                     if profile.chat_template_kwargs is not None
                     else None
                 ),
+                grammar_profile=profile.grammar_profile,
             )
 
         # Resolve via parent — validators guarantee parent exists and has no chaining
@@ -904,6 +1029,10 @@ class ModelConfig(BaseModel):
         chat_template_kwargs = (
             profile.chat_template_kwargs if profile.chat_template_kwargs is not None else parent.chat_template_kwargs
         )
+        # Routing metadata is profile-local rather than inherited. An alias
+        # must opt into the same fallback explicitly, and the fallback profile
+        # itself must not inherit a route back to itself.
+        grammar_profile = profile.grammar_profile
 
         if max_batch_tokens is None:
             msg = f"Resolved profile '{name}': max_batch_tokens must be set"
@@ -925,6 +1054,7 @@ class ModelConfig(BaseModel):
             chat_template_kwargs=(
                 MappingProxyType(dict(chat_template_kwargs)) if chat_template_kwargs is not None else None
             ),
+            grammar_profile=grammar_profile,
         )
 
     @property

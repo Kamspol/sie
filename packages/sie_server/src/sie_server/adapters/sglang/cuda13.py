@@ -3,7 +3,11 @@ from typing import Any
 from sie_server.adapters.sglang.generation import SGLangGenerationAdapter
 
 
-class SGLangStrictThinkingAdapter(SGLangGenerationAdapter):
+class SGLangCuda13Adapter(SGLangGenerationAdapter):
+    """Route generic generation through the CUDA 13 SGLang bundle."""
+
+
+class SGLangStrictThinkingAdapter(SGLangCuda13Adapter):
     """CUDA 13 SGLang lane that guarantees a closed private thought block.
 
     SGLang 0.5.13 can suppress premature EOS tokens until the model emits its

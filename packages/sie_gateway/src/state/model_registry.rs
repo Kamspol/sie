@@ -656,7 +656,7 @@ impl ModelRegistry {
         }
         let adapter_modules = Self::base_route_adapter_modules_from_profiles(&config.profiles);
 
-        Ok(ModelEntry {
+        let entry = ModelEntry {
             name: model_name.clone(),
             canonical_base_model: model_name,
             canonical_profile: "default".to_string(),
@@ -666,7 +666,70 @@ impl ModelRegistry {
             profile_names,
             profile_configs,
             info_extras,
-        })
+        };
+        Self::validate_profile_grammar_fallbacks(&entry)?;
+        Ok(entry)
+    }
+
+    fn validate_profile_grammar_fallbacks(entry: &ModelEntry) -> Result<(), String> {
+        if let Some(global_target) = entry.info_extras.grammar_profile.as_deref() {
+            // A temporarily missing global target remains a runtime
+            // MissingVariant outcome for config-skew compatibility. When the
+            // target is present, fail closed on chained fallbacks.
+            if let Some(target) = entry.profile_configs.get(global_target) {
+                if target.grammar_profile.is_some() {
+                    return Err(format!(
+                        "tasks.generate.grammar_profile target '{global_target}' must not declare another grammar_profile"
+                    ));
+                }
+                if !Self::profile_does_not_enable_speculation(target) {
+                    return Err(format!(
+                        "tasks.generate.grammar_profile target '{global_target}' must not enable speculation"
+                    ));
+                }
+            }
+        }
+        for (profile_name, profile) in &entry.profile_configs {
+            let Some(target_name) = profile.grammar_profile.as_deref() else {
+                continue;
+            };
+            if profile_name == "default" {
+                return Err(
+                    "Profile 'default' must use tasks.generate.grammar_profile rather than a profile-scoped fallback"
+                        .to_string(),
+                );
+            }
+            if target_name == "default" || target_name == profile_name {
+                return Err(format!(
+                    "Profile '{profile_name}' grammar_profile must name a non-default sibling profile, got '{target_name}'"
+                ));
+            }
+            if !entry.profile_configs.contains_key(target_name) {
+                return Err(format!(
+                    "Profile '{profile_name}' grammar_profile '{target_name}' is not defined"
+                ));
+            }
+            if entry
+                .profile_configs
+                .get(target_name)
+                .and_then(|target| target.grammar_profile.as_ref())
+                .is_some()
+            {
+                return Err(format!(
+                    "Profile '{profile_name}' grammar_profile target '{target_name}' must not declare another grammar_profile"
+                ));
+            }
+            if !Self::profile_scoped_grammar_fallback_is_compatible(
+                entry,
+                profile_name,
+                target_name,
+            ) {
+                return Err(format!(
+                    "Profile '{profile_name}' grammar_profile '{target_name}' must preserve adapter, precision, batch, KV/output limits, tokenizer mode and load-time settings while explicitly disabling speculation"
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn normalize_model_pool(pool: Option<&str>) -> Result<Option<String>, String> {
@@ -770,7 +833,10 @@ impl ModelRegistry {
 
     fn empty_profile_config() -> crate::types::model::ProfileConfig {
         crate::types::model::ProfileConfig {
+            kv_budget_tokens: None,
             max_output_tokens: None,
+            grammar_profile: None,
+            chat_template_kwargs: None,
             adapter_path: None,
             max_batch_tokens: None,
             compute_precision: None,
@@ -810,6 +876,16 @@ impl ModelRegistry {
             if profile.max_output_tokens.is_some() {
                 resolved.max_output_tokens = profile.max_output_tokens;
             }
+            if profile.kv_budget_tokens.is_some() {
+                resolved.kv_budget_tokens = profile.kv_budget_tokens;
+            }
+            // Routing metadata is profile-local rather than inherited. This
+            // prevents a grammar-safe child from inheriting its parent's
+            // fallback and recursively pointing at itself.
+            resolved.grammar_profile = profile.grammar_profile.clone();
+            if profile.chat_template_kwargs.is_some() {
+                resolved.chat_template_kwargs = profile.chat_template_kwargs.clone();
+            }
             resolved.adapter_options = ModelRegistry::merge_adapter_options(
                 resolved.adapter_options,
                 profile.adapter_options.clone(),
@@ -845,7 +921,10 @@ impl ModelRegistry {
                 (
                     name.clone(),
                     crate::types::model::ProfileConfig {
+                        kv_budget_tokens: canon.kv_budget_tokens,
                         max_output_tokens: existing_output_caps.get(name).copied(),
+                        grammar_profile: canon.grammar_profile.clone(),
+                        chat_template_kwargs: canon.chat_template_kwargs.clone(),
                         adapter_path: canon.adapter_path.clone(),
                         max_batch_tokens: canon.max_batch_tokens,
                         compute_precision: canon.compute_precision.clone(),
@@ -877,10 +956,14 @@ impl ModelRegistry {
                 .get("default")
                 .cloned()
                 .unwrap_or(CanonicalProfile {
+                    kv_budget_tokens: None,
                     adapter_path: None,
                     max_batch_tokens: None,
                     compute_precision: None,
+                    max_output_tokens: None,
                     adapter_options: None,
+                    grammar_profile: None,
+                    chat_template_kwargs: None,
                 });
         let profile = entry.profile_configs.get(profile_name)?;
 
@@ -892,6 +975,16 @@ impl ModelRegistry {
         }
         if profile.compute_precision.is_some() {
             resolved.compute_precision = profile.compute_precision.clone();
+        }
+        if profile.max_output_tokens.is_some() {
+            resolved.max_output_tokens = profile.max_output_tokens;
+        }
+        if profile.kv_budget_tokens.is_some() {
+            resolved.kv_budget_tokens = profile.kv_budget_tokens;
+        }
+        resolved.grammar_profile = profile.grammar_profile.clone();
+        if profile.chat_template_kwargs.is_some() {
+            resolved.chat_template_kwargs = profile.chat_template_kwargs.clone();
         }
         resolved.adapter_options =
             Self::merge_adapter_options(resolved.adapter_options, profile.adapter_options.clone());
@@ -1103,13 +1196,16 @@ impl ModelRegistry {
     /// ``ModelInfoExtras::grammar_profile``), grammar requests must run on the
     /// ``{base}:{grammar_profile}`` profile variant rather than a speculative
     /// one — NEXTN/MTP speculative decoding bypasses SGLang's Outlines grammar
-    /// FSM. An explicit variant that inherits the grammar profile, uses its
-    /// adapter/backend, and keeps speculation disabled remains selected.
+    /// FSM. An explicit variant may declare a profile-scoped grammar fallback
+    /// that preserves its context/hardware/thinking launch shape while
+    /// disabling speculation. A variant that directly inherits the model-wide
+    /// grammar profile and is already safe remains selected.
     ///
     /// The routing target is resolved off the request's *base* model, so the
     /// rewrite fires regardless of which id the caller named:
     /// - base id (``Qwen/Qwen3.5-4B``)            → ``…:no-spec``
     /// - sibling variant (``…:a100-40gb``, NEXTN) → ``…:no-spec``
+    /// - scoped variant (``…:h200-256k``)         → ``…:h200-256k-no-spec``
     /// - target variant (``…:no-spec``)           → ``Keep`` (already safe)
     /// - inheriting variant (``…:h100-fp8``)      → ``Keep`` (already safe)
     /// - no ``grammar_profile`` declared          → ``Keep``
@@ -1138,12 +1234,12 @@ impl ModelRegistry {
         }
     }
 
-    /// Resolve the *base* model id and its declared ``grammar_profile`` for a
-    /// possibly-variant request id. The hint lives on the base entry only —
-    /// variant entries clear it (see ``narrow_info_extras_to_profile``) so a
-    /// variant never recursively re-routes — so an explicit sibling-variant id
-    /// (e.g. ``…:a100-40gb``) resolves the *base's* profile here. Returns
-    /// ``None`` when no ``grammar_profile`` is declared.
+    /// Resolve the *base* model id and grammar fallback for a possibly-variant
+    /// request id. The model-wide hint lives on the base entry; an explicit
+    /// profile may override it with ``profiles.<name>.grammar_profile``. The
+    /// variant entry itself clears the model-wide hint to prevent recursive
+    /// ``{base}:{profile}:{grammar_profile}`` routing, so both hints are read
+    /// from the canonical base entry here.
     fn base_grammar_profile(snap: &RegistrySnapshot, model: &str) -> Option<(String, String)> {
         let canonical = Self::canonical_model_name(snap, model)?;
         // Base entry carrying the hint.
@@ -1158,6 +1254,22 @@ impl ModelRegistry {
         // hint). Strip the trailing ``:profile`` and read the base entry's hint.
         let (base, source_profile) = canonical.rsplit_once(':')?;
         let base_entry = snap.models.get(base)?;
+        // A declared profile-scoped fallback is already a concrete safe
+        // target. Keep it instead of applying the model-wide fallback again.
+        if base_entry
+            .profile_configs
+            .values()
+            .any(|profile| profile.grammar_profile.as_deref() == Some(source_profile))
+        {
+            return Some((base.to_string(), source_profile.to_string()));
+        }
+        let scoped = base_entry
+            .profile_configs
+            .get(source_profile)
+            .and_then(|profile| profile.grammar_profile.clone());
+        if let Some(scoped) = scoped {
+            return Some((base.to_string(), scoped));
+        }
         let gp = base_entry.info_extras.grammar_profile.clone()?;
         let target_profile = if base_entry
             .info_extras
@@ -1171,6 +1283,41 @@ impl ModelRegistry {
             gp
         };
         Some((base.to_string(), target_profile))
+    }
+
+    fn profile_scoped_grammar_fallback_is_compatible(
+        entry: &ModelEntry,
+        source_profile: &str,
+        target_profile: &str,
+    ) -> bool {
+        let (Some(source), Some(target)) = (
+            entry.profile_configs.get(source_profile),
+            entry.profile_configs.get(target_profile),
+        ) else {
+            return false;
+        };
+        source.adapter_path == target.adapter_path
+            && source.kv_budget_tokens == target.kv_budget_tokens
+            && source.max_batch_tokens == target.max_batch_tokens
+            && source.compute_precision == target.compute_precision
+            && source.max_output_tokens == target.max_output_tokens
+            && source.chat_template_kwargs == target.chat_template_kwargs
+            && Self::profile_explicitly_disables_speculation(target)
+            && Self::profile_loadtime_without_speculation(source)
+                == Self::profile_loadtime_without_speculation(target)
+    }
+
+    fn profile_loadtime_without_speculation(
+        profile: &CanonicalProfile,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let mut loadtime = profile
+            .adapter_options
+            .as_ref()?
+            .get("loadtime")?
+            .as_object()?
+            .clone();
+        loadtime.remove("speculative");
+        Some(loadtime)
     }
 
     fn profile_is_grammar_compatible(
@@ -1197,6 +1344,13 @@ impl ModelRegistry {
                 .and_then(|value| value.get("enabled")),
             Some(serde_json::Value::Bool(false))
         )
+    }
+
+    fn profile_does_not_enable_speculation(profile: &CanonicalProfile) -> bool {
+        match Self::profile_loadtime_value(profile, "speculative") {
+            None => true,
+            Some(value) => matches!(value.get("enabled"), Some(serde_json::Value::Bool(false))),
+        }
     }
 
     fn profile_extra_launch_args_are_compatible(
@@ -2140,6 +2294,7 @@ impl ModelRegistry {
             .collect();
         let mut affected_model_names = vec![sie_id.clone()];
         if let Some(base_entry) = snap.models.get(sie_id).cloned() {
+            Self::validate_profile_grammar_fallbacks(&base_entry)?;
             let old_variants: Vec<String> = snap
                 .models
                 .keys()
@@ -2287,7 +2442,10 @@ mod tests {
         extends: Option<&str>,
     ) -> crate::types::model::ProfileConfig {
         crate::types::model::ProfileConfig {
+            kv_budget_tokens: None,
             max_output_tokens: None,
+            grammar_profile: None,
+            chat_template_kwargs: None,
             adapter_path: adapter_path.map(str::to_string),
             max_batch_tokens,
             compute_precision: None,
@@ -2389,7 +2547,10 @@ mod tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -2427,7 +2588,10 @@ mod tests {
         let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
 
         let mk = || ProfileConfig {
+            kv_budget_tokens: None,
             max_output_tokens: None,
+            grammar_profile: None,
+            chat_template_kwargs: None,
             adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
             max_batch_tokens: Some(4096),
             compute_precision: None,
@@ -2482,6 +2646,27 @@ mod tests {
             "raw-grammar-override",
             serde_json::json!({"extra_launch_args": ["--grammar-backend", "xgrammar"]}),
         );
+        let mut scoped = mk();
+        scoped.grammar_profile = Some("h200-256k-no-spec".to_string());
+        scoped.adapter_options = Some(serde_json::json!({
+            "loadtime": {
+                "max_seq_length": 262144,
+                "grammar_backend": "outlines",
+                "speculative": {"enabled": true, "algorithm": "nextn"},
+                "extra_launch_args": ["--quantization", "fp8", "--kv-cache-dtype", "fp8_e4m3"],
+            },
+        }));
+        profiles.insert("h200-256k".to_string(), scoped);
+        let mut scoped_fallback = mk();
+        scoped_fallback.adapter_options = Some(serde_json::json!({
+            "loadtime": {
+                "max_seq_length": 262144,
+                "grammar_backend": "outlines",
+                "speculative": {"enabled": false},
+                "extra_launch_args": ["--quantization", "fp8", "--kv-cache-dtype", "fp8_e4m3"],
+            },
+        }));
+        profiles.insert("h200-256k-no-spec".to_string(), scoped_fallback);
         // ``tasks.generate.grammar_profile: no-spec`` is the routing hint the
         // gateway reads off the base entry.
         let tasks: serde_yaml::Value =
@@ -2527,6 +2712,16 @@ mod tests {
             registry.grammar_route_variant("ORG/G:H100-FP8"),
             GrammarRoute::Keep
         );
+        // A profile-scoped fallback preserves the exact long-context launch
+        // shape and rewrites only to its declared non-speculative twin.
+        assert_eq!(
+            registry.grammar_route_variant("org/g:h200-256k"),
+            GrammarRoute::Rewrite("org/g:h200-256k-no-spec".to_string())
+        );
+        assert_eq!(
+            registry.grammar_route_variant("org/g:h200-256k-no-spec"),
+            GrammarRoute::Keep
+        );
         // Inheritance is only a signal, not proof: incompatible structured or
         // raw launch settings must still fall back to ``no-spec``.
         for profile in [
@@ -2546,6 +2741,48 @@ mod tests {
         // to ``org/g:no-spec:no-spec``).
         assert_eq!(
             registry.grammar_route_variant("org/g:no-spec"),
+            GrammarRoute::Keep
+        );
+
+        let mut profiles = StdHashMap::new();
+        profiles.insert("default".to_string(), mk());
+        let mut fast = mk();
+        fast.grammar_profile = Some("safe".to_string());
+        fast.adapter_options = Some(serde_json::json!({
+            "loadtime": {
+                "grammar_backend": "outlines",
+                "speculative": {"enabled": true},
+            },
+        }));
+        profiles.insert("fast".to_string(), fast);
+        let mut safe = mk();
+        safe.adapter_options = Some(serde_json::json!({
+            "loadtime": {
+                "grammar_backend": "outlines",
+                "speculative": {"enabled": false},
+            },
+        }));
+        profiles.insert("safe".to_string(), safe);
+        let tasks: serde_yaml::Value = serde_yaml::from_str("generate: {}\n").unwrap();
+        registry
+            .add_model_config(ModelConfig {
+                name: "org/scoped-only".to_string(),
+                hf_revision: None,
+                adapter_module: None,
+                default_bundle: None,
+                pool: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: Some(tasks),
+            })
+            .unwrap();
+        assert_eq!(
+            registry.grammar_route_variant("org/scoped-only:fast"),
+            GrammarRoute::Rewrite("org/scoped-only:safe".to_string())
+        );
+        assert_eq!(
+            registry.grammar_route_variant("org/scoped-only:safe"),
             GrammarRoute::Keep
         );
     }
@@ -2568,7 +2805,10 @@ mod tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -2591,6 +2831,182 @@ mod tests {
             .unwrap();
 
         assert_eq!(registry.grammar_route_variant("org/n"), GrammarRoute::Keep);
+    }
+
+    #[test]
+    fn test_profile_scoped_grammar_fallback_rejects_launch_shape_mismatch() {
+        use crate::types::model::{ModelConfig, ProfileConfig};
+        use std::collections::HashMap as StdHashMap;
+
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            "name: default\npriority: 10\nadapters:\n  - sie_server.adapters.sentence_transformer\n",
+        )
+        .unwrap();
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+        let profile = |speculative: bool, max_seq_length: u32| ProfileConfig {
+            kv_budget_tokens: None,
+            max_output_tokens: None,
+            grammar_profile: None,
+            chat_template_kwargs: None,
+            adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
+            max_batch_tokens: Some(4096),
+            compute_precision: None,
+            adapter_options: Some(serde_json::json!({
+                "loadtime": {
+                    "max_seq_length": max_seq_length,
+                    "grammar_backend": "outlines",
+                    "speculative": {"enabled": speculative},
+                },
+            })),
+            extends: None,
+        };
+        let mut profiles = StdHashMap::new();
+        profiles.insert("default".to_string(), profile(true, 8192));
+        profiles.insert("unsafe".to_string(), profile(true, 8192));
+        let tasks: serde_yaml::Value =
+            serde_yaml::from_str("generate:\n  grammar_profile: unsafe\n").unwrap();
+        let error = registry
+            .add_model_config(ModelConfig {
+                name: "org/unsafe-global-target".to_string(),
+                hf_revision: None,
+                adapter_module: None,
+                default_bundle: None,
+                pool: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: Some(tasks),
+            })
+            .unwrap_err();
+        assert!(error.contains("must not enable speculation"));
+
+        let default = profile(false, 8192);
+        let mut source = profile(true, 262_144);
+        source.grammar_profile = Some("safe".to_string());
+        let mut profiles = StdHashMap::new();
+        profiles.insert("default".to_string(), default);
+        profiles.insert("fast".to_string(), source);
+        profiles.insert("safe".to_string(), profile(false, 8192));
+
+        let error = registry
+            .add_model_config(ModelConfig {
+                name: "org/mismatch".to_string(),
+                hf_revision: None,
+                adapter_module: None,
+                default_bundle: None,
+                pool: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: None,
+            })
+            .unwrap_err();
+        assert!(error
+            .contains("must preserve adapter, precision, batch, KV/output limits, tokenizer mode"));
+
+        let default = profile(false, 8192);
+        let mut source = profile(true, 262_144);
+        source.grammar_profile = Some("safe".to_string());
+        source.chat_template_kwargs = Some(serde_json::json!({"enable_thinking": true}));
+        let mut profiles = StdHashMap::new();
+        profiles.insert("default".to_string(), default);
+        profiles.insert("fast".to_string(), source);
+        profiles.insert("safe".to_string(), profile(false, 262_144));
+
+        let error = registry
+            .add_model_config(ModelConfig {
+                name: "org/mode-mismatch".to_string(),
+                hf_revision: None,
+                adapter_module: None,
+                default_bundle: None,
+                pool: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: None,
+            })
+            .unwrap_err();
+        assert!(error.contains("tokenizer mode"));
+
+        let default = profile(false, 8192);
+        let mut source = profile(true, 262_144);
+        source.grammar_profile = Some("safe".to_string());
+        source.max_output_tokens = Some(32_768);
+        let mut safe = profile(false, 262_144);
+        safe.max_output_tokens = Some(4_096);
+        let mut profiles = StdHashMap::new();
+        profiles.insert("default".to_string(), default);
+        profiles.insert("fast".to_string(), source);
+        profiles.insert("safe".to_string(), safe);
+
+        let error = registry
+            .add_model_config(ModelConfig {
+                name: "org/output-cap-mismatch".to_string(),
+                hf_revision: None,
+                adapter_module: None,
+                default_bundle: None,
+                pool: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: None,
+            })
+            .unwrap_err();
+        assert!(error.contains("KV/output limits"));
+
+        let default = profile(false, 8192);
+        let mut source = profile(true, 262_144);
+        source.grammar_profile = Some("safe".to_string());
+        source.kv_budget_tokens = Some(262_144);
+        let mut safe = profile(false, 262_144);
+        safe.kv_budget_tokens = Some(98_304);
+        let mut profiles = StdHashMap::new();
+        profiles.insert("default".to_string(), default);
+        profiles.insert("fast".to_string(), source);
+        profiles.insert("safe".to_string(), safe);
+
+        let error = registry
+            .add_model_config(ModelConfig {
+                name: "org/kv-budget-mismatch".to_string(),
+                hf_revision: None,
+                adapter_module: None,
+                default_bundle: None,
+                pool: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: None,
+            })
+            .unwrap_err();
+        assert!(error.contains("KV/output limits"));
+
+        let default = profile(false, 8192);
+        let mut source = profile(true, 262_144);
+        source.grammar_profile = Some("safe".to_string());
+        let mut safe = profile(false, 262_144);
+        safe.grammar_profile = Some("deeper".to_string());
+        let mut profiles = StdHashMap::new();
+        profiles.insert("default".to_string(), default);
+        profiles.insert("fast".to_string(), source);
+        profiles.insert("safe".to_string(), safe);
+        profiles.insert("deeper".to_string(), profile(false, 262_144));
+
+        let error = registry
+            .add_model_config(ModelConfig {
+                name: "org/chained-fallback".to_string(),
+                hf_revision: None,
+                adapter_module: None,
+                default_bundle: None,
+                pool: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: None,
+            })
+            .unwrap_err();
+        assert!(error.contains("must not declare another grammar_profile"));
     }
 
     #[test]
@@ -2654,7 +3070,10 @@ profiles:
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -2706,7 +3125,10 @@ profiles:
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -2719,7 +3141,10 @@ profiles:
         profiles.insert(
             "bad/name".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -2881,7 +3306,10 @@ profiles:
         profiles.insert(
             "experimental".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some(
                     "sie_server_rust.adapters.candle:CandleEmbeddingAdapter".to_string(),
                 ),
@@ -3253,12 +3681,16 @@ profiles:
             ..ModelInfoExtras::default()
         };
         let profile = CanonicalProfile {
+            kv_budget_tokens: None,
             adapter_path: None,
             max_batch_tokens: None,
             compute_precision: None,
+            max_output_tokens: None,
             adapter_options: Some(serde_json::json!({
                 "loadtime": {"max_seq_length": 32768}
             })),
+            grammar_profile: None,
+            chat_template_kwargs: None,
         };
 
         let variant = ModelRegistry::narrow_info_extras_to_profile(&base, "long", &profile);
@@ -3357,7 +3789,10 @@ profiles:
                     profiles.insert(
                         "default".to_string(),
                         ProfileConfig {
+                            kv_budget_tokens: None,
                             max_output_tokens: None,
+                            grammar_profile: None,
+                            chat_template_kwargs: None,
                             adapter_path: Some(
                                 "sie_server.adapters.sentence_transformer:Adapter".to_string(),
                             ),
@@ -3630,7 +4065,10 @@ adapters:
                 m.insert(
                     "default".to_string(),
                     crate::types::model::ProfileConfig {
+                        kv_budget_tokens: None,
                         max_output_tokens: None,
+                        grammar_profile: None,
+                        chat_template_kwargs: None,
                         adapter_path: Some(
                             "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
                                 .to_string(),
@@ -3678,7 +4116,10 @@ adapters:
         profiles.insert(
             "default".to_string(),
             crate::types::model::ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -3718,7 +4159,10 @@ encode:
         profiles.insert(
             "default".to_string(),
             crate::types::model::ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -3729,7 +4173,10 @@ encode:
         profiles.insert(
             "alt".to_string(),
             crate::types::model::ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(2048),
                 compute_precision: None,
@@ -3788,7 +4235,10 @@ adapters:
         profiles.insert(
             "default".to_string(),
             crate::types::model::ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -3823,7 +4273,10 @@ encode:
         profiles.insert(
             "default".to_string(),
             crate::types::model::ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -3834,7 +4287,10 @@ encode:
         profiles.insert(
             "alt".to_string(),
             crate::types::model::ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(2048),
                 compute_precision: None,
@@ -3879,7 +4335,10 @@ encode:
                 m.insert(
                     "default".to_string(),
                     crate::types::model::ProfileConfig {
+                        kv_budget_tokens: None,
                         max_output_tokens: None,
+                        grammar_profile: None,
+                        chat_template_kwargs: None,
                         adapter_path: Some(adapter_path.to_string()),
                         max_batch_tokens: Some(max_batch_tokens),
                         compute_precision: None,
@@ -4124,7 +4583,10 @@ adapters:
                 m.insert(
                     "default".to_string(),
                     crate::types::model::ProfileConfig {
+                        kv_budget_tokens: None,
                         max_output_tokens: None,
+                        grammar_profile: None,
+                        chat_template_kwargs: None,
                         adapter_path: Some(
                             "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
                                 .to_string(),
@@ -4183,7 +4645,10 @@ adapters:
                 m.insert(
                     "a100-40gb".to_string(),
                     crate::types::model::ProfileConfig {
+                        kv_budget_tokens: None,
                         max_output_tokens: None,
+                        grammar_profile: None,
+                        chat_template_kwargs: None,
                         adapter_path: Some(
                             "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
                                 .to_string(),
@@ -4842,7 +5307,10 @@ adapters:
                         m.insert(
                             "default".to_string(),
                             crate::types::model::ProfileConfig {
+                                kv_budget_tokens: None,
                                 max_output_tokens: None,
+                                grammar_profile: None,
+                                chat_template_kwargs: None,
                                 adapter_path: Some(
                                     "sie_server.adapters.sentence_transformer:A".to_string(),
                                 ),

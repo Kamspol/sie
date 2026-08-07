@@ -323,7 +323,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
         self._guard = guard or {}
         # Generic speculative-decoding surface accepts
         # ``{enabled, algorithm, num_steps?, eagle_topk?,
-        # num_draft_tokens?, draft_model?}``; translated by
+        # num_draft_tokens?, draft_model?, draft_model_revision?}``; translated by
         # ``_speculative_launch_args`` into SGLang CLI flags. Default-on
         # for Qwen3.5-4B (NEXTN/MTP trained in); intentionally off for
         # Qwen3-4B-Instruct-2507 (no NEXTN heads — see the
@@ -646,6 +646,8 @@ class SGLangGenerationAdapter(GenerationAdapter):
         - ``NEXTN`` (a.k.a. MTP in SGLang 0.5.x — multi-token prediction
           via trained-in draft heads; required for Qwen3.5-4B's
           ``MTP: trained with multi-steps`` capability).
+        - ``EAGLE`` (the current SGLang Qwen3.6 MTP spelling; uses the
+          checkpoint's trained-in draft heads without an external model).
         - ``EAGLE3`` (requires an external draft model whose
           architecture is registered with transformers; blocked for
           Qwen3-4B-Instruct-2507 on the pinned stack — see the
@@ -661,8 +663,8 @@ class SGLangGenerationAdapter(GenerationAdapter):
             Top-level gate. When False (or block missing), returns
             ``[]`` — caller still gets the unchanged baseline command.
         ``algorithm`` (str, required when enabled)
-            One of ``nextn``, ``eagle3``, ``ngram`` (case-insensitive).
-            Surfaced verbatim to SGLang's ``--speculative-algo``.
+            One of ``nextn``, ``eagle``, ``eagle3``, ``ngram`` (case-insensitive).
+            Surfaced verbatim to SGLang's ``--speculative-algorithm``.
         ``num_steps`` (int, optional)
             ``--speculative-num-steps``. Qwen3.5-4B's documented
             NEXTN recipe uses 3.
@@ -675,8 +677,12 @@ class SGLangGenerationAdapter(GenerationAdapter):
             window is set by separate SGLang knobs we leave at
             defaults — see ``qwen3-4b-speculative-side.yaml`` header).
         ``draft_model`` (str, optional)
-            ``--speculative-draft-model-path``. EAGLE3 needs this;
-            NEXTN/NGRAM do not.
+            ``--speculative-draft-model-path``. EAGLE3 needs this; paired
+            assistant variants of NEXTN may also use it.
+        ``draft_model_revision`` (str, optional)
+            ``--speculative-draft-model-revision``. Immutable checkpoint
+            revision for ``draft_model``; model-config validation requires a
+            full 40-character commit SHA when present.
 
         Unknown keys are intentionally ignored (with a debug log) so a
         future SGLang flag can be wired here without forcing a
@@ -691,19 +697,19 @@ class SGLangGenerationAdapter(GenerationAdapter):
             logger.warning(
                 "speculative.enabled=true but algorithm missing/invalid (%r); "
                 "skipping --speculative-* flags. Set algorithm to one of "
-                "'nextn' | 'eagle3' | 'ngram'.",
+                "'nextn' | 'eagle' | 'eagle3' | 'ngram'.",
                 algorithm_raw,
             )
             return []
         algorithm = algorithm_raw.strip().upper()
-        if algorithm not in {"NEXTN", "EAGLE3", "NGRAM"}:
+        if algorithm not in {"NEXTN", "EAGLE", "EAGLE3", "NGRAM"}:
             logger.warning(
                 "speculative.algorithm=%r is not in the recognised set "
-                "{NEXTN, EAGLE3, NGRAM}; forwarding to SGLang anyway "
+                "{NEXTN, EAGLE, EAGLE3, NGRAM}; forwarding to SGLang anyway "
                 "(it will reject if unsupported).",
                 algorithm_raw,
             )
-        args: list[str] = ["--speculative-algo", algorithm]
+        args: list[str] = ["--speculative-algorithm", algorithm]
 
         num_steps = spec.get("num_steps")
         if isinstance(num_steps, int) and num_steps > 0:
@@ -729,12 +735,22 @@ class SGLangGenerationAdapter(GenerationAdapter):
         draft_model = spec.get("draft_model")
         if isinstance(draft_model, str) and draft_model.strip():
             args.extend(["--speculative-draft-model-path", draft_model.strip()])
+            draft_model_revision = spec.get("draft_model_revision")
+            if isinstance(draft_model_revision, str) and draft_model_revision.strip():
+                args.extend(["--speculative-draft-model-revision", draft_model_revision.strip()])
+            elif draft_model_revision is not None:
+                logger.debug(
+                    "speculative.draft_model_revision=%r ignored (need non-empty str)",
+                    draft_model_revision,
+                )
         elif algorithm == "EAGLE3":
             logger.warning(
                 "speculative.algorithm=EAGLE3 without speculative.draft_model — "
                 "SGLang will fail to start. Set speculative.draft_model to the "
                 "EAGLE3 draft checkpoint path."
             )
+        elif spec.get("draft_model_revision") is not None:
+            logger.debug("speculative.draft_model_revision ignored without draft_model")
 
         logger.info("speculative decoding enabled: %s (args=%s)", algorithm, args)
         return args

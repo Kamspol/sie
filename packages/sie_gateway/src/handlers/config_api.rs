@@ -733,7 +733,10 @@ mod tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -927,7 +930,10 @@ mod tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("nonexistent.module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,

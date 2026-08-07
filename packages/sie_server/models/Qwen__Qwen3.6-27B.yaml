@@ -110,10 +110,10 @@ profiles:
           num_steps: 2
           eagle_topk: 1
           num_draft_tokens: 2
-        # ``--mamba-scheduler-strategy extra_buffer`` is the required
-        # pair-flag for NEXTN spec on the hybrid Gated-DeltaNet architecture.
-        # Keep it paired with ``--disable-overlap-schedule`` for all NEXTN
-        # launch profiles.
+        # On this conservative CUDA 12 profile, keep ``extra_buffer`` paired
+        # with ``--disable-overlap-schedule``. The measured CUDA 13 EAGLE
+        # native-window profiles below intentionally retain SPEC_V2 overlap
+        # scheduling with the same mamba buffer strategy.
         extra_launch_args:
           - "--mm-process-config"
           - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
@@ -302,11 +302,12 @@ profiles:
           min_new_tokens: 10
         stop_tokens:
           - "<|im_end|>"
-  # Explicit native-window candidate for one H100-80GB admission. Keep this
+  # Explicit native-window shape for one H100-80GB admission. Keep this
   # standalone (rather than extending ``h100-fp8``) so the matching
   # ``long-context-thinking`` child can inherit it without forbidden profile
-  # chaining. Online FP8 limits weight memory; KV remains BF16 until measured
-  # H100 evidence proves a lower-precision cache is necessary and faithful.
+  # chaining. The CUDA 13 engine's trained-in EAGLE draft, CUDA graphs, and
+  # overlap schedule sustain the same batch-one decode rate at 32K, 128K, and
+  # 256K. Online FP8 limits weight memory; KV remains BF16.
   long-context:
     # Qwen's official non-thinking serving recipe uses max_tokens=32768.
     # Keep the bare 8K profile at 4096 while exposing that decode ceiling only
@@ -314,8 +315,85 @@ profiles:
     max_output_tokens: 32768
     max_batch_tokens: 262144
     compute_precision: bfloat16
-    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    adapter_path: sie_server.adapters.sglang.cuda13:SGLangCuda13Adapter
+    grammar_profile: long-context-no-spec
     kv_budget_tokens: 262144
+    adapter_options:
+      loadtime:
+        max_seq_length: 262144
+        mem_fraction_static: 0.90
+        served_model_name: Qwen/Qwen3.6-27B
+        attention_backend: triton
+        grammar_backend: xgrammar
+        reasoning_parser: qwen3
+        tool_call_parser: qwen3_coder
+        speculative:
+          enabled: true
+          algorithm: eagle
+          num_steps: 3
+          eagle_topk: 1
+          num_draft_tokens: 4
+        extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
+          - "--quantization"
+          - "fp8"
+          - "--mamba-scheduler-strategy"
+          - "extra_buffer"
+          - "--page-size"
+          - "64"
+      runtime:
+        first_chunk_timeout_s: 900
+        inter_chunk_timeout_s: 30
+        overall_timeout_s: 1800
+        default_sampling:
+          temperature: 0.7
+          top_p: 0.8
+          top_k: 20
+          presence_penalty: 1.5
+          min_new_tokens: 10
+        stop_tokens:
+          - "<|im_end|>"
+  # Grammar-safe twin of the measured 256K H100 launch. It preserves every
+  # load-time axis except EAGLE, which must be disabled for constrained decode.
+  long-context-no-spec:
+    extends: long-context
+    adapter_options:
+      loadtime:
+        max_seq_length: 262144
+        mem_fraction_static: 0.90
+        served_model_name: Qwen/Qwen3.6-27B
+        attention_backend: triton
+        grammar_backend: xgrammar
+        reasoning_parser: qwen3
+        tool_call_parser: qwen3_coder
+        speculative:
+          enabled: false
+        extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
+          - "--quantization"
+          - "fp8"
+          - "--mamba-scheduler-strategy"
+          - "extra_buffer"
+          - "--page-size"
+          - "64"
+  # Keep the already-released thinking route on its conservative non-speculative
+  # launch while the EAGLE + strict-thinking startup failure is resolved in the
+  # follow-up release. This block is standalone so its aliases can inherit it
+  # without inheriting the optimized non-thinking launch above.
+  long-context-thinking:
+    grammar_profile: long-context-thinking-no-spec
+    # Official Qwen3.6 thinking examples use max_tokens=81920.
+    max_output_tokens: 81920
+    max_batch_tokens: 262144
+    compute_precision: bfloat16
+    # SGLang 0.5.13's strict-thinking token filter prevents a premature EOS
+    # from leaving the whole answer inside the private reasoning channel.
+    adapter_path: sie_server.adapters.sglang.cuda13:SGLangStrictThinkingAdapter
+    kv_budget_tokens: 262144
+    chat_template_kwargs:
+      enable_thinking: true
     adapter_options:
       loadtime:
         max_seq_length: 262144
@@ -341,29 +419,6 @@ profiles:
         inter_chunk_timeout_s: 30
         overall_timeout_s: 1800
         default_sampling:
-          temperature: 0.7
-          top_p: 0.8
-          top_k: 20
-          presence_penalty: 1.5
-          min_new_tokens: 10
-        stop_tokens:
-          - "<|im_end|>"
-  # Same measured 256K launch/admission envelope with Qwen thinking enabled.
-  long-context-thinking:
-    extends: long-context
-    # Official Qwen3.6 thinking examples use max_tokens=81920.
-    max_output_tokens: 81920
-    # SGLang 0.5.13's strict-thinking token filter prevents a premature EOS
-    # from leaving the whole answer inside the private reasoning channel.
-    adapter_path: sie_server.adapters.sglang.cuda13:SGLangStrictThinkingAdapter
-    chat_template_kwargs:
-      enable_thinking: true
-    adapter_options:
-      runtime:
-        first_chunk_timeout_s: 900
-        inter_chunk_timeout_s: 30
-        overall_timeout_s: 1800
-        default_sampling:
           temperature: 1.0
           top_p: 0.95
           top_k: 20
@@ -371,53 +426,27 @@ profiles:
           min_new_tokens: 10
         stop_tokens:
           - "<|im_end|>"
+  # Dedicated constrained-decoding identity for the conservative thinking
+  # launch. It is intentionally identical until the optimized thinking
+  # follow-up has its own measured speculative/non-speculative pair.
+  long-context-thinking-no-spec:
+    extends: long-context-thinking
   # Hardware-explicit aliases for the exact H100-80GB native-window shape.
   # Machine placement remains a separate gateway decision; these names make
   # the validated context/GPU pairing discoverable to callers.
   h100-256k:
     extends: long-context
+    grammar_profile: long-context-no-spec
   h100-256k-thinking:
-    extends: long-context
-    max_output_tokens: 81920
-    adapter_path: sie_server.adapters.sglang.cuda13:SGLangStrictThinkingAdapter
-    chat_template_kwargs:
-      enable_thinking: true
-    adapter_options:
-      runtime:
-        first_chunk_timeout_s: 900
-        inter_chunk_timeout_s: 30
-        overall_timeout_s: 1800
-        default_sampling:
-          temperature: 1.0
-          top_p: 0.95
-          top_k: 20
-          presence_penalty: 0.0
-          min_new_tokens: 10
-        stop_tokens:
-          - "<|im_end|>"
+    extends: long-context-thinking
+    grammar_profile: long-context-thinking-no-spec
   # Explicit reasoning mode uses the validated native-window H100 lane. Qwen's
   # model card recommends at least 128K context for thinking; keeping this alias
   # on the 8K base lane would expose a mode that routinely truncates before its
   # private thought closes. The bare model remains non-thinking and answer-only.
   thinking:
-    extends: long-context
-    max_output_tokens: 81920
-    adapter_path: sie_server.adapters.sglang.cuda13:SGLangStrictThinkingAdapter
-    chat_template_kwargs:
-      enable_thinking: true
-    adapter_options:
-      runtime:
-        first_chunk_timeout_s: 900
-        inter_chunk_timeout_s: 30
-        overall_timeout_s: 1800
-        default_sampling:
-          temperature: 1.0
-          top_p: 0.95
-          top_k: 20
-          presence_penalty: 0.0
-          min_new_tokens: 10
-        stop_tokens:
-          - "<|im_end|>"
+    extends: long-context-thinking
+    grammar_profile: long-context-thinking-no-spec
   # Throughput profile (H100-80GB) — the flagship's batch story. The
   # ``default`` NEXTN-spec shape is latency-optimized single-stream and
   # throughput-FLAT (~44 tok/s aggregate c=1→32, effective batch ≈1 —

@@ -113,6 +113,20 @@ class TestIsModelCached:
 
         assert is_model_cached("BAAI/bge-m3", config) is True
 
+    def test_model_cached_requires_exact_revision_when_pinned(self, tmp_path: Path) -> None:
+        revision = "a" * 40
+        model_dir = tmp_path / "models--BAAI--bge-m3" / "snapshots" / revision
+        model_dir.mkdir(parents=True)
+        (model_dir / "config.json").write_text("{}")
+
+        config = CacheConfig(local_cache=tmp_path)
+
+        assert is_model_cached("BAAI/bge-m3", config, revision=revision) is True
+        assert is_model_cached("BAAI/bge-m3", config, revision="b" * 40) is False
+        assert is_model_cached("BAAI/bge-m3", config, revision="../outside") is False
+        assert is_model_cached("BAAI/bge-m3", config, revision="") is False
+        assert is_model_cached("BAAI/bge-m3", config, revision=".") is False
+
     def test_model_cached_empty_snapshot(self, tmp_path: Path) -> None:
         """Returns False for model with empty snapshot directory."""
         model_dir = tmp_path / "models--BAAI--bge-m3" / "snapshots" / "abc123"

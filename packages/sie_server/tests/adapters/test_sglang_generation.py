@@ -111,6 +111,43 @@ def test_mamba_scheduler_strategy_value(args: list[str], expected: str | None) -
     assert _mamba_scheduler_strategy_value(args) == expected
 
 
+def test_speculative_launch_args_support_qwen_eagle_and_gemma_assistant() -> None:
+    assert SGLangGenerationAdapter._speculative_launch_args(
+        {
+            "enabled": True,
+            "algorithm": "eagle",
+            "num_steps": 3,
+            "eagle_topk": 1,
+            "num_draft_tokens": 4,
+        }
+    ) == [
+        "--speculative-algorithm",
+        "EAGLE",
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+    ]
+    assert SGLangGenerationAdapter._speculative_launch_args(
+        {
+            "enabled": True,
+            "algorithm": "nextn",
+            "num_steps": 3,
+            "eagle_topk": 1,
+            "num_draft_tokens": 4,
+            "draft_model": "google/gemma-4-31B-it-assistant",
+            "draft_model_revision": "6" * 40,
+        }
+    )[-4:] == [
+        "--speculative-draft-model-path",
+        "google/gemma-4-31B-it-assistant",
+        "--speculative-draft-model-revision",
+        "6" * 40,
+    ]
+
+
 def test_unloaded_generate_raises(adapter) -> None:
     # ``generate`` is now an async generator function; the loaded-check
     # fires when we first try to drive the iterator, not at call time.

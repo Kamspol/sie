@@ -35,10 +35,10 @@ pub struct ModelInfoExtras {
     /// ``tasks.generate.grammar_profile`` from the model YAML — the name of a
     /// profile that grammar-constrained requests must be served on. When set,
     /// the chat/completions/generate handlers rewrite a grammar request's model
-    /// id to the ``{model}:{grammar_profile}`` variant unless an explicitly
-    /// requested, directly inheriting variant preserves the resolved
-    /// grammar-safe launch contract. ``None`` when the model has no ``generate``
-    /// task or does not declare the field (no rewrite).
+    /// id to the ``{model}:{grammar_profile}`` variant unless the requested
+    /// profile declares its own grammar-safe sibling or a directly inheriting
+    /// variant already preserves the resolved contract. ``None`` when the
+    /// model has no ``generate`` task or does not declare the field.
     pub grammar_profile: Option<String>,
     /// Direct ``profiles.<name>.extends`` relationships. The gateway keeps
     /// these only to evaluate explicit variants that inherit the configured
@@ -394,6 +394,8 @@ pub struct ModelConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProfileConfig {
     #[serde(default)]
+    pub kv_budget_tokens: Option<u32>,
+    #[serde(default)]
     pub adapter_path: Option<String>,
     #[serde(default)]
     pub max_batch_tokens: Option<u32>,
@@ -401,6 +403,15 @@ pub struct ProfileConfig {
     pub compute_precision: Option<String>,
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// Optional profile-scoped grammar fallback. This lets a concrete
+    /// long-context or thinking route name a non-speculative sibling that
+    /// preserves its launch shape instead of using the model-wide fallback.
+    #[serde(default)]
+    pub grammar_profile: Option<String>,
+    /// Per-profile tokenizer/chat mode overrides. Grammar fallbacks must
+    /// preserve these exactly so routing cannot switch thinking mode.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<serde_json::Value>,
     #[serde(default)]
     pub adapter_options: Option<serde_json::Value>,
     #[serde(default)]
@@ -502,10 +513,14 @@ impl ModelEntry {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CanonicalProfile {
+    pub kv_budget_tokens: Option<u32>,
     pub adapter_path: Option<String>,
     pub max_batch_tokens: Option<u32>,
     pub compute_precision: Option<String>,
+    pub max_output_tokens: Option<u32>,
     pub adapter_options: Option<serde_json::Value>,
+    pub grammar_profile: Option<String>,
+    pub chat_template_kwargs: Option<serde_json::Value>,
 }
 
 impl CanonicalProfile {
@@ -528,10 +543,14 @@ impl CanonicalProfile {
             .and_then(canonicalize_adapter_options);
 
         Self {
+            kv_budget_tokens: profile.kv_budget_tokens,
             adapter_path: profile.adapter_path.clone(),
             max_batch_tokens: profile.max_batch_tokens,
             compute_precision: profile.compute_precision.clone(),
+            max_output_tokens: profile.max_output_tokens,
             adapter_options,
+            grammar_profile: profile.grammar_profile.clone(),
+            chat_template_kwargs: profile.chat_template_kwargs.clone(),
         }
     }
 }
@@ -576,7 +595,10 @@ mod tests {
     #[test]
     fn test_canonical_profile_basic() {
         let profile = ProfileConfig {
+            kv_budget_tokens: None,
             max_output_tokens: None,
+            grammar_profile: None,
+            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": true})),
             adapter_path: Some("module:Adapter".into()),
             max_batch_tokens: Some(4096),
             compute_precision: Some("float16".into()),
@@ -587,13 +609,20 @@ mod tests {
         assert_eq!(canonical.adapter_path, Some("module:Adapter".into()));
         assert_eq!(canonical.max_batch_tokens, Some(4096));
         assert_eq!(canonical.compute_precision, Some("float16".into()));
+        assert_eq!(
+            canonical.chat_template_kwargs,
+            Some(serde_json::json!({"enable_thinking": true}))
+        );
         assert!(canonical.adapter_options.is_none());
     }
 
     #[test]
     fn test_canonical_profile_strips_null_only_options() {
         let profile = ProfileConfig {
+            kv_budget_tokens: None,
             max_output_tokens: None,
+            grammar_profile: None,
+            chat_template_kwargs: None,
             adapter_path: Some("mod:A".into()),
             max_batch_tokens: None,
             compute_precision: None,
@@ -607,7 +636,10 @@ mod tests {
     #[test]
     fn test_canonical_profile_strips_false_only_options() {
         let profile = ProfileConfig {
+            kv_budget_tokens: None,
             max_output_tokens: None,
+            grammar_profile: None,
+            chat_template_kwargs: None,
             adapter_path: Some("mod:A".into()),
             max_batch_tokens: None,
             compute_precision: None,
@@ -622,7 +654,10 @@ mod tests {
     fn test_canonical_profile_keeps_meaningful_options() {
         let opts = serde_json::json!({"batch_size": 32, "key": null});
         let profile = ProfileConfig {
+            kv_budget_tokens: None,
             max_output_tokens: None,
+            grammar_profile: None,
+            chat_template_kwargs: None,
             adapter_path: Some("mod:A".into()),
             max_batch_tokens: None,
             compute_precision: None,
@@ -636,7 +671,10 @@ mod tests {
     #[test]
     fn test_canonical_profile_drops_empty_nested_option_maps() {
         let profile = ProfileConfig {
+            kv_budget_tokens: None,
             max_output_tokens: None,
+            grammar_profile: None,
+            chat_template_kwargs: None,
             adapter_path: Some("mod:A".into()),
             max_batch_tokens: None,
             compute_precision: None,
@@ -672,7 +710,10 @@ mod tests {
 
         let canonicalize = |opts: &serde_json::Value| {
             CanonicalProfile::from_profile(&ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("mod:A".into()),
                 max_batch_tokens: None,
                 compute_precision: None,
@@ -731,7 +772,10 @@ mod tests {
     #[test]
     fn test_canonical_profile_keeps_nonzero_numbers() {
         let profile = ProfileConfig {
+            kv_budget_tokens: None,
             max_output_tokens: None,
+            grammar_profile: None,
+            chat_template_kwargs: None,
             adapter_path: Some("mod:A".into()),
             max_batch_tokens: None,
             compute_precision: None,
@@ -745,7 +789,10 @@ mod tests {
     #[test]
     fn test_canonical_profile_equality() {
         let p1 = ProfileConfig {
+            kv_budget_tokens: None,
             max_output_tokens: None,
+            grammar_profile: None,
+            chat_template_kwargs: None,
             adapter_path: Some("mod:A".into()),
             max_batch_tokens: Some(4096),
             compute_precision: None,

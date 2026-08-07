@@ -250,6 +250,7 @@ def _expand_profile_variants(configs: dict[str, ModelConfig]) -> None:
                     chat_template_kwargs=(
                         dict(resolved.chat_template_kwargs) if resolved.chat_template_kwargs is not None else None
                     ),
+                    grammar_profile=resolved.grammar_profile,
                 )
             else:
                 variant_default = profile.model_copy(update={"extends": None})

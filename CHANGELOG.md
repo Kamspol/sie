@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.28
+
+- chore(release): refresh locks and generated sources
+- chore(main): release 0.6.28
+- fix(server): stage drafts for local models
+- fix(server): pin speculative draft launches
+- feat(server): optimize non-thinking generation profiles
+
 ## v0.6.27
 
 - chore(release): refresh locks and generated sources

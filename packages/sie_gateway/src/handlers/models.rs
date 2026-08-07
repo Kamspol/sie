@@ -358,7 +358,10 @@ mod route_tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -387,7 +390,10 @@ mod route_tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -398,7 +404,10 @@ mod route_tests {
         profiles.insert(
             "candle".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some(
                     "sie_server_rust.adapters.candle:CandleEmbeddingAdapter".to_string(),
                 ),
@@ -429,7 +438,10 @@ mod route_tests {
         profiles.insert(
             "candle".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some(
                     "sie_server_rust.adapters.candle:CandleEmbeddingAdapter".to_string(),
                 ),
@@ -533,7 +545,10 @@ mod route_tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -551,7 +566,10 @@ mod route_tests {
         profiles.insert(
             "a100".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("module:Adapter".to_string()),
                 max_batch_tokens: Some(8192),
                 compute_precision: None,

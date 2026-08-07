@@ -306,7 +306,10 @@ mod tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some(
                     "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
                         .to_string(),
@@ -323,7 +326,10 @@ mod tests {
         profiles.insert(
             "fp8".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some(
                     "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
                         .to_string(),

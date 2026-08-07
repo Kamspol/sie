@@ -1088,7 +1088,7 @@ class TestKvBudgetTokensValidator:
 
 
 class TestGrammarProfile:
-    """``tasks.generate.grammar_profile`` validation (grammar-request routing)."""
+    """Model- and profile-scoped grammar-request routing validation."""
 
     @staticmethod
     def _config(grammar_profile: str | None, *, with_no_spec: bool = True) -> ModelConfig:
@@ -1097,6 +1097,7 @@ class TestGrammarProfile:
                 adapter_path="sie_server.adapters.test:TestAdapter",
                 max_batch_tokens=8192,
                 kv_budget_tokens=1024,
+                adapter_options=AdapterOptions(loadtime={"speculative": {"enabled": True}}),
             ),
         }
         if with_no_spec:
@@ -1104,6 +1105,7 @@ class TestGrammarProfile:
                 adapter_path="sie_server.adapters.test:TestAdapter",
                 max_batch_tokens=8192,
                 kv_budget_tokens=1024,
+                adapter_options=AdapterOptions(loadtime={"speculative": {"enabled": False}}),
             )
         return ModelConfig(
             sie_id="gen-model",
@@ -1129,6 +1131,87 @@ class TestGrammarProfile:
     def test_grammar_profile_default_rejected(self) -> None:
         with pytest.raises(ValidationError, match="must not be 'default'"):
             self._config("default")
+
+    def test_global_grammar_profile_rejects_chained_target(self) -> None:
+        config = self._config("no-spec")
+        config.profiles["safe-2"] = ProfileConfig(
+            adapter_path="sie_server.adapters.test:TestAdapter",
+            max_batch_tokens=8192,
+            kv_budget_tokens=1024,
+            adapter_options=AdapterOptions(loadtime={"speculative": {"enabled": False}}),
+        )
+        config.profiles["no-spec"].grammar_profile = "safe-2"
+        with pytest.raises(ValidationError, match="must not declare another grammar_profile"):
+            ModelConfig.model_validate(config.model_dump())
+
+    def test_global_grammar_profile_must_not_enable_speculation(self) -> None:
+        config = self._config("no-spec")
+        config.profiles["no-spec"].adapter_options = AdapterOptions(loadtime={"speculative": {"enabled": True}})
+        with pytest.raises(ValidationError, match="must not enable speculation"):
+            ModelConfig.model_validate(config.model_dump())
+
+    def test_profile_scoped_grammar_profile_is_local_and_resolves(self) -> None:
+        config = self._config("no-spec")
+        config.profiles["fast"] = ProfileConfig(
+            extends="default",
+            grammar_profile="no-spec",
+            kv_budget_tokens=1024,
+        )
+        config = ModelConfig.model_validate(config.model_dump())
+
+        assert config.resolve_profile("fast").grammar_profile == "no-spec"
+        assert config.resolve_profile("no-spec").grammar_profile is None
+
+    def test_profile_scoped_grammar_profile_does_not_require_global_fallback(self) -> None:
+        config = self._config(None)
+        config.profiles["fast"] = ProfileConfig(
+            extends="default",
+            grammar_profile="no-spec",
+            kv_budget_tokens=1024,
+        )
+        config = ModelConfig.model_validate(config.model_dump())
+
+        assert config.tasks.generate is not None
+        assert config.tasks.generate.grammar_profile is None
+        assert config.resolve_profile("fast").grammar_profile == "no-spec"
+
+    def test_unknown_profile_scoped_grammar_profile_rejected(self) -> None:
+        config = self._config("no-spec")
+        config.profiles["fast"] = ProfileConfig(
+            extends="default",
+            grammar_profile="missing",
+            kv_budget_tokens=1024,
+        )
+        with pytest.raises(ValidationError, match="Profile 'fast' grammar_profile 'missing' is not defined"):
+            ModelConfig.model_validate(config.model_dump())
+
+    def test_profile_scoped_grammar_profile_preserves_thinking_mode(self) -> None:
+        config = self._config("no-spec")
+        config.profiles["fast"] = ProfileConfig(
+            extends="default",
+            grammar_profile="no-spec",
+            kv_budget_tokens=1024,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        with pytest.raises(ValidationError, match="tokenizer mode"):
+            ModelConfig.model_validate(config.model_dump())
+
+    def test_default_profile_scoped_grammar_profile_rejected(self) -> None:
+        config = self._config("no-spec")
+        config.profiles["default"].grammar_profile = "no-spec"
+        with pytest.raises(ValidationError, match=r"Profile 'default' must use tasks\.generate\.grammar_profile"):
+            ModelConfig.model_validate(config.model_dump())
+
+    @pytest.mark.parametrize("target", ["default", "fast"])
+    def test_profile_scoped_grammar_profile_rejects_default_or_self(self, target: str) -> None:
+        config = self._config("no-spec")
+        config.profiles["fast"] = ProfileConfig(
+            extends="default",
+            grammar_profile=target,
+            kv_budget_tokens=1024,
+        )
+        with pytest.raises(ValidationError, match="must name a non-default sibling"):
+            ModelConfig.model_validate(config.model_dump())
 
 
 class TestLoraRevisionPins:
@@ -1203,3 +1286,36 @@ class TestLoraRevisionPins:
             }
         )
         assert config.lora_revisions() == {"acme/l": self.SHA_A}
+
+
+class TestSpeculativeDraftRevisionPins:
+    SHA_A = "a" * 40
+    SHA_B = "b" * 40
+
+    @staticmethod
+    def _profile(draft_model: str, revision: str | None) -> ProfileConfig:
+        speculative = {"enabled": True, "algorithm": "nextn", "draft_model": draft_model}
+        if revision is not None:
+            speculative["draft_model_revision"] = revision
+        return ProfileConfig(
+            adapter_path="mod:Cls",
+            max_batch_tokens=8192,
+            adapter_options=AdapterOptions(loadtime={"speculative": speculative}),
+        )
+
+    def test_pinned_draft_is_accepted_and_surfaced(self) -> None:
+        config = _make_config(profiles={"default": self._profile("acme/draft", self.SHA_A)})
+        assert config.speculative_draft_revisions() == {"acme/draft": self.SHA_A}
+
+    def test_moving_draft_revision_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="40-char commit SHA"):
+            self._profile("acme/draft", "main")
+
+    def test_conflicting_draft_pins_are_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="two different revisions"):
+            _make_config(
+                profiles={
+                    "default": self._profile("acme/draft", self.SHA_A),
+                    "other": self._profile("acme/draft", self.SHA_B),
+                }
+            )

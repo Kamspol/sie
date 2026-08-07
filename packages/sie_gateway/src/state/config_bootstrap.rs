@@ -841,7 +841,10 @@ mod tests {
             profiles: HashMap::from([(
                 "default".to_string(),
                 crate::types::model::ProfileConfig {
+                    kv_budget_tokens: None,
                     max_output_tokens: None,
+                    grammar_profile: None,
+                    chat_template_kwargs: None,
                     adapter_path: Some(
                         "sie_server.adapters.sentence_transformer:Adapter".to_string(),
                     ),

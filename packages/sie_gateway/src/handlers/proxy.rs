@@ -6686,10 +6686,11 @@ async fn resolve_generation_route(
 /// out-of-schema keys, truncates mid-JSON), so a model whose default profile is
 /// speculative points ``grammar_profile`` at a non-speculative profile. The
 /// target is resolved off the request's *base* model
-/// (``ModelRegistry::grammar_route_variant``), so an explicit sibling-variant
-/// id (``…:a100-40gb``, also speculative) reroutes to ``{base}:{grammar_profile}``
-/// too, and the grammar-safe variant itself is a no-op (same bundle/pool/lane —
-/// only the worker-loaded model changes). Call this BEFORE the capability/LoRA
+/// (``ModelRegistry::grammar_route_variant``). An explicit sibling variant may
+/// name a profile-scoped non-speculative twin that preserves its context,
+/// hardware launch shape, and thinking mode; otherwise it uses the model-wide
+/// fallback. The grammar-safe variant itself is a no-op (same bundle/pool/lane
+/// — only the worker-loaded model changes). Call this BEFORE the capability/LoRA
 /// gates and resolve those gates against the routed variant: the variant
 /// preserves the base capabilities but narrows the profile-scoped LoRA
 /// allow-list, so a gate run against the base would accept an adapter the
@@ -14287,7 +14288,10 @@ mod tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -19795,7 +19799,10 @@ mod tests {
 
         let registry = empty_registry();
         let mk = || ProfileConfig {
+            kv_budget_tokens: None,
             max_output_tokens: None,
+            grammar_profile: None,
+            chat_template_kwargs: None,
             adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
             max_batch_tokens: Some(4096),
             compute_precision: None,
@@ -19806,7 +19813,11 @@ mod tests {
         profiles.insert("default".to_string(), mk());
         // A non-`default` profile expands into the `org/g:no-spec` variant
         // entry that grammar routing dispatches to.
-        profiles.insert("no-spec".to_string(), mk());
+        let mut no_spec = mk();
+        no_spec.adapter_options = Some(serde_json::json!({
+            "loadtime": {"speculative": {"enabled": false}},
+        }));
+        profiles.insert("no-spec".to_string(), no_spec);
         // `tasks.generate.grammar_profile: no-spec` is what surfaces on
         // `info_extras.grammar_profile` — the field the handlers read.
         let tasks: serde_yaml::Value = serde_yaml::from_str(
@@ -19884,7 +19895,10 @@ mod tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
@@ -19925,7 +19939,10 @@ mod tests {
 
         let registry = empty_registry();
         let default_profile = ProfileConfig {
+            kv_budget_tokens: None,
             max_output_tokens: None,
+            grammar_profile: None,
+            chat_template_kwargs: None,
             adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
             max_batch_tokens: Some(4096),
             compute_precision: None,
@@ -19935,12 +19952,18 @@ mod tests {
             extends: None,
         };
         let nospec_profile = ProfileConfig {
+            kv_budget_tokens: None,
             max_output_tokens: None,
+            grammar_profile: None,
+            chat_template_kwargs: None,
             adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
             max_batch_tokens: Some(4096),
             compute_precision: None,
             adapter_options: Some(serde_json::json!({
-                "loadtime": { "lora_paths": { "a2": "org/a2" } }
+                "loadtime": {
+                    "lora_paths": { "a2": "org/a2" },
+                    "speculative": { "enabled": false }
+                }
             })),
             extends: None,
         };
@@ -19999,7 +20022,10 @@ mod tests {
         profiles.insert(
             "default".to_string(),
             ProfileConfig {
+                kv_budget_tokens: None,
                 max_output_tokens: None,
+                grammar_profile: None,
+                chat_template_kwargs: None,
                 adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
