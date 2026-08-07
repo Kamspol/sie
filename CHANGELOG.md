@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.30
+
+- chore(release): refresh locks and generated sources
+- chore(main): release 0.6.30
+- perf(models): accelerate Qwen thinking inference
+
 ## v0.6.29
 
 - chore(release): refresh locks and generated sources

@@ -238,6 +238,28 @@ def test_qwen36_native_window_uses_measured_cuda13_eagle_shape() -> None:
     ]
 
 
+def test_qwen36_thinking_native_window_uses_measured_cuda13_shape() -> None:
+    config = ModelConfig.model_validate(yaml.safe_load(_QWEN36_MODEL_PATH.read_text()))
+    profile = config.resolve_profile("long-context-thinking")
+
+    assert profile.adapter_path == _STRICT_THINKING_ADAPTER
+    assert profile.max_batch_tokens == 262144
+    assert profile.kv_budget_tokens == 262144
+    assert profile.loadtime["max_seq_length"] == 262144
+    assert profile.loadtime["mem_fraction_static"] == 0.95
+    assert "disable_cuda_graph" not in profile.loadtime
+    assert profile.loadtime["speculative"] == {"enabled": False}
+    assert profile.loadtime["extra_launch_args"] == [
+        *_MM_PROCESS_CONFIG_ARGS,
+        "--quantization",
+        "fp8",
+        "--mamba-scheduler-strategy",
+        "extra_buffer",
+        "--page-size",
+        "64",
+    ]
+
+
 def test_qwen36_native_window_grammar_twins_preserve_launch_shape_and_mode() -> None:
     config = ModelConfig.model_validate(yaml.safe_load(_QWEN36_MODEL_PATH.read_text()))
 

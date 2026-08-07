@@ -378,10 +378,11 @@ profiles:
           - "extra_buffer"
           - "--page-size"
           - "64"
-  # Keep the already-released thinking route on its conservative non-speculative
-  # launch while the EAGLE + strict-thinking startup failure is resolved in the
-  # follow-up release. This block is standalone so its aliases can inherit it
-  # without inheriting the optimized non-thinking launch above.
+  # Keep thinking non-speculative for strict-reasoning correctness, but use the
+  # separately measured CUDA-graph + overlap launch. Exact H100-80GB standalone
+  # and gateway/NATS validation covered sustained churn, cache boundaries,
+  # cancellation/recovery, and near-window prefill plus decode. This block is
+  # standalone so its aliases inherit only the validated thinking shape.
   long-context-thinking:
     grammar_profile: long-context-thinking-no-spec
     # Official Qwen3.6 thinking examples use max_tokens=81920.
@@ -399,7 +400,6 @@ profiles:
         max_seq_length: 262144
         mem_fraction_static: 0.95
         served_model_name: Qwen/Qwen3.6-27B
-        disable_cuda_graph: true
         attention_backend: triton
         grammar_backend: xgrammar
         reasoning_parser: qwen3
@@ -413,7 +413,8 @@ profiles:
           - "fp8"
           - "--mamba-scheduler-strategy"
           - "extra_buffer"
-          - "--disable-overlap-schedule"
+          - "--page-size"
+          - "64"
       runtime:
         first_chunk_timeout_s: 900
         inter_chunk_timeout_s: 30
@@ -426,9 +427,9 @@ profiles:
           min_new_tokens: 10
         stop_tokens:
           - "<|im_end|>"
-  # Dedicated constrained-decoding identity for the conservative thinking
-  # launch. It is intentionally identical until the optimized thinking
-  # follow-up has its own measured speculative/non-speculative pair.
+  # Dedicated constrained-decoding identity for the non-speculative thinking
+  # launch. It is intentionally identical because the optimized parent also
+  # remains non-speculative and grammar-safe.
   long-context-thinking-no-spec:
     extends: long-context-thinking
   # Hardware-explicit aliases for the exact H100-80GB native-window shape.

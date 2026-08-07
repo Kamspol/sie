@@ -117,11 +117,11 @@ def test_long_context_thinking_profile_preserves_256k_contract(
     assert thinking.tasks.generate.max_output_tokens == expected_thinking_cap
     assert non_thinking.max_sequence_length == thinking.max_sequence_length == 262144
     if model_id == "Qwen/Qwen3.6-27B":
-        # Keep the conservative Qwen thinking launch until its speculative path
-        # passes the separate correctness gate.
+        # Qwen thinking remains non-speculative while using its separately
+        # measured CUDA-graph launch.
         assert non_thinking.resolve_profile("default").loadtime["speculative"]["enabled"] is True
         assert thinking.resolve_profile("default").loadtime["speculative"] == {"enabled": False}
-        assert thinking.resolve_profile("default").loadtime["disable_cuda_graph"] is True
+        assert "disable_cuda_graph" not in thinking.resolve_profile("default").loadtime
     else:
         assert non_thinking.resolve_profile("default").loadtime == thinking.resolve_profile("default").loadtime
     assert non_thinking.resolve_profile("default").kv_budget_tokens == 262144
