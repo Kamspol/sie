@@ -1,6 +1,6 @@
 [project]
 name = "sie-server"
-version = "0.7.0"
+version = "0.7.1"
 description = "Search Inference Engine - GPU inference server for search workloads"
 requires-python = ">=3.12,<3.13"
 license = { text = "Apache-2.0" }
@@ -52,8 +52,9 @@ dependencies = [
     # PINNED TO THE ARTIFACT REVISION, NOT FLOATED (#2872). Docling resolves
     # its RapidOCR det/cls/rec files by a version-specific path table, so the
     # library version and the immutable artifact revision pinned in
-    # models/docling.yaml (superlinked/docling-artifacts @ 6281da32, the
-    # "Docling 2.99 inference artifacts" commit) are ONE compatibility pair.
+    # models/docling.yaml (superlinked/docling-artifacts @ 310479be, which
+    # republishes the Docling 2.99 inference artifacts with BOTH the English
+    # and Chinese RapidOCR sets, #2919) are ONE compatibility pair.
     # A floating '>=2,<3' let the Linux resolution drift to 2.116, whose table
     # asks for PP-OCRv6 while the committed artifacts ship PP-OCRv4 only —
     # docling then failed to load on BOTH profiles. Moving this range requires

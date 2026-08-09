@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.7.1
+
+- chore(release): refresh locks and generated sources
+- chore(main): release 0.7.1
+- fix(server): meter executed GLiNER token window
+- test(bench): gate docling OCR on measured English-recogniser floors
+- test(server): scope the OCR smoke floor to what it provably catches
+- test(server): assert the adapter error channel in the OCR smoke test
+- feat(server): serve docling OCR with the English recogniser
+
 ## v0.7.0
 
 - chore(release): refresh locks and generated sources

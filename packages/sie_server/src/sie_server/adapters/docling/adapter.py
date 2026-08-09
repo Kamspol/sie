@@ -390,15 +390,25 @@ class DoclingAdapter(BaseAdapter):
         accelerator_options = self._build_accelerator_options()
 
         from docling.datamodel.base_models import InputFormat  # ty: ignore[unresolved-import]
-        from docling.datamodel.pipeline_options import PdfPipelineOptions  # ty: ignore[unresolved-import]
+        from docling.datamodel.pipeline_options import (  # ty: ignore[unresolved-import]
+            PdfPipelineOptions,
+            RapidOcrOptions,
+        )
         from docling.document_converter import ImageFormatOption, PdfFormatOption  # ty: ignore[unresolved-import]
 
         # Pass do_ocr explicitly on both paths. Docling's PdfPipelineOptions defaults
         # do_ocr=True, so an unset default would silently OCR every PDF and make the
         # `ocr` profile a no-op vs. the default profile.
+        #
+        # The OCR language is pinned to English (#2919, #2441 Decision 3): with no
+        # ocr_options, RapidOcrOptions' `["chinese"]` default applied and English
+        # pages came back word-joined ("Documentreference"). The pinned artifact
+        # revision ships BOTH language sets, so this stays a one-line flip if the
+        # served traffic mix ever argues for CJK.
         pdf_kwargs: dict[str, Any] = {
             "do_ocr": ocr_enabled,
             "document_timeout": self._document_timeout_s,
+            "ocr_options": RapidOcrOptions(lang=["en"]),
         }
         artifacts_path = self._artifacts_path or self._package_artifact_root
         if artifacts_path is not None:

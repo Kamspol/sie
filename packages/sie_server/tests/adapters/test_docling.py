@@ -562,7 +562,13 @@ class TestDoclingMakeConverter:
         ):
             adapter._make_converter(ocr_enabled=False)
 
-        mock_opts.assert_called_once_with(do_ocr=False, document_timeout=90.0)
+        mock_opts.assert_called_once()
+        kwargs = mock_opts.call_args.kwargs
+        assert kwargs["do_ocr"] is False
+        assert kwargs["document_timeout"] == 90.0
+        # #2919: the recogniser language is pinned, never docling's ["chinese"]
+        # default — word-joined English output was a defect on a billed profile.
+        assert kwargs["ocr_options"].lang == ["en"]
         mock_fmt_opt.assert_called_once()
         mock_cls.assert_called_once()
         assert "format_options" in mock_cls.call_args.kwargs
@@ -578,7 +584,13 @@ class TestDoclingMakeConverter:
         ):
             adapter._make_converter(ocr_enabled=True)
 
-        mock_opts.assert_called_once_with(do_ocr=True, document_timeout=90.0)
+        mock_opts.assert_called_once()
+        kwargs = mock_opts.call_args.kwargs
+        assert kwargs["do_ocr"] is True
+        assert kwargs["document_timeout"] == 90.0
+        # #2919: the OCR profile serves the English RapidOCR set from the pinned
+        # artifact revision; both language sets ship, so this stays a data flip.
+        assert kwargs["ocr_options"].lang == ["en"]
         mock_fmt_opt.assert_called_once()
         mock_cls.assert_called_once()
         assert "format_options" in mock_cls.call_args.kwargs

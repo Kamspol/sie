@@ -1,6 +1,6 @@
 sie_id: docling
 hf_id: superlinked/docling-artifacts
-hf_revision: 6281da328c88328d2b36af759ff19d470b4f7411
+hf_revision: 310479be56f3a99a0fea75d930e11eea38bf5ef7
 inputs:
   text: false
   image: true

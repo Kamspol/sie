@@ -28,6 +28,8 @@ from sie_server.types.responses import Entity
 
 # Error messages
 _ERR_REQUIRES_LABELS = "GLiNER requires labels parameter for extraction"
+_ERR_REQUIRES_NON_BLANK_TEXT = "GLiNER requires non-blank text for extraction"
+_ERR_PROMPT_EXHAUSTS_DOCUMENT = "GLiNER label prompt leaves no document tokens for extraction"
 
 
 class GLiNERAdapter(BaseAdapter):
@@ -171,6 +173,13 @@ class GLiNERAdapter(BaseAdapter):
 
         # Extract texts from all items
         texts = [self._extract_text(item) for item in items]
+        if any(not text.strip() for text in texts):
+            raise ValueError(_ERR_REQUIRES_NON_BLANK_TEXT)
+
+        # Meter the exact post-word-truncation document window before GPU work.
+        # Besides producing the authoritative terminal counts, this rejects a
+        # finite-tokenizer prompt that leaves no represented document subword.
+        input_token_counts = self._doc_input_token_counts(texts, labels)
 
         # Get options with fallback to model defaults
         opts = options or {}
@@ -210,38 +219,82 @@ class GLiNERAdapter(BaseAdapter):
 
             all_entities.append(entity_results)
 
-        return ExtractOutput(entities=all_entities, input_token_counts=self._doc_input_token_counts(texts))
+        return ExtractOutput(entities=all_entities, input_token_counts=input_token_counts)
 
-    def _doc_input_token_counts(self, texts: list[str]) -> list[int] | None:
-        """Real per-document input-token counts for the unit meter (§7.3).
+    def _doc_input_token_counts(self, texts: list[str], labels: list[str]) -> list[int] | None:
+        """Count the document subwords represented by GLiNER's real processor.
 
-        GLiNER's ``inference`` owns tokenization opaquely, so we recover the
-        billable count by running each document through the model's own
-        transformer tokenizer (``data_processor.transformer_tokenizer``) — the
-        same subword vocabulary the forward pass uses. We count the DOCUMENT
-        tokens only; the entity-type label prompt is request schema (re-used
-        across docs, not billed content), matching "$ per 1M input tokens" over
-        the document (§7.1). Best-effort: any tokenizer-shape quirk returns
-        ``None`` so the meter falls back to its reserve estimate rather than
-        billing an approximation as a count.
+        Classic GLiNER first splits and truncates each document in WORDS, then
+        prepends the label prompt and transformer-tokenizes that retained word
+        window. Tokenizing the original string separately therefore counts
+        discarded tail text and is not an authoritative execution meter.
+
+        Delegate splitting, processor-specific truncation, label mapping, and
+        prompt construction to the pinned GLiNER processor. ``word_ids`` then
+        identifies every represented document subword while excluding prompt
+        words. Attention masking excludes padding; tokenizer specials remain
+        billable, matching the existing document-token contract. Batches match
+        GLiNER inference's default batch size so a finite tokenizer cap is
+        observed identically.
         """
         processor = getattr(self._model, "data_processor", None)
-        tokenizer = getattr(processor, "transformer_tokenizer", None)
-        if tokenizer is None:
+        prepare_inputs = getattr(self._model, "prepare_inputs", None)
+        prepare_base_input = getattr(self._model, "prepare_base_input", None)
+        if processor is None or prepare_inputs is None or prepare_base_input is None:
             return None
-        # Cap truncation at the tokenizer's own ``model_max_length`` when it
-        # declares a plausible one; HF sets an ``int(1e30)`` sentinel for
-        # uncapped tokenizers, which we treat as "no cap" (documents are short
-        # relative to that and counting the full length is still authoritative).
-        raw_max = getattr(tokenizer, "model_max_length", None)
-        max_length = raw_max if isinstance(raw_max, int) and 0 < raw_max < 1_000_000 else None
+
         try:
-            encoded = tokenizer(texts, truncation=max_length is not None, max_length=max_length)
-            counts = [len(ids) for ids in encoded["input_ids"]]
+            split_texts, _, _ = prepare_inputs(texts)
+            raw_items = prepare_base_input(split_texts)
+            counts: list[int] = []
+            has_document_subwords: list[bool] = []
+            for start in range(0, len(raw_items), 8):
+                raw_batch = processor.collate_raw_batch(
+                    raw_items[start : start + 8],
+                    entity_types=labels,
+                )
+                retained_words = raw_batch["tokens"]
+                entity_mappings = raw_batch["classes_to_id"]
+                encoded = processor.tokenize_inputs(retained_words, entity_mappings)
+                for batch_index in range(len(retained_words)):
+                    word_ids = encoded.word_ids(batch_index)
+                    attention_mask = encoded["attention_mask"][batch_index].tolist()
+                    words_mask = encoded["words_mask"][batch_index].tolist()
+                    if len(word_ids) != len(attention_mask) or len(word_ids) != len(words_mask):
+                        return None
+                    first_document_index = next(
+                        (index for index, word_mask in enumerate(words_mask) if word_mask > 0),
+                        None,
+                    )
+                    first_document_word_id = (
+                        word_ids[first_document_index] if first_document_index is not None else None
+                    )
+                    represented_document = [
+                        bool(
+                            attended
+                            and first_document_word_id is not None
+                            and word_id is not None
+                            and word_id >= first_document_word_id
+                        )
+                        for attended, word_id in zip(attention_mask, word_ids)
+                    ]
+                    has_document_subwords.append(any(represented_document))
+                    counts.append(
+                        sum(
+                            bool(attended)
+                            and (
+                                word_id is None
+                                or (first_document_word_id is not None and word_id >= first_document_word_id)
+                            )
+                            for attended, word_id in zip(attention_mask, word_ids)
+                        )
+                    )
         except Exception:  # noqa: BLE001 — metering must never fail an extraction
             return None
-        if len(counts) != len(texts):
+        if len(counts) != len(texts) or len(has_document_subwords) != len(texts):
             return None
+        if not all(has_document_subwords):
+            raise ValueError(_ERR_PROMPT_EXHAUSTS_DOCUMENT)
         return counts
 
     def _merge_entities(self, entities: list[Entity], text: str) -> list[Entity]:
