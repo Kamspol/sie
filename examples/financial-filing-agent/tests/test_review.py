@@ -130,15 +130,18 @@ def test_gliner_gate_requires_all_primary_source_amounts() -> None:
 def test_table_row_context_keeps_heading_and_isolates_requested_row() -> None:
     source = (
         "## Restated Form 10-K/A. Three Months Ended June 30, 2023 "
-        "| Net income | $45,096 | $36,080 | | Diluted | $1.68 | $1.34 |"
+        "| Metric | Original | Adjustment | Restated | | --- | --- | --- | --- | "
+        "| Net income | $45,096 | $(9,016) | $36,080 | | Diluted | $1.68 | | $1.34 | "
+        "| Basic | $1.60 | | $1.20 |"
     )
 
     context = _table_row_context(source, "Diluted")
 
     assert "Restated Form 10-K/A" in context
     assert "Three Months Ended June 30, 2023" in context
-    assert "| Diluted | $1.68 | $1.34 |" in context
+    assert "| Diluted | $1.68 | | $1.34 |" in context
     assert "Net income" not in context
+    assert "Basic" not in context
 
 
 def test_docling_line_breaks_do_not_split_source_sections() -> None:

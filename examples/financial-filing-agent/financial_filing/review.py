@@ -201,7 +201,15 @@ def _table_row_context(text: str, row_label: str) -> str:
         raise RuntimeError(f"The source table omitted the {row_label} row")
     header_end = text.find("|")
     header = text[:header_end].strip() if 0 <= header_end < row_start else ""
-    return f"{header} {text[row_start:]}".strip()
+    separator = re.search(r"\|\s*\|\s*-{3,}", text)
+    if separator is None or header_end < 0 or separator.start() >= row_start:
+        raise RuntimeError(f"The source table omitted its header before the {row_label} row")
+    column_count = len(text[header_end : separator.start() + 1].split("|")) - 2
+    row_pipe_offsets = [match.start() for match in re.finditer(r"\|", text[row_start:])]
+    if column_count < 1 or len(row_pipe_offsets) <= column_count:
+        raise RuntimeError(f"The source table returned an incomplete {row_label} row")
+    row_end = row_start + row_pipe_offsets[column_count] + 1
+    return f"{header} {text[row_start:row_end]}".strip()
 
 
 def _table_source_values(text: str, row_label: str) -> tuple[str, str]:

@@ -18,7 +18,7 @@ from agents.tool_context import ToolContext
 from pydantic import BaseModel
 
 from contract_review_agent import tools as contract_tools
-from contract_review_agent.native_model import SIENativeModel
+from contract_review_agent.native_model import SIENativeModel, _next_required_tool
 from contract_review_agent.runtime import AppContext, GenResult, Ledger, instruct_once
 
 set_tracing_disabled(True)
@@ -89,7 +89,7 @@ async def test_agents_runner_executes_native_tool_turn_then_finishes() -> None:
             "Qwen/Qwen3.5-4B",
             client,  # type: ignore[arg-type]
             provision_timeout_s=30,
-            required_tool_sequence=("echo",),
+            required_tool_sequence=(("echo", None),),
         ),
         tools=[echo],
     )
@@ -104,6 +104,37 @@ async def test_agents_runner_executes_native_tool_turn_then_finishes() -> None:
     assert len(second_schema["oneOf"]) == 2
     assert "[tool echo]\nCLAUSE" in client.calls[1]["prompt"]
     assert client.calls[1]["kwargs"]["wait_for_capacity"] is True
+
+
+def test_required_search_steps_only_advance_on_the_expected_query() -> None:
+    sequence = (
+        ("search_clauses", "automatic renewal"),
+        ("search_clauses", "termination"),
+        ("analyze_clause_risks", None),
+    )
+    repeated_query = [
+        {
+            "type": "function_call",
+            "name": "search_clauses",
+            "arguments": json.dumps({"query": "automatic renewal"}),
+        },
+        {
+            "type": "function_call",
+            "name": "search_clauses",
+            "arguments": json.dumps({"query": "automatic renewal"}),
+        },
+    ]
+    distinct_queries = [
+        repeated_query[0],
+        {
+            "type": "function_call",
+            "name": "search_clauses",
+            "arguments": json.dumps({"query": "termination"}),
+        },
+    ]
+
+    assert _next_required_tool(sequence, repeated_query) == "search_clauses"
+    assert _next_required_tool(sequence, distinct_queries) == "analyze_clause_risks"
 
 
 class Risk(BaseModel):

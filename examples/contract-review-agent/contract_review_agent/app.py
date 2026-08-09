@@ -63,16 +63,16 @@ field, use "unknown" (or false for `executed`). Make key_obligations and risk_fl
 specific and grounded in the findings, and give a clear recommendation."""
 
 _INVESTIGATOR_TOOL_SEQUENCE = (
-    "classify_document",
-    "ocr_signature_page",
-    "extract_entities",
-    "read_signature_page",
-    "search_clauses",
-    "search_clauses",
-    "search_clauses",
-    "search_clauses",
-    "analyze_clause_risks",
-    "query_obligations_db",
+    ("classify_document", None),
+    ("ocr_signature_page", None),
+    ("extract_entities", None),
+    ("read_signature_page", None),
+    ("search_clauses", "automatic renewal"),
+    ("search_clauses", "limitation of liability"),
+    ("search_clauses", "indemnification"),
+    ("search_clauses", "termination"),
+    ("analyze_clause_risks", None),
+    ("query_obligations_db", None),
 )
 
 
