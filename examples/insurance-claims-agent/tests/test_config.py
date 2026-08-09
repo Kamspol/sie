@@ -16,8 +16,8 @@ def test_source_set_uses_public_fema_documents() -> None:
     assert all(source.rights.startswith("U.S. federal government work") for source in config.sources)
     assert config.models.parse == "docling"
     assert config.models.extract == "fastino/gliner2-large-v1"
-    assert config.models.rerank == "BAAI/bge-reranker-v2-m3"
-    assert config.models.review == "Qwen/Qwen3.5-4B:no-spec"
+    assert config.models.rerank == "Qwen/Qwen3-Reranker-4B"
+    assert config.models.review == "Qwen/Qwen3.5-4B"
 
 
 def test_bundled_sources_match_the_verified_source_manifest() -> None:

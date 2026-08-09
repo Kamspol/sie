@@ -11,7 +11,9 @@ import pytest
 import insurance_claims.review as review_module
 from insurance_claims.evaluate import ARTIFACT_EXCLUDED_PATHS, evaluate_review, evaluate_run
 from insurance_claims.review import (
+    REVIEW_SCHEMA,
     _extract_claim_facts,
+    _final_review,
     _json_object_from_text,
     _require_sources,
     chunk_markdown,
@@ -34,6 +36,15 @@ class FakeExtractClient:
     ) -> dict[str, object]:
         self.labels = kwargs.get("labels")  # type: ignore[assignment]
         return {"data": {"entities": []}}
+
+
+class FakeGenerateClient:
+    def __init__(self) -> None:
+        self.kwargs: dict[str, object] = {}
+
+    def generate(self, _model: str, _prompt: str, **kwargs: object) -> dict[str, object]:
+        self.kwargs = kwargs
+        return {"text": '{"route":"scope_review_required"}'}
 
 
 def test_chunk_markdown_keeps_all_paragraphs() -> None:
@@ -69,6 +80,26 @@ def test_claim_fact_extraction_passes_domain_labels() -> None:
 def test_review_json_accepts_fenced_model_output() -> None:
     assert _json_object_from_text('```json\n{"route": "scope_review_required"}\n```') == {
         "route": "scope_review_required"
+    }
+
+
+def test_final_review_uses_native_strict_json_schema() -> None:
+    client = FakeGenerateClient()
+
+    _, parsed, _ = _final_review(
+        client,
+        "Qwen/Qwen3.5-4B",
+        appeal_markdown="appeal",
+        claim_facts={},
+        policy_chunks=[],
+        provision_timeout_s=60,
+    )
+
+    assert parsed == {"route": "scope_review_required"}
+    assert client.kwargs["grammar"] == {
+        "json_schema": REVIEW_SCHEMA,
+        "label": "insurance_appeal_review",
+        "strict": True,
     }
 
 

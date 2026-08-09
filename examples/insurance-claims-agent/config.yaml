@@ -8,8 +8,8 @@ cluster:
 models:
   parse: "docling"
   extract: "fastino/gliner2-large-v1"
-  rerank: "BAAI/bge-reranker-v2-m3"
-  review: "Qwen/Qwen3.5-4B:no-spec"
+  rerank: "Qwen/Qwen3-Reranker-4B"
+  review: "Qwen/Qwen3.5-4B"
 
 retrieval:
   candidate_chunks: 16

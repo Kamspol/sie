@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agents import Agent, Runner, RunResult
+from agents import Agent, ModelSettings, Runner, RunResult
 from pydantic import BaseModel
 
 from .guardrails import safety_guardrail
@@ -62,6 +62,19 @@ ONLY the findings provided — never add facts. If the findings don't establish 
 field, use "unknown" (or false for `executed`). Make key_obligations and risk_flags
 specific and grounded in the findings, and give a clear recommendation."""
 
+_INVESTIGATOR_TOOL_SEQUENCE = (
+    "classify_document",
+    "ocr_signature_page",
+    "extract_entities",
+    "read_signature_page",
+    "search_clauses",
+    "search_clauses",
+    "search_clauses",
+    "search_clauses",
+    "analyze_clause_risks",
+    "query_obligations_db",
+)
+
 
 def build_reasoning_agent(cfg: dict[str, Any], client: Any) -> Agent:
     return Agent(
@@ -76,6 +89,7 @@ def build_reasoning_agent(cfg: dict[str, Any], client: Any) -> Agent:
             client,
             provision_timeout_s=provision_timeout_from(cfg),
         ),
+        model_settings=ModelSettings(temperature=0, max_tokens=1200),
     )
 
 
@@ -88,7 +102,9 @@ def build_investigator(cfg: dict[str, Any], client: Any) -> Agent:
             cfg["models"]["orchestrator"],
             client,
             provision_timeout_s=provision_timeout_from(cfg),
+            required_tool_sequence=_INVESTIGATOR_TOOL_SEQUENCE,
         ),
+        model_settings=ModelSettings(temperature=0, max_tokens=2048),
         tools=ALL_TOOLS,
         input_guardrails=[safety_guardrail],
     )
@@ -104,6 +120,7 @@ def build_synthesizer(cfg: dict[str, Any], client: Any) -> Agent:
             client,
             provision_timeout_s=provision_timeout_from(cfg),
         ),
+        model_settings=ModelSettings(temperature=0, max_tokens=2400),
         output_type=ContractReview,
     )
 

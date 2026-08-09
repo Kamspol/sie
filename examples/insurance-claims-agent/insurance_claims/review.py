@@ -331,6 +331,11 @@ schema.<|im_end|>
         max_new_tokens=1800,
         temperature=0,
         top_p=1,
+        grammar={
+            "json_schema": REVIEW_SCHEMA,
+            "label": "insurance_appeal_review",
+            "strict": True,
+        },
         wait_for_capacity=True,
         provision_timeout_s=provision_timeout_s,
     )

@@ -102,6 +102,28 @@ def _conversation(input_items: str | list[TResponseInputItem]) -> str:
     return "\n\n".join(turns)
 
 
+def _called_tool_names(input_items: str | list[TResponseInputItem]) -> list[str]:
+    if isinstance(input_items, str):
+        return []
+    rows = [_as_dict(item) for item in input_items]
+    return [
+        row["name"]
+        for row in rows
+        if row.get("type") == "function_call" and isinstance(row.get("name"), str)
+    ]
+
+
+def _next_required_tool(
+    required_sequence: tuple[str, ...],
+    input_items: str | list[TResponseInputItem],
+) -> str | None:
+    progress = 0
+    for name in _called_tool_names(input_items):
+        if progress < len(required_sequence) and name == required_sequence[progress]:
+            progress += 1
+    return required_sequence[progress] if progress < len(required_sequence) else None
+
+
 def _function_tools(tools: list[Tool]) -> list[FunctionTool]:
     function_tools: list[FunctionTool] = []
     for tool in tools:
@@ -306,10 +328,12 @@ class SIENativeModel(Model):
         client: SIEAsyncClient,
         *,
         provision_timeout_s: float,
+        required_tool_sequence: tuple[str, ...] = (),
     ) -> None:
         self.model = model
         self._client = client
         self._provision_timeout_s = provision_timeout_s
+        self._required_tool_sequence = required_tool_sequence
 
     async def get_response(
         self,
@@ -339,6 +363,12 @@ class SIENativeModel(Model):
             _function_tools(tools),
             model_settings,
         )
+        required_tool = _next_required_tool(self._required_tool_sequence, input)
+        if required_tool is not None:
+            selected_tools = [tool for tool in selected_tools if tool.name == required_tool]
+            if not selected_tools:
+                raise ModelBehaviorError(f"Required tool is unavailable: {required_tool}")
+            allow_final = False
         schema = _turn_schema(selected_tools, output_schema, allow_final=allow_final)
         result = await self._client.generate(
             self.model,

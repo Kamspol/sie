@@ -23,12 +23,14 @@ def model_for(
     client: SIEAsyncClient,
     *,
     provision_timeout_s: float,
+    required_tool_sequence: tuple[str, ...] = (),
 ) -> SIENativeModel:
     """Bind one SIE catalog model to the Agents SDK native model interface."""
     return SIENativeModel(
         model_id,
         client,
         provision_timeout_s=provision_timeout_s,
+        required_tool_sequence=required_tool_sequence,
     )
 
 

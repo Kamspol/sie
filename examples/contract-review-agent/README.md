@@ -19,7 +19,7 @@ Every value below is a real model in the [SIE catalog](https://superlinked.com/m
 | OCR: scanned page to markdown | `lightonai/LightOnOCR-2-1B` | extract |
 | Clause search: dense embeddings | `BAAI/bge-m3` | encode |
 | Clause rerank: cross-encoder | `Qwen/Qwen3-Reranker-4B` | score |
-| Entity extraction: parties, dates, amounts | `urchade/gliner_large-v2.1` | extract |
+| Entity extraction: parties, dates, amounts | `urchade/gliner_multi-v2.1` | extract |
 
 ## How it works
 
@@ -79,7 +79,7 @@ uv run review                          # uv run review --list   to see available
 uv run review --contract <slug>        # review a specific one
 ```
 
-> **GPU sizing.** The brain (`orchestrator`, which also does the structured synthesis) runs on `Qwen/Qwen3.6-27B` (64K, non-thinking), so it needs an H100 or RTX PRO 6000. The shorter-context roles (`triage`, `vision`, `reasoning`, `sql`) run on `Qwen/Qwen3.5-4B`. A cold cluster pays a one-time load per model on first use; the agent retries the "still provisioning" responses under `cluster.provision_timeout_s`. Keep bundles warm (`minReplicas: 1`) to skip the wait. Any model the cluster can't serve degrades gracefully, logged in the ledger, instead of failing the run.
+> **GPU sizing.** The brain (`orchestrator`, which also does the structured synthesis) runs on `Qwen/Qwen3.6-27B` (64K, non-thinking), so it needs an H100 or RTX PRO 6000. The shorter-context roles (`triage`, `vision`, `reasoning`, `sql`) run on `Qwen/Qwen3.5-4B`. A cold cluster pays a one-time load per model on first use; the agent retries the "still provisioning" responses under `cluster.provision_timeout_s`. Keep bundles warm (`minReplicas: 1`) to skip the wait. A required model or tool failure is printed with the partial ledger and exits nonzero.
 
 ## What you'll see
 

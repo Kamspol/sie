@@ -194,6 +194,16 @@ def _single_source_row(ranked: list[dict[str, Any]], term: str, stage: str) -> s
     return min(exact_rows, key=len)
 
 
+def _table_row_context(text: str, row_label: str) -> str:
+    marker = f"| {row_label}"
+    row_start = text.casefold().find(marker.casefold())
+    if row_start < 0:
+        raise RuntimeError(f"The source table omitted the {row_label} row")
+    header_end = text.find("|")
+    header = text[:header_end].strip() if 0 <= header_end < row_start else ""
+    return f"{header} {text[row_start:]}".strip()
+
+
 def _table_source_values(text: str, row_label: str) -> tuple[str, str]:
     marker = f"| {row_label}"
     start = text.casefold().find(marker.casefold())
@@ -427,6 +437,11 @@ def run(run_id: str) -> Path:
         entity_inputs = [
             ("entities_original_10q", original_table_text, FIGURE_ENTITY_LABELS),
             ("entities_restated_10ka", restated_table_text, FIGURE_ENTITY_LABELS),
+            (
+                "entities_restated_10ka_diluted",
+                _table_row_context(restated_table_text, "Diluted"),
+                FIGURE_ENTITY_LABELS,
+            ),
         ]
         entity_inputs.append(("entities_status", status_model_text, STATUS_ENTITY_LABELS))
         for stage, text, labels in entity_inputs:
@@ -565,6 +580,7 @@ def run(run_id: str) -> Path:
             "rerank",
             "entities_original_10q",
             "entities_restated_10ka",
+            "entities_restated_10ka_diluted",
             "entities_status",
             "gliner2_original_10q",
             "gliner2_restated_10ka",

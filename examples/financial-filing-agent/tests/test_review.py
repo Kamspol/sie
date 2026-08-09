@@ -8,6 +8,7 @@ from financial_filing.review import (
     _original_table_source_value,
     _require_entity_evidence,
     _require_matching_source_values,
+    _table_row_context,
     _table_source_values,
     build_review,
     load_config,
@@ -124,6 +125,20 @@ def test_gliner_gate_requires_all_primary_source_amounts() -> None:
         assert "required source spans" in str(exc)
     else:
         raise AssertionError("GLiNER gate accepted evidence without the restated amount")
+
+
+def test_table_row_context_keeps_heading_and_isolates_requested_row() -> None:
+    source = (
+        "## Restated Form 10-K/A. Three Months Ended June 30, 2023 "
+        "| Net income | $45,096 | $36,080 | | Diluted | $1.68 | $1.34 |"
+    )
+
+    context = _table_row_context(source, "Diluted")
+
+    assert "Restated Form 10-K/A" in context
+    assert "Three Months Ended June 30, 2023" in context
+    assert "| Diluted | $1.68 | $1.34 |" in context
+    assert "Net income" not in context
 
 
 def test_docling_line_breaks_do_not_split_source_sections() -> None:
