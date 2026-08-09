@@ -18,7 +18,7 @@ from agents.tool_context import ToolContext
 from pydantic import BaseModel
 
 from contract_review_agent import tools as contract_tools
-from contract_review_agent.native_model import SIENativeModel
+from contract_review_agent.native_model import SIENativeModel, _next_required_tool
 from contract_review_agent.runtime import AppContext, GenResult, Ledger, instruct_once
 
 set_tracing_disabled(True)
@@ -89,6 +89,7 @@ async def test_agents_runner_executes_native_tool_turn_then_finishes() -> None:
             "Qwen/Qwen3.5-4B",
             client,  # type: ignore[arg-type]
             provision_timeout_s=30,
+            required_tool_sequence=(("echo", None),),
         ),
         tools=[echo],
     )
@@ -98,10 +99,42 @@ async def test_agents_runner_executes_native_tool_turn_then_finishes() -> None:
     assert result.final_output == "Grounded result: CLAUSE"
     assert len(client.calls) == 2
     first_schema = client.calls[0]["kwargs"]["grammar"]["json_schema"]
-    assert len(first_schema["oneOf"]) == 2
-    assert first_schema["oneOf"][0]["properties"]["name"]["const"] == "echo"
+    assert first_schema["properties"]["name"]["const"] == "echo"
+    second_schema = client.calls[1]["kwargs"]["grammar"]["json_schema"]
+    assert len(second_schema["oneOf"]) == 2
     assert "[tool echo]\nCLAUSE" in client.calls[1]["prompt"]
     assert client.calls[1]["kwargs"]["wait_for_capacity"] is True
+
+
+def test_required_search_steps_only_advance_on_the_expected_query() -> None:
+    sequence = (
+        ("search_clauses", "automatic renewal"),
+        ("search_clauses", "termination"),
+        ("analyze_clause_risks", None),
+    )
+    repeated_query = [
+        {
+            "type": "function_call",
+            "name": "search_clauses",
+            "arguments": json.dumps({"query": "automatic renewal"}),
+        },
+        {
+            "type": "function_call",
+            "name": "search_clauses",
+            "arguments": json.dumps({"query": "automatic renewal"}),
+        },
+    ]
+    distinct_queries = [
+        repeated_query[0],
+        {
+            "type": "function_call",
+            "name": "search_clauses",
+            "arguments": json.dumps({"query": "termination"}),
+        },
+    ]
+
+    assert _next_required_tool(sequence, repeated_query) == "search_clauses"
+    assert _next_required_tool(sequence, distinct_queries) == "analyze_clause_risks"
 
 
 class Risk(BaseModel):
@@ -384,17 +417,13 @@ async def test_query_obligations_db_rejects_unknown_generation_mode() -> None:
         db_path="obligations.db",
     )
 
-    result = await contract_tools.query_obligations_db.on_invoke_tool(
-        ToolContext(
-            app,
-            tool_name="query_obligations_db",
-            tool_call_id="call-invalid",
-            tool_arguments=json.dumps({"question": "Show one value"}),
-        ),
-        json.dumps({"question": "Show one value"}),
-    )
-
-    assert result == (
-        "An error occurred while running the tool. Please try again. "
-        "Error: sql.mode must be 'instruct' or 'prompt'"
-    )
+    with pytest.raises(ValueError, match="sql.mode must be 'instruct' or 'prompt'"):
+        await contract_tools.query_obligations_db.on_invoke_tool(
+            ToolContext(
+                app,
+                tool_name="query_obligations_db",
+                tool_call_id="call-invalid",
+                tool_arguments=json.dumps({"question": "Show one value"}),
+            ),
+            json.dumps({"question": "Show one value"}),
+        )

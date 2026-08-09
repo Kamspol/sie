@@ -96,7 +96,7 @@ async def _clause_index(
 # ──────────────────────────────────────────────────────────────────────────
 # Generative-LLM tools
 # ──────────────────────────────────────────────────────────────────────────
-@function_tool
+@function_tool(failure_error_function=None)
 async def classify_document(ctx: RunContextWrapper[AppContext]) -> str:
     """Classify the contract under review as MSA, NDA, SOW, or Other, with a
     one-line reason. A fast first-pass triage over the loaded contract."""
@@ -128,7 +128,7 @@ async def classify_document(ctx: RunContextWrapper[AppContext]) -> str:
     return res.text.strip()
 
 
-@function_tool
+@function_tool(failure_error_function=None)
 async def read_signature_page(ctx: RunContextWrapper[AppContext], question: str) -> str:
     """Ask a vision model a question about the scanned signature-page image
     (e.g. 'Are both parties' signatures present and dated?'). Use this for
@@ -170,7 +170,7 @@ async def read_signature_page(ctx: RunContextWrapper[AppContext], question: str)
     return res.text.strip()
 
 
-@function_tool
+@function_tool(failure_error_function=None)
 async def analyze_clause_risks(ctx: RunContextWrapper[AppContext], clauses: str) -> str:
     """Delegate deep legal risk analysis of specific clauses to a specialist
     reasoning agent (the largest model). Pass the clause text to analyze; get
@@ -203,7 +203,7 @@ async def analyze_clause_risks(ctx: RunContextWrapper[AppContext], clauses: str)
 # ──────────────────────────────────────────────────────────────────────────
 # Retrieval / extraction tools (encode · score · extract)
 # ──────────────────────────────────────────────────────────────────────────
-@function_tool
+@function_tool(failure_error_function=None)
 async def ocr_signature_page(ctx: RunContextWrapper[AppContext]) -> str:
     """OCR the executed signature page (a scanned image) into markdown text.
     Use this to recover who signed, their titles, and the execution date —
@@ -232,7 +232,7 @@ async def ocr_signature_page(ctx: RunContextWrapper[AppContext]) -> str:
     return markdown
 
 
-@function_tool
+@function_tool(failure_error_function=None)
 async def extract_entities(ctx: RunContextWrapper[AppContext]) -> str:
     """Extract structured entities (parties, dates, monetary amounts, governing
     law, notice periods) from the loaded contract using zero-shot NER."""
@@ -273,7 +273,7 @@ async def extract_entities(ctx: RunContextWrapper[AppContext]) -> str:
     return "\n".join(lines) if lines else "(no entities found)"
 
 
-@function_tool
+@function_tool(failure_error_function=None)
 async def search_clauses(ctx: RunContextWrapper[AppContext], query: str) -> str:
     """Find the clauses most relevant to a topic (e.g. 'automatic renewal',
     'limitation of liability', 'indemnification'). Dense-embedding retrieval
@@ -377,7 +377,7 @@ def _run_select(db_path: str, sql: str) -> tuple[list[str], list[tuple]]:
         conn.close()
 
 
-@function_tool
+@function_tool(failure_error_function=None)
 async def query_obligations_db(
     ctx: RunContextWrapper[AppContext], question: str
 ) -> str:

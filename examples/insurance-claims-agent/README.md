@@ -16,8 +16,8 @@ and debris removal from the yard remain outside that covered scope.
 |---|---|---|
 | Parse the appeal and policy | `docling` | Markdown with the record, amounts, rules, analysis, and conclusion |
 | Extract claim facts | `fastino/gliner2-large-v1` | Amounts, debris volume, loss date, and coverage terms |
-| Retrieve controlling policy language | `BAAI/bge-reranker-v2-m3` | Ranked passages about non-owned debris removal |
-| Produce the cited review | `Qwen/Qwen3.5-4B:no-spec` | JSON separating covered work, excluded costs, and evidence still needed |
+| Retrieve controlling policy language | `Qwen/Qwen3-Reranker-4B` | Ranked passages about non-owned debris removal |
+| Produce the cited review | `Qwen/Qwen3.5-4B` | JSON separating covered work, excluded costs, and evidence still needed |
 
 Every model call goes through SIE.
 

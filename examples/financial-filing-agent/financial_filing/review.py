@@ -194,6 +194,24 @@ def _single_source_row(ranked: list[dict[str, Any]], term: str, stage: str) -> s
     return min(exact_rows, key=len)
 
 
+def _table_row_context(text: str, row_label: str) -> str:
+    marker = f"| {row_label}"
+    row_start = text.casefold().find(marker.casefold())
+    if row_start < 0:
+        raise RuntimeError(f"The source table omitted the {row_label} row")
+    header_end = text.find("|")
+    header = text[:header_end].strip() if 0 <= header_end < row_start else ""
+    separator = re.search(r"\|\s*\|\s*-{3,}", text)
+    if separator is None or header_end < 0 or separator.start() >= row_start:
+        raise RuntimeError(f"The source table omitted its header before the {row_label} row")
+    column_count = len(text[header_end : separator.start() + 1].split("|")) - 2
+    row_pipe_offsets = [match.start() for match in re.finditer(r"\|", text[row_start:])]
+    if column_count < 1 or len(row_pipe_offsets) <= column_count:
+        raise RuntimeError(f"The source table returned an incomplete {row_label} row")
+    row_end = row_start + row_pipe_offsets[column_count] + 1
+    return f"{header} {text[row_start:row_end]}".strip()
+
+
 def _table_source_values(text: str, row_label: str) -> tuple[str, str]:
     marker = f"| {row_label}"
     start = text.casefold().find(marker.casefold())
@@ -427,6 +445,11 @@ def run(run_id: str) -> Path:
         entity_inputs = [
             ("entities_original_10q", original_table_text, FIGURE_ENTITY_LABELS),
             ("entities_restated_10ka", restated_table_text, FIGURE_ENTITY_LABELS),
+            (
+                "entities_restated_10ka_diluted",
+                _table_row_context(restated_table_text, "Diluted"),
+                FIGURE_ENTITY_LABELS,
+            ),
         ]
         entity_inputs.append(("entities_status", status_model_text, STATUS_ENTITY_LABELS))
         for stage, text, labels in entity_inputs:
@@ -565,6 +588,7 @@ def run(run_id: str) -> Path:
             "rerank",
             "entities_original_10q",
             "entities_restated_10ka",
+            "entities_restated_10ka_diluted",
             "entities_status",
             "gliner2_original_10q",
             "gliner2_restated_10ka",

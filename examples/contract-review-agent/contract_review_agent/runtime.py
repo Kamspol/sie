@@ -10,7 +10,7 @@ from typing import Any
 
 from sie_sdk import SIEAsyncClient
 
-from .native_model import SIENativeModel
+from .native_model import RequiredToolStep, SIENativeModel
 
 
 def provision_timeout_from(cfg: dict[str, Any]) -> float:
@@ -23,12 +23,14 @@ def model_for(
     client: SIEAsyncClient,
     *,
     provision_timeout_s: float,
+    required_tool_sequence: tuple[RequiredToolStep, ...] = (),
 ) -> SIENativeModel:
     """Bind one SIE catalog model to the Agents SDK native model interface."""
     return SIENativeModel(
         model_id,
         client,
         provision_timeout_s=provision_timeout_s,
+        required_tool_sequence=required_tool_sequence,
     )
 
 

@@ -24,7 +24,7 @@ from .app import (
 from .config import load_config
 from .data import make_sample
 from .data.paths import CUAD_DIR, GENERATED_DIR, MANIFEST_PATH
-from .runtime import AppContext, Ledger, instruct_once
+from .runtime import AppContext, Ledger, instruct_once, provision_timeout_from
 
 console = Console()
 
@@ -213,7 +213,9 @@ async def _run(args) -> None:
     )
 
     async with SIEAsyncClient(
-        cfg["cluster"]["url"], api_key=cfg["cluster"]["api_key"] or None
+        cfg["cluster"]["url"],
+        api_key=cfg["cluster"]["api_key"] or None,
+        timeout_s=provision_timeout_from(cfg),
     ) as sie:
         ledger = Ledger()
         app = AppContext(
@@ -244,7 +246,7 @@ async def _run(args) -> None:
             )
             _print_ledger(ledger)
             return
-        except Exception as exc:  # noqa: BLE001 - report the model boundary failure.
+        except Exception as exc:
             console.print(
                 Panel(
                     f"{type(exc).__name__}: {exc}",
@@ -253,7 +255,7 @@ async def _run(args) -> None:
                 )
             )
             _print_ledger(ledger)
-            return
+            raise
         wall = time.monotonic() - t0
 
         try:

@@ -29,6 +29,7 @@ from openai.types.responses import (
 from sie_sdk import SIEAsyncClient
 
 _DEFAULT_MAX_NEW_TOKENS = 1200
+type RequiredToolStep = tuple[str, str | None]
 
 
 def _as_dict(item: Any) -> dict[str, Any]:
@@ -100,6 +101,48 @@ def _conversation(input_items: str | list[TResponseInputItem]) -> str:
                 f"[{item_type}]\n{json.dumps(row, ensure_ascii=False, default=str)}"
             )
     return "\n\n".join(turns)
+
+
+def _called_tools(input_items: str | list[TResponseInputItem]) -> list[dict[str, Any]]:
+    if isinstance(input_items, str):
+        return []
+    rows = [_as_dict(item) for item in input_items]
+    return [
+        row
+        for row in rows
+        if row.get("type") == "function_call" and isinstance(row.get("name"), str)
+    ]
+
+
+def _next_required_tool(
+    required_sequence: tuple[RequiredToolStep, ...],
+    input_items: str | list[TResponseInputItem],
+) -> str | None:
+    progress = 0
+    for call in _called_tools(input_items):
+        if progress >= len(required_sequence):
+            break
+        required_name, required_query = required_sequence[progress]
+        if call["name"] != required_name:
+            continue
+        if required_query is not None:
+            raw_arguments = call.get("arguments")
+            try:
+                arguments = (
+                    json.loads(raw_arguments)
+                    if isinstance(raw_arguments, str)
+                    else raw_arguments
+                )
+            except json.JSONDecodeError:
+                continue
+            query = arguments.get("query") if isinstance(arguments, dict) else None
+            if (
+                not isinstance(query, str)
+                or query.strip().casefold() != required_query.casefold()
+            ):
+                continue
+        progress += 1
+    return required_sequence[progress][0] if progress < len(required_sequence) else None
 
 
 def _function_tools(tools: list[Tool]) -> list[FunctionTool]:
@@ -306,10 +349,12 @@ class SIENativeModel(Model):
         client: SIEAsyncClient,
         *,
         provision_timeout_s: float,
+        required_tool_sequence: tuple[RequiredToolStep, ...] = (),
     ) -> None:
         self.model = model
         self._client = client
         self._provision_timeout_s = provision_timeout_s
+        self._required_tool_sequence = required_tool_sequence
 
     async def get_response(
         self,
@@ -339,6 +384,16 @@ class SIENativeModel(Model):
             _function_tools(tools),
             model_settings,
         )
+        required_tool = _next_required_tool(self._required_tool_sequence, input)
+        if required_tool is not None:
+            selected_tools = [
+                tool for tool in selected_tools if tool.name == required_tool
+            ]
+            if not selected_tools:
+                raise ModelBehaviorError(
+                    f"Required tool is unavailable: {required_tool}"
+                )
+            allow_final = False
         schema = _turn_schema(selected_tools, output_schema, allow_final=allow_final)
         result = await self._client.generate(
             self.model,
