@@ -108,6 +108,8 @@ from ._shared import (
     HTTP_CLIENT_ERROR,
     HTTP_GATEWAY_TIMEOUT,
     HTTP_SERVICE_UNAVAILABLE,
+    JOB_RESULT_NOT_FOUND_ERROR_CODE,
+    JOB_RESULT_REF_MAX_REFRESHES,
     JSON_CONTENT_TYPE,
     LORA_LOADING_DEFAULT_DELAY_S,
     LORA_LOADING_ERROR_CODE,
@@ -3444,25 +3446,34 @@ class _SyncJobs(_SyncNamespace):
         http(s) URL in the POC) and unpacks the msgpack ``WorkResult`` array;
         dense embeddings decode to numpy arrays (like :meth:`encode`).
         """
-        job = self.get(job_id)
-        chunks = job_chunks(job)
-        items = []
-        for chunk in chunks:
-            ref = chunk.get("ref")
-            if chunk.get("state") != "succeeded" or not ref:
-                continue
-            items.extend(decode_chunk_bytes(self._read_ref(ref)))
-        dims = next((it["dims"] for it in items if it.get("dims")), None)
-        return {
-            "job_id": job.get("id", job_id),
-            "state": job.get("state"),
-            "total_items": job.get("total_items"),
-            "settled_credits": job.get("settled_credits"),
-            "chunks": chunks,
-            "retrieved": len(items),
-            "dims": dims,
-            "items": items,
-        }
+        refreshes = 0
+        while True:
+            job = self.get(job_id)
+            chunks = job_chunks(job)
+            items = []
+            try:
+                for chunk in chunks:
+                    ref = chunk.get("ref")
+                    if chunk.get("state") != "succeeded" or not ref:
+                        continue
+                    items.extend(decode_chunk_bytes(self._read_ref(ref)))
+            except RequestError as exc:
+                refreshable = exc.status_code == 404 and exc.code == JOB_RESULT_NOT_FOUND_ERROR_CODE
+                if refreshable and refreshes < JOB_RESULT_REF_MAX_REFRESHES:
+                    refreshes += 1
+                    continue
+                raise
+            dims = next((it["dims"] for it in items if it.get("dims")), None)
+            return {
+                "job_id": job.get("id", job_id),
+                "state": job.get("state"),
+                "total_items": job.get("total_items"),
+                "settled_credits": job.get("settled_credits"),
+                "chunks": chunks,
+                "retrieved": len(items),
+                "dims": dims,
+                "items": items,
+            }
 
     def wait(self, job_id: str, *, timeout_s: float = 600.0, poll_s: float = 2.0) -> JobStatus:
         """Poll until terminal, or return a connector plan at its stable planned phase."""

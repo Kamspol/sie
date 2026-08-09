@@ -60,9 +60,10 @@ export class SIEConnectionError extends SIEError {
 }
 
 /**
- * Error in the request (4xx responses).
+ * Terminal request or response-contract error.
  *
- * Raised when the client sends an invalid request:
+ * Raised for 4xx responses, malformed successful response bodies, and other
+ * terminal response-shape violations. Common 4xx cases include:
  * - 400: Bad request (invalid parameters, malformed body)
  * - 401: Unauthorized (missing or invalid API key)
  * - 403: Forbidden (insufficient permissions)
@@ -72,7 +73,7 @@ export class SIEConnectionError extends SIEError {
 export class RequestError extends SIEError {
   /** Error code from the server (e.g., "INVALID_MODEL", "VALIDATION_ERROR") */
   readonly code: string | undefined;
-  /** HTTP status code (400-499) */
+  /** HTTP status code, when the failure came from a terminal response. */
   readonly statusCode: number | undefined;
 
   constructor(message: string, code?: string, statusCode?: number) {

@@ -101,6 +101,7 @@ describe("SIEClient.generate", () => {
     const [url, init] = mockFetch.mock.calls[0];
     expect(url).toBe("http://localhost:8080/v1/generate/m");
     expect(init.method).toBe("POST");
+    expect(init.redirect).toBe("error");
     expect(init.headers["Content-Type"]).toBe("application/json");
     expect(init.headers.Accept).toBe("application/json");
     const body = JSON.parse(init.body);
@@ -223,6 +224,36 @@ describe("SIEClient.generate", () => {
     );
   });
 
+  it("reports malformed JSON without exposing response headers or body", async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response("SECRET-RESPONSE-BODY", {
+        status: 200,
+        headers: {
+          "Content-Type": "application/PRIVATE-TOKEN-ABC",
+          Location: "https://redirect.example/private-token",
+        },
+      }),
+    );
+
+    const client = new SIEClient("http://localhost:8080");
+    const error = await client
+      .generate("m", "hi", { maxNewTokens: 4 })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(RequestError);
+    const requestError = error as RequestError & { cause?: unknown; stack?: string };
+    expect(requestError.statusCode).toBe(200);
+    expect(requestError.message).toContain(
+      "Malformed generate JSON response (status=200, content_type=other, body_bytes=20)",
+    );
+    expect(requestError.message).not.toContain("PRIVATE-TOKEN-ABC");
+    expect(requestError.message).not.toContain("SECRET-RESPONSE-BODY");
+    expect(requestError.message).not.toContain("private-token");
+    expect(requestError.stack).not.toContain("SECRET-RESPONSE-BODY");
+    expect(requestError.cause).toBeUndefined();
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
   // H4 regression: a truncated / malformed envelope must NOT silently
   // produce an empty completion. Missing or non-string `model` / `text`
   // raises (matches the Python SDK contract).
@@ -326,6 +357,21 @@ describe("SIEClient.generate retry semantics (B1c)", () => {
 
     // Crucially: exactly ONE call, no retry.
     expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  it("refuses redirects as a terminal single-shot transport error", async () => {
+    const client = new SIEClient("http://localhost:8080", {
+      timeout: 30_000,
+      provisionTimeout: 60_000,
+    });
+    mockFetch.mockRejectedValueOnce(new TypeError("fetch failed"));
+
+    await expect(
+      client.generate("m", "hi", { maxNewTokens: 8, waitForCapacity: true }),
+    ).rejects.toBeInstanceOf(SIEConnectionError);
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(mockFetch.mock.calls[0]?.[1].redirect).toBe("error");
   });
 
   it("does NOT retry a mid-flight TypeError when waitForCapacity is false", async () => {

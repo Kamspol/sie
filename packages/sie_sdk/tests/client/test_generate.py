@@ -11,6 +11,7 @@ Mocks the HTTP layer; exercises:
 from __future__ import annotations
 
 import json
+import traceback
 from types import MappingProxyType
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,6 +19,7 @@ import httpx
 import pytest
 from sie_sdk import SIEAsyncClient, SIEClient, SIEConnectionError
 from sie_sdk.client._shared import validate_generate_grammar
+from sie_sdk.client.async_ import _AioResponse
 from sie_sdk.client.errors import ProvisioningError, RequestError, ServerError
 
 
@@ -78,6 +80,19 @@ def _resp_503_openai_provisioning() -> MagicMock:
     return response
 
 
+def _resp_303() -> MagicMock:
+    response = MagicMock()
+    response.status_code = 303
+    response.headers = {
+        "content-type": " Text/HTML ; charset=utf-8",
+        "Location": "https://redirect.example/private-token",
+        "X-SIE-Request-ID": "req-generate-redirect",
+    }
+    response.content = "private response π".encode()
+    response.json.side_effect = AssertionError("redirect response must not be parsed")
+    return response
+
+
 def _ok_envelope() -> dict:
     return {
         "model": "m",
@@ -89,9 +104,11 @@ def _ok_envelope() -> dict:
 
 
 def _aio_resp(status: int, body: object, headers: dict | None = None) -> object:
-    from sie_sdk.client.async_ import _AioResponse
-
     return _AioResponse(status, json.dumps(body).encode("utf-8"), headers or {"content-type": "application/json"})
+
+
+def _aio_raw_resp(status: int, body: bytes, headers: dict | None = None) -> object:
+    return _AioResponse(status, body, headers or {"content-type": "application/json"})
 
 
 def test_openai_provisioning_header_is_classified_as_provisioning() -> None:
@@ -410,6 +427,67 @@ class TestSyncGenerate:
             }
             client.close()
 
+    def test_generate_rejects_redirect_without_following_or_retrying(self) -> None:
+        redirect = _resp_303()
+        with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+            mock_client.return_value.post.side_effect = [redirect, _ok_response(_ok_envelope())]
+            client = SIEClient("http://localhost:8080")
+            try:
+                with pytest.raises(RequestError) as excinfo:
+                    client.generate("m", prompt="hi", max_new_tokens=4)
+            finally:
+                client.close()
+
+        error = excinfo.value
+        assert error.status_code == 303
+        assert error.request == {"id": "req-generate-redirect"}
+        assert str(error) == (
+            "Unexpected generate HTTP response "
+            f"(status=303, content_type=text/html, body_bytes={len(redirect.content)})"
+        )
+        assert "private-token" not in str(error)
+        assert "private response" not in str(error)
+        assert "Location" not in str(error)
+        assert mock_client.return_value.post.call_count == 1
+        assert client.last_retry_count == 0
+        assert mock_client.call_args.kwargs["follow_redirects"] is False
+        redirect.json.assert_not_called()
+
+    def test_generate_malformed_json_has_content_safe_diagnostics(self) -> None:
+        response = MagicMock()
+        response.status_code = 200
+        response.headers = {
+            "content-type": " application/PRIVATE-TOKEN-ABC ; charset=UTF-8",
+            "Location": "https://redirect.example/private-token",
+            "X-SIE-Request-ID": "req-generate-invalid-json",
+        }
+        response.content = "private malformed π".encode()
+        response.json.side_effect = lambda: json.loads(response.content)
+        with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+            mock_client.return_value.post.return_value = response
+            client = SIEClient("http://localhost:8080")
+            try:
+                with pytest.raises(RequestError) as excinfo:
+                    client.generate("m", prompt="hi", max_new_tokens=4)
+            finally:
+                client.close()
+
+        error = excinfo.value
+        assert error.status_code == 200
+        assert error.request == {"id": "req-generate-invalid-json"}
+        assert str(error) == (
+            f"Malformed generate JSON response (status=200, content_type=other, body_bytes={len(response.content)})"
+        )
+        assert "PRIVATE-TOKEN-ABC" not in str(error)
+        assert "private-token" not in str(error)
+        assert "private malformed" not in str(error)
+        assert "Location" not in str(error)
+        assert error.__cause__ is None
+        assert error.__context__ is None
+        formatted = "".join(traceback.format_exception(error))
+        assert "private-token" not in formatted
+        assert "private malformed" not in formatted
+
     @pytest.mark.parametrize("body", [{"text": "ok"}, {"model": "m"}])
     def test_generate_invalid_object_retains_request_metadata(self, body: dict) -> None:
         response = _ok_response(
@@ -565,6 +643,45 @@ class TestAsyncGenerate:
             "usage": {"output_tokens": 3},
             "credits_debited": 8,
         }
+
+    @pytest.mark.asyncio
+    async def test_generate_rejects_redirect_without_following_or_retrying(self) -> None:
+        redirect_body = "private response π".encode()
+        client = SIEAsyncClient("http://localhost:8080")
+        client._post = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                _aio_raw_resp(
+                    303,
+                    redirect_body,
+                    {
+                        "content-type": " Text/HTML ; charset=utf-8",
+                        "Location": "https://redirect.example/private-token",
+                        "X-SIE-Request-ID": "req-async-generate-redirect",
+                    },
+                ),
+                _aio_resp(200, _ok_envelope()),
+            ]
+        )
+        with patch.object(client, "_ensure_session") as ensure:
+            ensure.return_value.post = _make_session_post(client._post)
+            try:
+                with pytest.raises(RequestError) as excinfo:
+                    await client.generate("m", prompt="hi", max_new_tokens=4)
+            finally:
+                await client.close()
+
+        error = excinfo.value
+        assert error.status_code == 303
+        assert error.request == {"id": "req-async-generate-redirect"}
+        assert str(error) == (
+            f"Unexpected generate HTTP response (status=303, content_type=text/html, body_bytes={len(redirect_body)})"
+        )
+        assert "private-token" not in str(error)
+        assert "private response" not in str(error)
+        assert "Location" not in str(error)
+        assert client._post.call_count == 1
+        assert ensure.return_value.post.call_count == 1
+        assert ensure.return_value.post.call_args.kwargs["allow_redirects"] is False
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("body", [{"text": "ok"}, {"model": "m"}])

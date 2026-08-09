@@ -25,6 +25,8 @@ _logger = logging.getLogger(__name__)
 
 
 _HTTP_HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_HTTP_MEDIA_TYPE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+/[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_CONTENT_SAFE_MEDIA_TYPES = frozenset({"application/json", "application/problem+json", "text/html"})
 _RESERVED_BASE_URL_HEADERS = frozenset(
     {
         "accept",
@@ -177,6 +179,13 @@ HTTP_CLIENT_ERROR = 400
 HTTP_SERVER_ERROR = 500
 HTTP_SERVICE_UNAVAILABLE = 503
 HTTP_GATEWAY_TIMEOUT = 504
+
+# A result ref can land on a gateway replica whose payload-store view has not
+# converged yet. The gateway uses this exact 404 code to tell the SDK to fetch
+# a fresh job view before trying the refs again. Keep the refresh bounded: a
+# storage outage is a distinct 503 and must never be hidden by this path.
+JOB_RESULT_NOT_FOUND_ERROR_CODE = "RESULT_NOT_FOUND"
+JOB_RESULT_REF_MAX_REFRESHES = 3
 
 
 _GENERATE_GRAMMAR_VARIANTS = frozenset({"json_schema", "regex", "ebnf"})
@@ -770,16 +779,43 @@ def parse_request_metadata(headers: Any, body: Any = None) -> RequestMetadata | 
     return metadata or None
 
 
+def _terminal_response_diagnostic(response: _HttpResponse) -> str:
+    """Describe a terminal response without copying attacker-controlled values."""
+    raw_content_type = _header_value(response.headers, "content-type")
+    content_type = "unknown"
+    if isinstance(raw_content_type, str):
+        candidate = raw_content_type.partition(";")[0].strip().lower()
+        if candidate in _CONTENT_SAFE_MEDIA_TYPES:
+            content_type = candidate
+        elif _HTTP_MEDIA_TYPE.fullmatch(candidate):
+            content_type = "other"
+    return f"status={response.status_code}, content_type={content_type}, body_bytes={len(response.content)}"
+
+
 def parse_terminal_json_object(response: _HttpResponse, *, owner: str) -> dict[str, Any]:
-    """Parse one terminal JSON object while retaining response metering evidence."""
+    """Parse one successful terminal JSON object with content-safe diagnostics."""
     request = parse_request_metadata(response.headers)
+    diagnostic = _terminal_response_diagnostic(response)
+
+    if not 200 <= response.status_code < 300:
+        msg = f"Unexpected {owner} HTTP response ({diagnostic})"
+        raise RequestError(msg, status_code=response.status_code, request=request)
+
+    malformed = False
     try:
         data = response.json()
-    except (TypeError, ValueError) as exc:
-        raise RequestError(f"Malformed {owner} JSON response", request=request) from exc
+    except (TypeError, ValueError):
+        # Raise only after the parser exception context has been cleared. JSON
+        # decoder exceptions can retain the raw response body (for example in
+        # JSONDecodeError.doc), which must never escape through chaining.
+        malformed = True
+        data = None
+    if malformed:
+        msg = f"Malformed {owner} JSON response ({diagnostic})"
+        raise RequestError(msg, status_code=response.status_code, request=request)
     if not isinstance(data, dict):
-        msg = f"Unexpected {owner} response shape: {type(data).__name__}"
-        raise RequestError(msg, request=request)
+        msg = f"Unexpected {owner} response shape: {type(data).__name__} ({diagnostic})"
+        raise RequestError(msg, status_code=response.status_code, request=request)
     return data
 
 
@@ -1086,6 +1122,14 @@ def next_stream_retry_delay(
         raise ServerError(
             msg,
             code=get_error_code(response),
+            status_code=status,
+            request=parse_request_metadata(response.headers),
+        )
+
+    if 300 <= status < HTTP_CLIENT_ERROR:
+        msg = f"Unexpected HTTP redirect ({_terminal_response_diagnostic(response)})"
+        raise RequestError(
+            msg,
             status_code=status,
             request=parse_request_metadata(response.headers),
         )

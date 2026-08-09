@@ -334,6 +334,7 @@ describe("SIEClient.streamChatCompletions", () => {
 
     const [url, init] = mockFetch.mock.calls[0];
     expect(url).toBe("http://localhost:8080/v1/chat/completions");
+    expect(init.redirect).toBe("error");
     expect(init.headers.Accept).toBe("text/event-stream");
     const body = JSON.parse(init.body);
     expect(body.stream).toBe(true);
@@ -518,6 +519,7 @@ describe("SIEClient.streamGenerate", () => {
     }
     const [url, init] = mockFetch.mock.calls[0];
     expect(url).toBe("http://localhost:8080/v1/generate/Qwen__Qwen3-4B-Instruct-2507");
+    expect(init.redirect).toBe("error");
     expect(init.headers.Accept).toBe("text/event-stream");
     const body = JSON.parse(init.body);
     expect(body).toEqual({

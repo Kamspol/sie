@@ -1056,6 +1056,7 @@ describe("SIEClient.createPool() - bundle / warm-floor / pinned-model args", () 
 
     const [url, init] = mockFetch.mock.calls[0];
     expect(url).toBe("http://localhost:8080/v1/pools");
+    expect(init.redirect).toBe("error");
     expect(JSON.parse(init.body)).toEqual({
       name: "eval",
       gpus: { l4: 2 },

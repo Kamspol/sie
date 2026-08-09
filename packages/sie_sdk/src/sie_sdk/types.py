@@ -1220,11 +1220,15 @@ class CostEstimate(TypedDict):
     Settlement bills the worker-authoritative counts against that plan and
     releases the remainder, so the real charge is at most this number.
 
-    ``minimum_billed_units`` is present only for duration-priced (sealed custom
-    lane, ``gpu_second``) identities, where a dry run cannot know the request's
-    duration: there the quote is a rate card — ``applied_rates`` plus this
-    per-request floor — and ``unit_ceilings`` is the whole-window hold, not a
-    prediction. ``estimate_basis`` says which of the two you are looking at.
+    ``minimum_billed_units`` is present only for duration-priced identities.
+    On a sealed custom lane (``gpu_second``) a dry run cannot know the
+    request's duration: there the quote is a rate card — ``applied_rates``
+    plus this per-request floor — and ``unit_ceilings`` is the whole-window
+    hold, not a prediction. On a measured ``audio_ms`` identity it is the
+    minimum billed audio duration: a request settles at least this many
+    milliseconds of accepted audio, so below it the rate is a
+    per-started-window price and above it a duration price.
+    ``estimate_basis`` says which of these you are looking at.
 
     Every field except ``minimum_billed_units`` is always present: the gateway
     serializes a whole ``ReservationPlan`` projection, so a partial quote is not

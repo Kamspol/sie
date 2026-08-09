@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgpack
 import pytest
-from sie_sdk import SIEAsyncClient, SIEClient
+from sie_sdk import RequestError, ServerError, SIEAsyncClient, SIEClient
 
 GW = "http://gw.test:8080"
 KEY = "sk-sie-testkey"
@@ -23,6 +23,36 @@ _SUBMIT_RESP = {
     "chunks": 1,
     "preflight": {"estimated_credits": 64},
 }
+
+
+def _result_chunk(item_id: str) -> bytes:
+    return msgpack.packb(
+        [
+            {
+                "success": True,
+                "id": item_id,
+                "units": {"input_tokens": 5},
+                "result_msgpack": msgpack.packb(
+                    {"dense": {"dims": 2, "values": [0.1, 0.2]}},
+                    use_bin_type=True,
+                ),
+            }
+        ],
+        use_bin_type=True,
+    )
+
+
+def _result_job(*refs: str) -> dict[str, Any]:
+    return {
+        "id": "job-1",
+        "state": "succeeded",
+        "total_items": len(refs),
+        "settled_credits": 5 * len(refs),
+        "output": {
+            "kind": "refs",
+            "chunks": [{"seq": seq, "items": 1, "state": "succeeded", "ref": ref} for seq, ref in enumerate(refs)],
+        },
+    }
 
 
 def _resp(status: int, body: Any) -> MagicMock:
@@ -278,6 +308,74 @@ def test_results_reads_local_refs_and_decodes(tmp_path: Any) -> None:
         client.close()
 
 
+def test_results_refreshes_job_after_replica_miss_without_duplicating_partial_items() -> None:
+    stale = _result_job("https://gw.test/stale-0", "https://gw.test/stale-1")
+    fresh = _result_job("https://gw.test/fresh-0", "https://gw.test/fresh-1")
+    replica_miss = RequestError("not on this replica", code="RESULT_NOT_FOUND", status_code=404)
+    with patch("sie_sdk.client.sync.httpx.Client"):
+        client = SIEClient(GW, api_key=KEY)
+        with (
+            patch.object(client.jobs, "get", side_effect=[stale, fresh]) as get_job,
+            patch.object(
+                client.jobs,
+                "_read_ref",
+                side_effect=[_result_chunk("discarded"), replica_miss, _result_chunk("0"), _result_chunk("1")],
+            ) as read_ref,
+        ):
+            results = client.jobs.results("job-1")
+
+        assert get_job.call_count == 2
+        assert read_ref.call_count == 4
+        assert results["retrieved"] == 2
+        assert [item["id"] for item in results["items"]] == ["0", "1"]
+        assert [chunk["ref"] for chunk in results["chunks"]] == [
+            "https://gw.test/fresh-0",
+            "https://gw.test/fresh-1",
+        ]
+        client.close()
+
+
+def test_results_bounds_replica_miss_refreshes() -> None:
+    replica_miss = RequestError("not on this replica", code="RESULT_NOT_FOUND", status_code=404)
+    with patch("sie_sdk.client.sync.httpx.Client"):
+        client = SIEClient(GW, api_key=KEY)
+        with (
+            patch.object(client.jobs, "get", return_value=_result_job("https://gw.test/stale")) as get_job,
+            patch.object(client.jobs, "_read_ref", side_effect=replica_miss) as read_ref,
+            pytest.raises(RequestError, match="not on this replica") as excinfo,
+        ):
+            client.jobs.results("job-1")
+
+        expected_attempts = 4
+        assert get_job.call_count == expected_attempts
+        assert read_ref.call_count == expected_attempts
+        assert excinfo.value is replica_miss
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RequestError("ordinary missing ref", code="NOT_FOUND", status_code=404),
+        ServerError("payload store unavailable", code="STORAGE_UNAVAILABLE", status_code=503),
+    ],
+)
+def test_results_does_not_refresh_unrelated_ref_failures(error: RequestError | ServerError) -> None:
+    with patch("sie_sdk.client.sync.httpx.Client"):
+        client = SIEClient(GW, api_key=KEY)
+        with (
+            patch.object(client.jobs, "get", return_value=_result_job("https://gw.test/ref")) as get_job,
+            patch.object(client.jobs, "_read_ref", side_effect=error) as read_ref,
+            pytest.raises(type(error)) as excinfo,
+        ):
+            client.jobs.results("job-1")
+
+        get_job.assert_called_once_with("job-1")
+        read_ref.assert_called_once_with("https://gw.test/ref")
+        assert excinfo.value is error
+        client.close()
+
+
 # ---------------------------------------------------------------------------
 # async
 # ---------------------------------------------------------------------------
@@ -437,4 +535,74 @@ async def test_async_repair_posts_exact_revision_predecessor_and_one_idempotency
         ("Idempotency-Key", "async-repair-plan-2-attempt-1")
     ]
     assert result["id"] == "job-9"
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_async_results_refreshes_job_after_replica_miss_without_duplicating_partial_items() -> None:
+    stale = _result_job("https://gw.test/stale-0", "https://gw.test/stale-1")
+    fresh = _result_job("https://gw.test/fresh-0", "https://gw.test/fresh-1")
+    replica_miss = RequestError("not on this replica", code="RESULT_NOT_FOUND", status_code=404)
+    client = SIEAsyncClient(GW, api_key=KEY)
+    with (
+        patch.object(client.jobs, "get", new=AsyncMock(side_effect=[stale, fresh])) as get_job,
+        patch.object(
+            client.jobs,
+            "_read_ref",
+            new=AsyncMock(
+                side_effect=[_result_chunk("discarded"), replica_miss, _result_chunk("0"), _result_chunk("1")]
+            ),
+        ) as read_ref,
+    ):
+        results = await client.jobs.results("job-1")
+
+    assert get_job.await_count == 2
+    assert read_ref.await_count == 4
+    assert results["retrieved"] == 2
+    assert [item["id"] for item in results["items"]] == ["0", "1"]
+    assert [chunk["ref"] for chunk in results["chunks"]] == [
+        "https://gw.test/fresh-0",
+        "https://gw.test/fresh-1",
+    ]
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_async_results_bounds_replica_miss_refreshes() -> None:
+    replica_miss = RequestError("not on this replica", code="RESULT_NOT_FOUND", status_code=404)
+    client = SIEAsyncClient(GW, api_key=KEY)
+    with (
+        patch.object(client.jobs, "get", new=AsyncMock(return_value=_result_job("https://gw.test/stale"))) as get_job,
+        patch.object(client.jobs, "_read_ref", new=AsyncMock(side_effect=replica_miss)) as read_ref,
+        pytest.raises(RequestError, match="not on this replica") as excinfo,
+    ):
+        await client.jobs.results("job-1")
+
+    expected_attempts = 4
+    assert get_job.await_count == expected_attempts
+    assert read_ref.await_count == expected_attempts
+    assert excinfo.value is replica_miss
+    await client.close()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RequestError("ordinary missing ref", code="NOT_FOUND", status_code=404),
+        ServerError("payload store unavailable", code="STORAGE_UNAVAILABLE", status_code=503),
+    ],
+)
+@pytest.mark.asyncio
+async def test_async_results_does_not_refresh_unrelated_ref_failures(error: RequestError | ServerError) -> None:
+    client = SIEAsyncClient(GW, api_key=KEY)
+    with (
+        patch.object(client.jobs, "get", new=AsyncMock(return_value=_result_job("https://gw.test/ref"))) as get_job,
+        patch.object(client.jobs, "_read_ref", new=AsyncMock(side_effect=error)) as read_ref,
+        pytest.raises(type(error)) as excinfo,
+    ):
+        await client.jobs.results("job-1")
+
+    get_job.assert_awaited_once_with("job-1")
+    read_ref.assert_awaited_once_with("https://gw.test/ref")
+    assert excinfo.value is error
     await client.close()

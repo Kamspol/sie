@@ -17,7 +17,10 @@ class SIEConnectionError(SIEError):
 
 
 class RequestError(SIEError):
-    """Error in the request (4xx responses).
+    """Terminal request or response-contract error.
+
+    This covers 4xx responses plus unexpected redirects, malformed successful
+    response bodies, and other terminal response-shape violations.
 
     ``request`` contains canonical request, usage, and debit metadata parsed
     from the terminal response headers when the server supplied any.

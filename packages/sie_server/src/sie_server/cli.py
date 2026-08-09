@@ -40,7 +40,13 @@ from sie_sdk.bundle_utils import (
 import sie_server
 from sie_server.api.generate import router as generate_router
 from sie_server.api.openai_audio import router as openai_audio_router
-from sie_server.app.app_state_config import ENV_DEVICES, ENV_POOL, AppStateConfig
+from sie_server.app.app_state_config import (
+    ENV_DEVICES,
+    ENV_PINNED_MODELS,
+    ENV_POOL,
+    ENV_PRELOAD_MODELS,
+    AppStateConfig,
+)
 from sie_server.config.model import ModelConfig
 from sie_server.core.deps import collect_bundle_deps
 from sie_server.core.loader import load_model_configs
@@ -98,6 +104,16 @@ def parse_devices(value: str | None) -> list[str] | None:
         return None
     devices = [item.strip() for item in value.split(",") if item.strip()]
     return devices or None
+
+
+def _canonical_model_id(value: str) -> str:
+    """Normalize model IDs consistently with registry pin matching."""
+    base, separator, profile = value.strip().lower().partition(":")
+    base = base.strip()
+    profile = profile.strip()
+    if not separator or not profile or profile == "default":
+        return base
+    return f"{base}:{profile}"
 
 
 app = typer.Typer(
@@ -546,7 +562,7 @@ def serve(
                 raise typer.Exit(1)
         typer.echo(f"Preload: {len(preload_models)} models will be loaded at startup")
     else:
-        preload_env = os.environ.get("SIE_PRELOAD_MODELS")
+        preload_env = os.environ.get(ENV_PRELOAD_MODELS)
         if preload_env:
             preload_models = [m.strip() for m in preload_env.split(",") if m.strip()]
             if preload_models:
@@ -557,12 +573,26 @@ def serve(
                         raise typer.Exit(1)
                 typer.echo(f"Preload (from env): {len(preload_models)} models will be loaded at startup")
 
+    pinned_env = os.environ.get(ENV_PINNED_MODELS)
+    pinned_models = [m.strip() for m in pinned_env.split(",") if m.strip()] if pinned_env else None
+    if pinned_models:
+        if model_filter is not None:
+            selected_model_ids = {_canonical_model_id(model_id) for model_id in model_filter}
+            invalid = [
+                model_id for model_id in pinned_models if _canonical_model_id(model_id) not in selected_model_ids
+            ]
+            if invalid:
+                typer.echo(f"Error: Pinned model(s) not in model filter: {', '.join(invalid)}", err=True)
+                raise typer.Exit(1)
+        typer.echo(f"Pinned (from env): {len(pinned_models)} models will be kept resident")
+
     config = AppStateConfig(
         models_dir=models_dir_resolved,
         device=resolved_device,
         devices=resolved_devices,
         model_filter=model_filter,
         preload_models=preload_models,
+        pinned_models=pinned_models,
         pool_name=pool_name,
     )
 

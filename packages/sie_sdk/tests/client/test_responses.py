@@ -10,7 +10,7 @@ import aiohttp
 import httpx
 import pytest
 from sie_sdk import SIEAsyncClient, SIEClient
-from sie_sdk.client.errors import ProvisioningError, ServerError, SIEConnectionError
+from sie_sdk.client.errors import ProvisioningError, RequestError, ServerError, SIEConnectionError
 from sie_sdk.types import ResponseInputContentPart, ResponseInputMessage
 
 
@@ -175,6 +175,36 @@ def test_responses_does_not_retry_post_publish_timeout() -> None:
             "usage": {"output_tokens": 4},
             "credits_debited": 11,
         }
+        client.close()
+
+
+def test_responses_rejects_redirect_without_retrying() -> None:
+    redirect = _sync_response(
+        303,
+        {"private": "response-body"},
+        headers={
+            "content-type": "text/html",
+            "location": "https://redirect.example/private-token",
+            "x-sie-request-id": "req-responses-redirect",
+        },
+    )
+    with (
+        patch("sie_sdk.client.sync.httpx.Client") as client_cls,
+        patch("sie_sdk.client.sync.time.sleep") as sleep,
+    ):
+        client_cls.return_value.post.return_value = redirect
+        client = SIEClient("http://localhost:8080")
+
+        with pytest.raises(RequestError) as exc_info:
+            client.responses("m", "Hi")
+
+        assert exc_info.value.status_code == 303
+        assert exc_info.value.request == {"id": "req-responses-redirect"}
+        assert "private-token" not in str(exc_info.value)
+        assert "response-body" not in str(exc_info.value)
+        assert client_cls.return_value.post.call_count == 1
+        assert client.last_retry_count == 0
+        sleep.assert_not_called()
         client.close()
 
 

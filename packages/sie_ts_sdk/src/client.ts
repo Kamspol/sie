@@ -137,6 +137,9 @@ import type {
 } from "./types.js";
 import { SDK_VERSION } from "./version.js";
 
+const JOB_RESULT_NOT_FOUND_ERROR_CODE = "RESULT_NOT_FOUND";
+const JOB_RESULT_REF_MAX_REFRESHES = 3;
+
 /** The `client.jobs` batch namespace. */
 export interface JobsNamespace {
   /** Submit a batch job; exact connector replays may return current status. */
@@ -246,6 +249,54 @@ export interface BatchesNamespace {
 /** Helper to sleep for a given number of milliseconds */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const CONTENT_SAFE_MEDIA_TYPES = new Set([
+  "application/json",
+  "application/problem+json",
+  "text/html",
+]);
+
+function terminalResponseDiagnostic(response: Response, bodyBytes: number): string {
+  const rawContentType = response.headers.get("content-type");
+  let contentType = "unknown";
+  if (rawContentType !== null) {
+    const candidate = rawContentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+    contentType = CONTENT_SAFE_MEDIA_TYPES.has(candidate) ? candidate : "other";
+  }
+  return `status=${response.status}, content_type=${contentType}, body_bytes=${bodyBytes}`;
+}
+
+async function parseTerminalJsonObject(
+  response: Response,
+  owner: string,
+): Promise<Record<string, unknown>> {
+  const body = new Uint8Array(await response.arrayBuffer());
+  if (!response.ok) {
+    throw new RequestError(
+      `Unexpected ${owner} HTTP response (${terminalResponseDiagnostic(response, body.byteLength)})`,
+      undefined,
+      response.status,
+    );
+  }
+  let data: unknown;
+  try {
+    data = JSON.parse(new TextDecoder().decode(body));
+  } catch {
+    throw new RequestError(
+      `Malformed ${owner} JSON response (${terminalResponseDiagnostic(response, body.byteLength)})`,
+      undefined,
+      response.status,
+    );
+  }
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    throw new RequestError(
+      `Unexpected ${owner} response shape (${terminalResponseDiagnostic(response, body.byteLength)})`,
+      undefined,
+      response.status,
+    );
+  }
+  return data as Record<string, unknown>;
 }
 
 function parseNonnegativeMeterHeader(headers: Headers, name: string): number | undefined {
@@ -1051,10 +1102,7 @@ export class SIEClient {
       provisionTimeoutMs: this.provisionTimeout,
     });
 
-    const data = (await response.json()) as Record<string, unknown>;
-    if (data === null || typeof data !== "object") {
-      throw new RequestError("Unexpected generate response shape");
-    }
+    const data = await parseTerminalJsonObject(response, "generate");
     const result = parseGenerateResult(data);
     attachRequestMetadata([result], response.headers, data);
     return result;
@@ -1084,12 +1132,14 @@ export class SIEClient {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.timeout);
     try {
-      return await fetch(url, {
+      const response = await fetch(url, {
         method: "POST",
         headers,
         body: JSON.stringify(body),
         signal: controller.signal,
+        redirect: "error",
       });
+      return response;
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") {
         throw new SIEConnectionError(`Request timeout after ${this.timeout}ms`, "timeout");
@@ -1178,10 +1228,10 @@ export class SIEClient {
 
     this.checkServerVersion(response);
 
-    const data = (await response.json()) as ChatCompletion;
-    if (data === null || typeof data !== "object") {
-      throw new RequestError("Unexpected chat.completion response shape");
-    }
+    const data = (await parseTerminalJsonObject(
+      response,
+      "chat.completion",
+    )) as unknown as ChatCompletion;
     attachRequestMetadata([data], response.headers, data);
     return data;
   }
@@ -1389,6 +1439,7 @@ export class SIEClient {
             headers,
             body: JSON.stringify(body),
             signal: controller.signal,
+            redirect: "error",
           });
         } catch (error) {
           if (signal?.aborted) {
@@ -1805,6 +1856,7 @@ export class SIEClient {
         headers,
         body: JSON.stringify(requestBody),
         signal: controller.signal,
+        redirect: "error",
       });
 
       if (response.status >= HTTP_CLIENT_ERROR_MIN) {
@@ -1862,6 +1914,7 @@ export class SIEClient {
                 method: "POST",
                 headers: renewHeaders,
                 signal: perAttempt.signal,
+                redirect: "error",
               });
               if (resp.ok) break;
             } catch {
@@ -1996,6 +2049,7 @@ export class SIEClient {
           method: "DELETE",
           headers,
           signal: controller.signal,
+          redirect: "error",
         });
 
         return response.ok || response.status === 404;
@@ -2375,6 +2429,7 @@ export class SIEClient {
         headers,
         body: body !== undefined ? packMessage(body) : undefined,
         signal: controller.signal,
+        redirect: "error",
       });
 
       return response;
@@ -2415,6 +2470,7 @@ export class SIEClient {
         method,
         headers,
         signal: controller.signal,
+        redirect: "error",
       });
 
       if (!response.ok) {
@@ -2472,6 +2528,7 @@ export class SIEClient {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
     init.signal = controller.signal;
+    init.redirect = "error";
     try {
       const response = await fetch(url, init);
       if (!response.ok) {
@@ -2564,25 +2621,40 @@ export class SIEClient {
   }
 
   private async jobResults(jobId: string): Promise<JobResults> {
-    const job = await this.jobGet(jobId);
-    const chunks = jobChunks(job);
-    const items: JobResultItem[] = [];
-    for (const chunk of chunks) {
-      if (chunk.state !== "succeeded" || !chunk.ref) continue;
-      const raw = await this.readRef(chunk.ref);
-      items.push(...decodeChunkBytes(raw));
+    let refreshes = 0;
+    for (;;) {
+      const job = await this.jobGet(jobId);
+      const chunks = jobChunks(job);
+      const items: JobResultItem[] = [];
+      try {
+        for (const chunk of chunks) {
+          if (chunk.state !== "succeeded" || !chunk.ref) continue;
+          const raw = await this.readRef(chunk.ref);
+          items.push(...decodeChunkBytes(raw));
+        }
+      } catch (error) {
+        const refreshable =
+          error instanceof RequestError &&
+          error.statusCode === 404 &&
+          error.code === JOB_RESULT_NOT_FOUND_ERROR_CODE;
+        if (refreshable && refreshes < JOB_RESULT_REF_MAX_REFRESHES) {
+          refreshes += 1;
+          continue;
+        }
+        throw error;
+      }
+      const withDims = items.find((it) => it.dims != null);
+      return {
+        job_id: job.id ?? jobId,
+        state: job.state,
+        total_items: job.total_items,
+        settled_credits: job.settled_credits,
+        chunks,
+        retrieved: items.length,
+        dims: withDims ? withDims.dims : null,
+        items,
+      };
     }
-    const withDims = items.find((it) => it.dims != null);
-    return {
-      job_id: job.id ?? jobId,
-      state: job.state,
-      total_items: job.total_items,
-      settled_credits: job.settled_credits,
-      chunks,
-      retrieved: items.length,
-      dims: withDims ? withDims.dims : null,
-      items,
-    };
   }
 
   private async jobWait(
@@ -2623,6 +2695,7 @@ export class SIEClient {
       const response = await fetch(ref, {
         headers: { Accept: "application/octet-stream" },
         signal: controller.signal,
+        redirect: "error",
       });
       if (!response.ok) {
         await handleError(response);
@@ -2729,6 +2802,7 @@ export class SIEClient {
         headers,
         body,
         signal: controller.signal,
+        redirect: "error",
       });
       if (!response.ok) {
         await handleError(response);
@@ -2761,7 +2835,12 @@ export class SIEClient {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.timeout);
     try {
-      const response = await fetch(url, { method: "GET", headers, signal: controller.signal });
+      const response = await fetch(url, {
+        method: "GET",
+        headers,
+        signal: controller.signal,
+        redirect: "error",
+      });
       if (!response.ok) {
         await handleError(response);
       }
@@ -2946,6 +3025,7 @@ export class SIEClient {
         method: "GET",
         headers,
         signal: controller.signal,
+        redirect: "error",
       });
 
       if (!response.ok) {

@@ -70,7 +70,11 @@ class TestGroundingDINOAdapter:
         ("labels", "instruction", "expected_prompt"),
         [
             (["Person", " car "], "ignored instruction", "person. car."),
-            (None, "find the damaged screen", "find the damaged screen"),
+            (None, " Find the Damaged Screen ", "find the damaged screen."),
+            (None, "text", "text."),
+            (None, "text.", "text."),
+            (None, "Text?", "text?."),
+            (None, "Text!", "text!."),
         ],
     )
     def test_extract_uses_labels_or_instruction_prompt(

@@ -1307,16 +1307,18 @@ class TestProcessExtractBatch:
         assert requests[0].prepared_items == [prepared_item]
 
     @pytest.mark.asyncio
-    async def test_single_item_publish_and_ack(self) -> None:
+    async def test_extract_results_echo_or_generate_original_item_ids(self) -> None:
         reg = _make_registry()
         worker = AsyncMock()
         extract_output = ExtractOutput(
             entities=[[{"text": "Alice", "label": "person", "score": 0.99, "start": 0, "end": 5}]]
         )
-        wr = WorkerResult(output=extract_output, timing=RequestTiming())
-        fut: asyncio.Future[WorkerResult] = asyncio.Future()
-        fut.set_result(wr)
-        worker.submit_extract_preformed_batch = AsyncMock(return_value=[fut])
+        futures: list[asyncio.Future[WorkerResult]] = []
+        for _ in range(2):
+            fut: asyncio.Future[WorkerResult] = asyncio.Future()
+            fut.set_result(WorkerResult(output=extract_output, timing=RequestTiming()))
+            futures.append(fut)
+        worker.submit_extract_preformed_batch = AsyncMock(return_value=futures)
         reg.start_worker = AsyncMock(return_value=worker)
 
         ex = QueueExecutor(reg)
@@ -1328,18 +1330,28 @@ class TestProcessExtractBatch:
                         work_item_id="req-1.0",
                         request_id="req-1",
                         item_index=0,
-                        total_items=1,
+                        total_items=2,
                         timestamp=time.time(),
-                        item={"text": "Alice works at Acme."},
+                        item={"id": "caller-id", "text": "Alice works at Acme."},
                         labels=["person"],
-                    )
+                    ),
+                    ExtractBatchItem(
+                        work_item_id="req-1.1",
+                        request_id="req-1",
+                        item_index=1,
+                        total_items=2,
+                        timestamp=time.time(),
+                        item={"text": "Bob works at Example."},
+                        labels=["person"],
+                    ),
                 ],
             )
         )
 
-        assert outcome.outcomes[0].disposition == "publish_and_ack"
-        inner = msgpack.unpackb(outcome.outcomes[0].result_msgpack, raw=False)
-        assert "entities" in inner
+        assert [item.work_item_id for item in outcome.outcomes] == ["req-1.0", "req-1.1"]
+        assert [item.disposition for item in outcome.outcomes] == ["publish_and_ack", "publish_and_ack"]
+        result_ids = [msgpack.unpackb(item.result_msgpack, raw=False)["id"] for item in outcome.outcomes]
+        assert result_ids == ["caller-id", "item-1"]
 
     @pytest.mark.asyncio
     async def test_effective_profile_options_drive_lora_grouping_and_invalid_is_per_item(self) -> None:

@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 
 
 def test_serve_passes_sie_pool_to_app_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _clear_unrelated_serve_env(monkeypatch)
     captured: dict[str, Any] = {}
 
     def fake_run_server(*, config: AppStateConfig, **kwargs: Any) -> None:
@@ -93,9 +94,99 @@ def _write_model(
 def _clear_unrelated_serve_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep CLI tests independent from suite-level env round-trip tests."""
     monkeypatch.delenv("SIE_BUNDLE", raising=False)
+    monkeypatch.delenv("SIE_DEVICE", raising=False)
     monkeypatch.delenv("SIE_EXTRA_MODELS", raising=False)
+    monkeypatch.delenv("SIE_DEVICES", raising=False)
+    monkeypatch.delenv("SIE_MODELS_DIR", raising=False)
+    monkeypatch.delenv("SIE_MODEL_FILTER", raising=False)
     monkeypatch.delenv("SIE_POOL", raising=False)
     monkeypatch.delenv("SIE_PRELOAD_MODELS", raising=False)
+    monkeypatch.delenv("SIE_PINNED_MODELS", raising=False)
+
+
+def test_serve_preserves_env_backed_runtime_config_through_uvicorn_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Environment-backed serve config survives run_server's env round trip."""
+    _clear_unrelated_serve_env(monkeypatch)
+    model_ids = ["org/preload-a", "org/preload-b", "org/pinned-a", "org/pinned-b"]
+    for index, model_id in enumerate(model_ids):
+        _write_model(tmp_path / f"model-{index}.yaml", sie_id=model_id)
+    captured: dict[str, AppStateConfig] = {}
+
+    def fake_run_server(*, config: AppStateConfig, **kwargs: Any) -> None:
+        config.save_to_env_vars()
+        captured["config"] = AppStateConfig.from_env_vars()
+
+    monkeypatch.setenv("SIE_POOL", "customer-a")
+    monkeypatch.setenv("SIE_DEVICES", "cpu")
+    monkeypatch.setenv("SIE_PRELOAD_MODELS", "org/preload-a, org/preload-b")
+    monkeypatch.setenv("SIE_PINNED_MODELS", "ORG/PINNED-A:default, org/pinned-b")
+    monkeypatch.setattr(cli, "run_server", fake_run_server)
+
+    try:
+        cli.serve(
+            port=8080,
+            host="127.0.0.1",
+            device="cpu",
+            models_dir=str(tmp_path),
+            bundle=None,
+            models=",".join(model_ids),
+            local_cache=None,
+            cluster_cache=None,
+            hf_fallback=True,
+            reload=False,
+            tracing=False,
+            instrumentation=False,
+            verbose=False,
+            log_level="info",
+            preload=None,
+            json_logs=False,
+        )
+    finally:
+        monkeypatch.delenv("SIE_BUNDLE", raising=False)
+        monkeypatch.delenv("SIE_HF_FALLBACK", raising=False)
+        monkeypatch.delenv("SIE_INSTRUMENTATION", raising=False)
+
+    config = captured["config"]
+    assert config.devices == ["cpu"]
+    assert config.pool_name == "customer-a"
+    assert config.preload_models == ["org/preload-a", "org/preload-b"]
+    assert config.pinned_models == ["ORG/PINNED-A:default", "org/pinned-b"]
+    assert "Pinned (from env): 2 models will be kept resident" in capsys.readouterr().out
+
+
+def test_serve_rejects_pinned_models_outside_model_filter(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_unrelated_serve_env(monkeypatch)
+    bundles_dir = tmp_path / "bundles"
+    models_dir = tmp_path / "models"
+    bundles_dir.mkdir()
+    models_dir.mkdir()
+    _write_bundle(bundles_dir / "fake.yaml", name="fake")
+    _write_model(models_dir / "selected.yaml", sie_id="org/selected")
+    called = False
+
+    def fake_run_server(*, config: AppStateConfig, **kwargs: Any) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setenv("SIE_PINNED_MODELS", "org/not-selected")
+    monkeypatch.setattr(cli, "_DEFAULT_BUNDLES_DIR", bundles_dir)
+    monkeypatch.setattr(cli, "run_server", fake_run_server)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["serve", "--device", "cpu", "--models-dir", str(models_dir), "--models", "org/selected"],
+    )
+
+    assert result.exit_code == 1
+    assert "Pinned model(s) not in model filter: org/not-selected" in result.output
+    assert not called
 
 
 def test_load_bundle_filters_models_by_sie_pool(tmp_path: Path) -> None:

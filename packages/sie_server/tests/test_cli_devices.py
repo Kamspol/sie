@@ -9,6 +9,8 @@ from typer.testing import CliRunner
 
 def test_serve_threads_sie_devices_env_to_app_config(monkeypatch, tmp_path) -> None:
     """Helm-rendered SIE_DEVICES reaches AppStateConfig through the CLI path."""
+    monkeypatch.delenv("SIE_PRELOAD_MODELS", raising=False)
+    monkeypatch.delenv("SIE_PINNED_MODELS", raising=False)
     captured: dict[str, AppStateConfig] = {}
 
     def fake_run_server(**kwargs: Any) -> None:

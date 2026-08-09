@@ -1942,7 +1942,8 @@ def _extract_success_outcome(
         # Adapter returned no results for a single-item request — surface an
         # error instead of publishing an object the client reads as success.
         return _error_outcome(bi, _INFERENCE_ERROR_CODE, "adapter returned no extraction results")
-    result_msgpack = msgpack.packb(extraction_results[0], use_bin_type=True)
+    item_id = server_item.id if server_item.id is not None else f"item-{bi.item_index}"
+    result_msgpack = msgpack.packb({**extraction_results[0], "id": item_id}, use_bin_type=True)
 
     return ItemOutcome(
         work_item_id=bi.work_item_id,

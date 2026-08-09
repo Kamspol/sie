@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.7.0
+
+- chore(release): refresh locks and generated sources
+- chore(main): release 0.7.0
+- fix(release): unpin sidecar path dependency
+- fix(sdk): refresh stale job result refs
+- fix(cloud): align catalog canary model contracts
+- fix(server): normalize Grounding DINO instructions
+- test(server): isolate serve environment fixtures
+- fix(server): validate pinned model selection
+- fix(server): preserve pinned models in serve config
+- fix(clients): address terminal response review
+- fix(cloud): harden generation response handling
+- feat(cloud): bill audio_ms at a 1,150 ms minimum duration
+- fix(server): echo queued extract item ids
+- fix(deps): declare requests and huggingface-hub in the serving distribution
+- fix(deps): provide the dependencies the bundle and the eval already declare
+
 ## v0.6.30
 
 - chore(release): refresh locks and generated sources

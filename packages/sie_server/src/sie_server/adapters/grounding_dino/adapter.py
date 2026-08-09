@@ -199,7 +199,9 @@ class GroundingDINOAdapter(BaseAdapter):
         if labels:
             text_prompt = " ".join(f"{label.lower().strip()}." for label in labels)
         elif instruction and instruction.strip():
-            text_prompt = instruction.strip()
+            text_prompt = instruction.strip().lower()
+            if not text_prompt.endswith("."):
+                text_prompt += "."
         else:
             raise ValueError(_ERR_NO_PROMPT)
 

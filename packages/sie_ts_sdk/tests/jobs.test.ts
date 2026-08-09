@@ -444,6 +444,102 @@ describe("client.jobs", () => {
     expect(Array.from(results.items[0].dense as number[])).toEqual([0.1, 0.2, 0.3, 0.4]);
   });
 
+  it("results refreshes the job after a replica miss and discards partial items", async () => {
+    const chunk = (id: string) =>
+      packMessage([
+        {
+          success: true,
+          id,
+          units: { input_tokens: 5 },
+          result_msgpack: packMessage({ dense: { dims: 2, values: [0.1, 0.2] } }),
+        },
+      ]);
+    const job = (prefix: string) => ({
+      id: "job-1",
+      state: "succeeded",
+      total_items: 2,
+      output: {
+        kind: "refs",
+        chunks: [
+          { seq: 0, items: 1, state: "succeeded", ref: `http://refs.local/${prefix}-0` },
+          { seq: 1, items: 1, state: "succeeded", ref: `http://refs.local/${prefix}-1` },
+        ],
+      },
+    });
+    mockFetch
+      .mockResolvedValueOnce(jsonResponse(job("stale")))
+      .mockResolvedValueOnce(new Response(chunk("discarded"), { status: 200 }))
+      .mockResolvedValueOnce(
+        jsonResponse({ detail: { code: "RESULT_NOT_FOUND", message: "not on this replica" } }, 404),
+      )
+      .mockResolvedValueOnce(jsonResponse(job("fresh")))
+      .mockResolvedValueOnce(new Response(chunk("0"), { status: 200 }))
+      .mockResolvedValueOnce(new Response(chunk("1"), { status: 200 }));
+
+    const client = new SIEClient("http://gw:8080");
+    const results = await client.jobs.results("job-1");
+
+    expect(mockFetch).toHaveBeenCalledTimes(6);
+    expect(results.retrieved).toBe(2);
+    expect(results.items.map((item) => item.id)).toEqual(["0", "1"]);
+    expect(results.chunks.map((chunk) => chunk.ref)).toEqual([
+      "http://refs.local/fresh-0",
+      "http://refs.local/fresh-1",
+    ]);
+  });
+
+  it("results bounds replica-miss refreshes", async () => {
+    const job = {
+      id: "job-1",
+      state: "succeeded",
+      output: {
+        kind: "refs",
+        chunks: [{ seq: 0, items: 1, state: "succeeded", ref: "http://refs.local/stale" }],
+      },
+    };
+    const expectedAttempts = 4;
+    for (let attempt = 0; attempt < expectedAttempts; attempt += 1) {
+      mockFetch
+        .mockResolvedValueOnce(jsonResponse(job))
+        .mockResolvedValueOnce(
+          jsonResponse(
+            { detail: { code: "RESULT_NOT_FOUND", message: "not on this replica" } },
+            404,
+          ),
+        );
+    }
+
+    const client = new SIEClient("http://gw:8080");
+    await expect(client.jobs.results("job-1")).rejects.toMatchObject({
+      code: "RESULT_NOT_FOUND",
+      statusCode: 404,
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(expectedAttempts * 2);
+  });
+
+  it.each([
+    [404, "NOT_FOUND"],
+    [503, "STORAGE_UNAVAILABLE"],
+  ])("results does not refresh unrelated ref failure %i %s", async (status, code) => {
+    const job = {
+      id: "job-1",
+      state: "succeeded",
+      output: {
+        kind: "refs",
+        chunks: [{ seq: 0, items: 1, state: "succeeded", ref: "http://refs.local/ref" }],
+      },
+    };
+    mockFetch
+      .mockResolvedValueOnce(jsonResponse(job))
+      .mockResolvedValueOnce(
+        jsonResponse({ detail: { code, message: "terminal ref failure" } }, status),
+      );
+
+    const client = new SIEClient("http://gw:8080");
+    await expect(client.jobs.results("job-1")).rejects.toMatchObject({ code, statusCode: status });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
   it("wait polls until the job reaches a terminal state", async () => {
     mockFetch
       .mockResolvedValueOnce(jsonResponse({ id: "job-1", state: "running" }))
