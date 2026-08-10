@@ -37,6 +37,27 @@ def evaluate_review(review: dict[str, Any]) -> list[Check]:
     excluded = str(decision.get("excluded_scope", "")).casefold()
     evidence = str(decision.get("evidence_needed", "")).casefold()
     overlap = str(decision.get("prior_claim_check", "")).casefold()
+    overlap_findings = [
+        str(finding.get("evidence", "")).casefold()
+        for finding in findings
+        if finding.get("category") == "prior_claim_overlap"
+    ]
+    overlap_actions = [
+        str(action).casefold()
+        for action in review.get("next_actions", [])
+        if "prior claim" in str(action).casefold()
+        or "previous claim" in str(action).casefold()
+        or "payment overlap" in str(action).casefold()
+    ]
+
+    def preserves_prior_claim_timing(value: str) -> bool:
+        return (
+            ("same area" in value or "underneath the building" in value)
+            and "before" in value
+            and "july 2019" in value
+            and "repair" in value
+            and "pric" in value
+        )
 
     return [
         Check(
@@ -81,8 +102,10 @@ def evaluate_review(review: dict[str, Any]) -> list[Check]:
         ),
         Check(
             "prior-claim-overlap",
-            "previous" in overlap or "prior" in overlap,
-            str(decision.get("prior_claim_check")),
+            bool(overlap_findings)
+            and bool(overlap_actions)
+            and all(preserves_prior_claim_timing(value) for value in (overlap, *overlap_findings, *overlap_actions)),
+            " | ".join((overlap, *overlap_findings, *overlap_actions)),
         ),
         Check(
             "finding-categories",

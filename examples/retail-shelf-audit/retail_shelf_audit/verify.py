@@ -8,13 +8,21 @@ from typing import Any
 from PIL import Image
 
 from retail_shelf_audit.audit import (
+    _ocr_text,
     build_evidence,
     candidate_crop_box,
     nearby_price_candidates,
     select_gap,
     select_vertical_pair,
 )
-from retail_shelf_audit.config import RECORDED_DIR, ROOT
+from retail_shelf_audit.config import (
+    DINO_MODEL,
+    OCR_MODEL,
+    RECORDED_DIR,
+    ROOT,
+    SOURCE_IMAGE,
+    VERIFIED_DIR,
+)
 
 EXPECTED_OCR_FRAGMENTS = [
     "Panadol Child",
@@ -130,7 +138,80 @@ def verify_recorded_case() -> None:
         raise ValueError(f"Recorded detector evidence differs from reviewed case 042: {mismatches}")
 
 
+def verify_cloud_run() -> None:
+    manifest = _load(VERIFIED_DIR / "manifest.json")
+    if manifest.get("endpoint") != "https://api.superlinked.com":
+        raise ValueError("Verified run is not from the prod-US endpoint")
+    if manifest.get("models") != {"detection": DINO_MODEL, "ocr": OCR_MODEL}:
+        raise ValueError("Verified run model roster differs from the example config")
+    if manifest["source_input"].get("path") != SOURCE_IMAGE.relative_to(ROOT).as_posix():
+        raise ValueError("Verified run source image path differs")
+    if manifest["source_input"]["sha256"] != sha256(SOURCE_IMAGE):
+        raise ValueError("Verified run source image checksum differs")
+    expected_outputs = {
+        "crops/candidate-1.jpg",
+        "crops/candidate-2.jpg",
+        "evaluation.json",
+        "evidence.json",
+        "raw/grounding-dino.json",
+        "raw/lighton-ocr-candidate-1.json",
+        "raw/lighton-ocr-candidate-2.json",
+        "selection.json",
+    }
+    output_records = manifest.get("outputs")
+    if not isinstance(output_records, list):
+        raise TypeError("Verified run has no output checksum records")
+    output_paths = [record.get("path") for record in output_records if isinstance(record, dict)]
+    if len(output_paths) != len(output_records) or set(output_paths) != expected_outputs:
+        raise ValueError("Verified run output checksum scope differs")
+    for record in output_records:
+        path = VERIFIED_DIR / record["path"]
+        if sha256(path) != record["sha256"]:
+            raise ValueError(f"Verified run checksum differs for {record['path']}")
+
+    detector = _load(VERIFIED_DIR / "raw" / "grounding-dino.json")
+    upper_ocr = _load(VERIFIED_DIR / "raw" / "lighton-ocr-candidate-1.json")
+    lower_ocr = _load(VERIFIED_DIR / "raw" / "lighton-ocr-candidate-2.json")
+    request_ids: list[str] = []
+    for result, model in (
+        (detector, DINO_MODEL),
+        (upper_ocr, OCR_MODEL),
+        (lower_ocr, OCR_MODEL),
+    ):
+        if result.get("model") != model:
+            raise ValueError(f"Verified runtime model differs for {model}")
+        request = result.get("request")
+        request_id = request.get("id") if isinstance(request, dict) else None
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError(f"Verified response has no request ID for {model}")
+        request_ids.append(request_id)
+    if len(request_ids) != len(set(request_ids)):
+        raise ValueError("Verified responses reuse a request ID")
+
+    gap = select_gap(detector["objects"], (4032, 3024))
+    _upper, lower = select_vertical_pair(nearby_price_candidates(detector["objects"], gap))
+    actual = build_evidence(
+        gap,
+        lower,
+        _ocr_text(upper_ocr),
+        _ocr_text(lower_ocr),
+    )
+    if actual != _load(VERIFIED_DIR / "evidence.json"):
+        raise ValueError("Verified production evidence is not reproducible from raw responses")
+    expected_evaluation = {
+        "passed": True,
+        "checks": {
+            "non_strip_gap_selected": True,
+            "nearby_vertical_price_pair_selected": True,
+            "minimum_ocr_fragments_recovered": True,
+        },
+    }
+    if _load(VERIFIED_DIR / "evaluation.json") != expected_evaluation:
+        raise ValueError("Verified production evaluation did not pass")
+
+
 def main() -> None:
     verify_manifest()
     verify_recorded_case()
-    print("Recorded checksums, DINO geometry, and derived-crop OCR evidence are valid.")
+    verify_cloud_run()
+    print("Recorded and prod-US checksums, model IDs, geometry, and OCR evidence are valid.")

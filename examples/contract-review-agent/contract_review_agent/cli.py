@@ -24,6 +24,11 @@ from .app import (
 from .config import load_config
 from .data import make_sample
 from .data.paths import CUAD_DIR, GENERATED_DIR, MANIFEST_PATH
+from .evidence import (
+    ensure_run_destination_available,
+    validate_run_id,
+    write_run_record,
+)
 from .runtime import AppContext, Ledger, instruct_once, provision_timeout_from
 
 console = Console()
@@ -136,20 +141,35 @@ def _print_review(review: ContractReview) -> None:
         console.print(risks)
 
 
-def _resolve_corpus(args) -> tuple[str, str, str, str]:
-    """Return (contract_text, scan_path, db_path, label)."""
+def _guardrail_unavailable(ledger: Ledger) -> bool:
+    return bool(
+        ledger.entries
+        and ledger.entries[-1].step.startswith("Safety guardrail")
+        and ledger.entries[-1].got.startswith("unavailable:")
+    )
+
+
+def _resolve_corpus(args) -> tuple[str, str, str, str, str | None]:
+    """Return text, scan, obligations DB, display label, and DB counterparty."""
     # Explicit file path wins.
     if args.contract and Path(args.contract).is_file():
         p = Path(args.contract)
         scan = args.scan or str(GENERATED_DIR / "acme-msa-signature.png")
-        return p.read_text(), scan, str(GENERATED_DIR / "obligations.db"), p.name
+        return p.read_text(), scan, str(GENERATED_DIR / "obligations.db"), p.name, None
 
     if MANIFEST_PATH.exists():  # real CUAD corpus
         manifest = json.loads(MANIFEST_PATH.read_text())
         slug = args.contract or manifest["primary"]
+        contract = next(row for row in manifest["contracts"] if row["slug"] == slug)
         text = (CUAD_DIR / f"{slug}.txt").read_text()
         scan = args.scan or str(GENERATED_DIR / manifest["scan_path"])
-        return text, scan, str(GENERATED_DIR / manifest["db_path"]), f"CUAD · {slug}"
+        return (
+            text,
+            scan,
+            str(GENERATED_DIR / manifest["db_path"]),
+            f"CUAD · {slug}",
+            contract["counterparty"],
+        )
 
     # Offline fallback: synthetic corpus (generate it if missing).
     if not (GENERATED_DIR / "acme-msa.md").exists():
@@ -161,7 +181,18 @@ def _resolve_corpus(args) -> tuple[str, str, str, str]:
     name = args.contract or "acme-msa"
     text = (GENERATED_DIR / f"{name}.md").read_text()
     scan = args.scan or str(GENERATED_DIR / "acme-msa-signature.png")
-    return text, scan, str(GENERATED_DIR / "obligations.db"), f"synthetic · {name}"
+    counterparty = {
+        "acme-msa": "Acme Cloud Services, LLC",
+        "acme-sow": "Acme Cloud Services, LLC",
+        "mutual-nda": "Globex Corporation",
+    }.get(name)
+    return (
+        text,
+        scan,
+        str(GENERATED_DIR / "obligations.db"),
+        f"synthetic · {name}",
+        counterparty,
+    )
 
 
 def _list_contracts() -> None:
@@ -192,6 +223,7 @@ async def _warm(app: AppContext) -> None:
                     app,
                     model,
                     [{"role": "user", "content": "ok"}],
+                    stage="warmup",
                     max_tokens=1,
                 )
             except Exception as exc:  # noqa: BLE001 - warm-up is best effort.
@@ -204,8 +236,10 @@ async def _warm(app: AppContext) -> None:
 
 async def _run(args) -> None:
     set_tracing_disabled(True)
+    if args.run_id is not None:
+        ensure_run_destination_available(args.run_id)
     cfg = load_config()
-    text, scan_path, db_path, label = _resolve_corpus(args)
+    text, scan_path, db_path, label, obligation_counterparty = _resolve_corpus(args)
 
     _print_catalog(cfg)
     console.print(
@@ -218,6 +252,7 @@ async def _run(args) -> None:
         timeout_s=provision_timeout_from(cfg),
     ) as sie:
         ledger = Ledger()
+        api_calls: list[dict] = []
         app = AppContext(
             sie=sie,
             cfg=cfg,
@@ -225,10 +260,12 @@ async def _run(args) -> None:
             contract_text=text,
             scan_path=scan_path,
             db_path=db_path,
-            reasoning_agent=build_reasoning_agent(cfg, sie),
+            obligation_counterparty=obligation_counterparty,
+            api_calls=api_calls,
+            reasoning_agent=build_reasoning_agent(cfg, sie, api_calls),
         )
-        investigator = build_investigator(cfg, sie)
-        synthesizer = build_synthesizer(cfg, sie)
+        investigator = build_investigator(cfg, sie, api_calls)
+        synthesizer = build_synthesizer(cfg, sie, api_calls)
         if not args.no_warm:
             await _warm(app)
         t0 = time.monotonic()
@@ -237,14 +274,21 @@ async def _run(args) -> None:
                 app, investigator, synthesizer, args.instruction
             )
         except InputGuardrailTripwireTriggered:
+            unavailable = _guardrail_unavailable(ledger)
             console.print(
                 Panel(
-                    "Request blocked by the granite-guardian safety guardrail.",
+                    (
+                        "Safety guardrail unavailable; the contract review did not run."
+                        if unavailable
+                        else "Request blocked by the granite-guardian safety guardrail."
+                    ),
                     border_style="red",
-                    title="Guardrail tripped",
+                    title="Run failed" if unavailable else "Guardrail tripped",
                 )
             )
             _print_ledger(ledger)
+            if unavailable:
+                raise
             return
         except Exception as exc:
             console.print(
@@ -272,6 +316,24 @@ async def _run(args) -> None:
         _print_ledger(ledger)
         usage = getattr(getattr(gather, "context_wrapper", None), "usage", None)
         _print_summary(cfg, usage, wall)
+        if args.run_id is not None:
+            if not isinstance(review, ContractReview):
+                raise RuntimeError("Cannot record an unstructured contract review")
+            run_dir = write_run_record(
+                run_id=args.run_id,
+                endpoint=cfg["cluster"]["url"],
+                cfg=cfg,
+                label=label,
+                contract_text=text,
+                scan_path=scan_path,
+                db_path=db_path,
+                findings=str(gather.final_output),
+                review=review,
+                ledger=ledger,
+                api_calls=api_calls,
+                wall_s=wall,
+            )
+            console.print(f"Checked run evidence: [bold]{run_dir}[/]")
 
 
 def main() -> None:
@@ -288,9 +350,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--instruction",
-        default="Review this contract. Identify the parties and key terms, flag the "
-        "biggest risks to the Customer with severity and redlines, confirm it is "
-        "executed, and surface upcoming obligations and deadlines.",
+        default="Review this contract. Identify the parties and key terms, flag every "
+        "source-backed material risk to the Customer with severity and redlines, "
+        "assess whether signatures and dates are visible on the supplied signature "
+        "page, and surface outstanding obligations with their deadline status.",
         help="what to ask the agent to do",
     )
     parser.add_argument(
@@ -300,6 +363,12 @@ def main() -> None:
         "--no-warm",
         action="store_true",
         help="skip pre-warming models (faster when the cluster is already warm)",
+    )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        type=validate_run_id,
+        help="write reproducible evidence under runs/<run-id> after a passing run",
     )
     args = parser.parse_args()
 

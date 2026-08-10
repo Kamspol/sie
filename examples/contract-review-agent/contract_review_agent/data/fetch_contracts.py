@@ -22,6 +22,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+import textwrap
 import zipfile
 from pathlib import Path
 
@@ -137,6 +138,20 @@ _OBLIGATION_PLANS = [
 ]
 
 
+def _signature_page_text(contract_text: str) -> str:
+    starts = [
+        match.start()
+        for marker in ("in witness whereof", "signature page", "signatures")
+        for match in re.finditer(re.escape(marker), contract_text, re.IGNORECASE)
+    ]
+    if starts:
+        return contract_text[max(starts) :]
+    wrapped_lines: list[str] = []
+    for raw_line in contract_text.splitlines():
+        wrapped_lines.extend(textwrap.wrap(raw_line, width=92) or [""])
+    return "\n".join(wrapped_lines[-46:])
+
+
 def build_obligations(contracts: list[dict]) -> int:
     DB_PATH.unlink(missing_ok=True)
     rows = []
@@ -175,7 +190,11 @@ def main() -> None:
 
     primary = contracts[0]
     scan_path = CUAD_DIR / f"{primary['slug']}-page.png"
-    render_text_page(primary["text"], scan_path, title=primary["title"])
+    render_text_page(
+        _signature_page_text(primary["text"]),
+        scan_path,
+        title=f"{primary['title']} — signature page",
+    )
 
     n_obligations = build_obligations(contracts)
 

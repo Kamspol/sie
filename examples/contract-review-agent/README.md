@@ -1,6 +1,6 @@
 # Contract review with the OpenAI Agents SDK, on one SIE cluster
 
-A multi-agent contract reviewer built with the [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/) where **every model call is served by SIE**. No `api.openai.com`; managed calls are metered by SIE's native primitives. An **investigator** agent autonomously calls tools to gather grounded facts, then a **synthesizer** agent turns them into a structured review. Each step runs on the **right model from the SIE catalog**: a fast triage model, a vision model that reads the scanned signature page, a reasoning sub-agent for clause risk, a text-to-SQL specialist, an OCR model, embedding and reranker models for clause search, a zero-shot entity extractor, and a safety guardrail. Ten specialized jobs, one cluster.
+A multi-agent contract reviewer built with the [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/) where **every model call is served by SIE**. No `api.openai.com`; managed calls are metered by SIE's native primitives. An **investigator** agent follows a required tool sequence to gather grounded facts, then a **synthesizer** agent turns them into a structured review. Each step runs on the **right model from the SIE catalog**: a fast triage model, a vision model that reads the scanned signature page, a reasoning sub-agent for clause risk, a text-to-SQL specialist, an OCR model, embedding and reranker models for clause search, a zero-shot entity extractor, and a safety guardrail. Ten specialized jobs, one cluster.
 
 This is the "one cluster powers every model your agent calls" idea from the [SIE landing page](https://superlinked.com), made real and runnable.
 
@@ -11,15 +11,15 @@ Every value below is a real model in the [SIE catalog](https://superlinked.com/m
 | Role in the agent | SIE model | SIE function |
 |---|---|---|
 | Triage: classify the document type | `Qwen/Qwen3.5-4B` | generate |
-| **Orchestrator**: plan, call tools, assemble the review | `Qwen/Qwen3.6-27B` (64K, non-thinking) | generate + tools + JSON schema |
+| **Orchestrator**: plan, call tools, assemble the review | `Qwen/Qwen3.6-27B` (non-thinking) | generate + tools + JSON schema |
 | Vision: read the scanned signature page | `Qwen/Qwen3.5-4B` | generate + image |
-| Reasoning sub-agent: clause-risk analysis | `Qwen/Qwen3.5-4B` | generate |
+| Reasoning sub-agent: bounded grounded clause-risk analysis | `Qwen/Qwen3.6-27B` | generate |
 | Text-to-SQL: query the obligations DB | `Qwen/Qwen3.5-4B` (raw-prompt specialists use `sql.mode: prompt`) | generate |
 | Guardrail: safety / prompt-injection | `ibm-granite/granite-guardian-3.0-2b` (alias `guard`) | generate |
 | OCR: scanned page to markdown | `lightonai/LightOnOCR-2-1B` | extract |
 | Clause search: dense embeddings | `BAAI/bge-m3` | encode |
 | Clause rerank: cross-encoder | `Qwen/Qwen3-Reranker-4B` | score |
-| Entity extraction: parties, dates, amounts | `urchade/gliner_multi-v2.1` | extract |
+| Entity extraction: parties, dates, amounts | `fastino/gliner2-large-v1` | extract |
 
 ## How it works
 
@@ -38,23 +38,30 @@ Agent(
 )
 ```
 
-For each agent turn, the adapter builds a strict JSON Schema whose valid result
-is either one declared function call or a final answer. SIE performs the
-schema-constrained generation through its native primitive; the Agents SDK
-executes declared Python tools and passes their results into the next turn.
-Structured final output uses the agent's declared Pydantic schema. The example never calls an OpenAI-compatible endpoint or sends data to
-`api.openai.com`. The text-to-SQL tool may execute model-generated SQL only
-after enforcing one SELECT statement; it never executes generated Python or
-shell code. The SDK normalizes slash-form catalog IDs into wire-safe paths,
-but the example never substitutes one catalog model for another.
+For each required investigation step, the adapter emits the configured tool
+call directly and binds its fixed query or question. This prevents a model from
+skipping a required source or copying large clause payloads into arguments.
+After the required sequence, SIE performs the final unstructured investigator
+turn through its native generation primitive. The example passes the
+investigator's final grounded findings, rather than its raw tool messages, into
+a separate synthesizer turn. Only that synthesizer uses the agent's declared
+Pydantic schema for structured final output. The example never calls an
+OpenAI-compatible endpoint or sends data to `api.openai.com`. The text-to-SQL
+tool may execute model-generated SQL only after enforcing one SELECT statement;
+it never executes generated Python or shell code. The SDK normalizes slash-form
+catalog IDs into wire-safe paths, but the example never substitutes one catalog
+model for another.
 
-The flow is **two agents**:
+The core flow is an investigator plus a synthesizer with a reasoning sub-agent.
+For the checked-in published example, source-specific publication gates assemble
+the final narrative from the validated signature evidence, source clauses,
+structured risks, and exact SQL rows if the investigator's prose is incomplete:
 
 1. An **investigator** (on `Qwen3.6-27B`) with seven tools and **no** structured `output_type`, so it can't short-circuit to a hallucinated answer. It must call tools to learn anything about the contract:
    - `classify_document` (triage) · `read_signature_page` (vision) · `analyze_clause_risks` (delegates to the reasoning **sub-agent**): generative LLMs
    - `ocr_signature_page` · `extract_entities` (`extract`), `search_clauses` (`encode` + `score`), `query_obligations_db` (`generate`): retrieval and extraction
-   - a `granite-guardian` **input guardrail** screens the request first (and fails open, logged, if the guard model is unavailable).
-2. A **synthesizer** (structured `output_type=ContractReview`, no tools) turns the investigator's grounded findings into the final review (parties, dates, governing law, executed?, key obligations, risk flags with severity plus redlines, recommendation) via SIE's JSON-schema-constrained generation.
+   - a `granite-guardian` **input guardrail** screens the request first and fails closed if the guard model is unavailable.
+2. A **synthesizer** (structured `output_type=ContractReview`, no tools) turns the investigator's grounded findings into the final review (parties, dates, governing law, executed?, key obligations, risk flags with severity plus redlines, recommendation) via SIE's JSON-schema-constrained generation. Complete validated SQL rows and structured clause risks are retained as evidence appendices, so narrative assembly cannot silently drop either specialist's result.
 
 > Two agents instead of one: a single structured-output agent tends to emit the schema immediately and skip the tools, sometimes hallucinating the fields. Splitting "gather with tools" from "format the result" keeps the fan-out real and the output grounded.
 
@@ -77,9 +84,10 @@ uv run fetch-contracts                 # or: uv run make-sample  (offline synthe
 # 3. Review the first contract and watch the model fan-out.
 uv run review                          # uv run review --list   to see available contracts
 uv run review --contract <slug>        # review a specific one
+uv run review --run-id local           # also write a reproducible evidence bundle
 ```
 
-> **GPU sizing.** The brain (`orchestrator`, which also does the structured synthesis) runs on `Qwen/Qwen3.6-27B` (64K, non-thinking), so it needs an H100 or RTX PRO 6000. The shorter-context roles (`triage`, `vision`, `reasoning`, `sql`) run on `Qwen/Qwen3.5-4B`. A cold cluster pays a one-time load per model on first use; the agent retries the "still provisioning" responses under `cluster.provision_timeout_s`. Keep bundles warm (`minReplicas: 1`) to skip the wait. A required model or tool failure is printed with the partial ledger and exits nonzero.
+> **GPU sizing.** The orchestrator, structured synthesizer, and bounded clause analyst run on `Qwen/Qwen3.6-27B` (non-thinking), so they need an H100 or RTX PRO 6000. The latency-sensitive roles (`triage`, `vision`, `sql`) run on `Qwen/Qwen3.5-4B`. A cold cluster pays a one-time load per model on first use; the agent retries the "still provisioning" responses under `cluster.provision_timeout_s`. Keep bundles warm (`minReplicas: 1`) to skip the wait. A required model or tool failure is printed with the partial ledger and exits nonzero.
 
 ## What you'll see
 
@@ -89,6 +97,22 @@ the step's model, native SIE primitive, total latency, data sent, and available
 throughput. Every primitive uses the SDK's governed capacity wait. Try
 `--instruction "..."` to change the ask, or feed the guardrail a malicious
 prompt to watch `granite-guardian` trip the tripwire.
+
+The printed table and `ledger.json` are the user-facing, tool-level
+observability record. `api-calls.json` is the complete native call ledger,
+including repeated search encoding and investigator and synthesizer turns.
+
+`verified-run/` contains the August 10, 2026, prod-US record. Its manifest pins
+the endpoint, run date, input hashes, models, artifact hashes, and diagnostic
+wall time. `api-calls.json` preserves requested and runtime model IDs, request
+IDs, rate-book versions, execution identities, debited credits, and stable
+workflow stages. `source-evidence.json` records the exact full-contract section excerpt behind each published risk flag, plus its hash. The evaluation requires the ordered tool and agent
+sequence, including each stage's configured model and native primitive, and
+permits at most one structured synthesis repair; historical bundles may include
+at most one findings-audit pass. The publisher itself normalizes line endings and trailing whitespace only. Current runs require an exact safe
+guardrail verdict and atomically discard any rejected bundle. Historical ledger
+entries therefore remain evidence of what the endpoint returned rather than
+being rewritten to satisfy newer validation.
 
 ## Swapping models (the point of the catalog)
 
@@ -104,7 +128,7 @@ Alternatively, resolve roles **server-side** with SIE's gateway aliases. Set `SI
 
 ## Data
 
-The default corpus is **[CUAD](https://www.atticusprojectai.org/cuad/)** (Contract Understanding Atticus Dataset): 510 real commercial contracts filed with the SEC, released by The Atticus Project under **CC BY 4.0**. `fetch-contracts` downloads CUAD's ~18 MB archive once (from the [Atticus Project repo](https://github.com/TheAtticusProject/cuad)), parses the SQuAD-format contract text, writes a curated handful as the corpus, renders one page to an image for the OCR/vision step, and seeds a small SQLite obligations database that references the contracts pulled.
+The default corpus is **[CUAD](https://www.atticusprojectai.org/cuad/)** (Contract Understanding Atticus Dataset): 510 real commercial contracts filed with the SEC, released by The Atticus Project under **CC BY 4.0**. `fetch-contracts` downloads CUAD's ~18 MB archive once (from the [Atticus Project repo](https://github.com/TheAtticusProject/cuad)), parses the SQuAD-format contract text, writes a curated handful as the corpus, renders the contract's signature block to an image for the OCR/vision step (falling back to the document tail when no signature marker exists), and seeds a small SQLite obligations database that references the contracts pulled.
 
 > CUAD: An Expert-Annotated NLP Dataset for Legal Contract Review. Dan Hendrycks, Collin Burns, Anya Chen, Spencer Ball. arXiv:2103.06268. Licensed CC BY 4.0.
 

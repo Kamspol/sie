@@ -1,16 +1,32 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+import retail_shelf_audit.audit as audit_module
 from retail_shelf_audit.audit import (
     build_evidence,
     candidate_crop_box,
+    evaluation_checks,
     nearby_price_candidates,
     ocr_fragments,
     select_gap,
     select_vertical_pair,
 )
 from retail_shelf_audit.verify import EXPECTED_OCR_FRAGMENTS
+
+
+@pytest.mark.parametrize("run_id", ["", ".", "..", "../escape", "nested/run", "nested\\run"])
+def test_run_audit_rejects_unsafe_run_id_before_setup(run_id: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        audit_module,
+        "load_config",
+        lambda: pytest.fail("load_config must not run for an unsafe run ID"),
+    )
+
+    with pytest.raises(ValueError, match="safe directory name"):
+        audit_module.run_audit(run_id)
 
 
 def _objects() -> list[dict]:
@@ -108,3 +124,120 @@ def test_build_evidence_preserves_model_outputs() -> None:
         },
         "ocr_fragments": EXPECTED_OCR_FRAGMENTS,
     }
+
+
+def test_evaluation_checks_are_derived_from_selected_evidence() -> None:
+    upper, lower = select_vertical_pair(nearby_price_candidates(_objects(), _gap()))
+    checks = evaluation_checks(
+        _objects(),
+        _gap(),
+        upper,
+        lower,
+        "I am temporarily\nout-of-stock\nfrom our supplier",
+        "Panadol Child\n5-12Yrs Elixir 100ml\n101760\n10⁹⁹",
+        (4032, 3024),
+    )
+    assert checks == {
+        "non_strip_gap_selected": True,
+        "nearby_vertical_price_pair_selected": True,
+        "minimum_ocr_fragments_recovered": True,
+    }
+
+
+def test_evaluation_checks_fail_on_incomplete_ocr() -> None:
+    upper, lower = select_vertical_pair(nearby_price_candidates(_objects(), _gap()))
+    checks = evaluation_checks(
+        _objects(),
+        _gap(),
+        upper,
+        lower,
+        "one\ntwo",
+        "three\nfour",
+        (4032, 3024),
+    )
+    assert checks == {
+        "non_strip_gap_selected": True,
+        "nearby_vertical_price_pair_selected": True,
+        "minimum_ocr_fragments_recovered": False,
+    }
+
+
+def test_evaluation_checks_reject_a_full_width_strip_gap() -> None:
+    upper, lower = select_vertical_pair(nearby_price_candidates(_objects(), _gap()))
+    checks = evaluation_checks(
+        _objects(),
+        _objects()[0],
+        upper,
+        lower,
+        "I am temporarily\nout-of-stock\nfrom our supplier",
+        "Panadol Child\n5-12Yrs Elixir 100ml\n101760\n10⁹⁹",
+        (4032, 3024),
+    )
+
+    assert checks["non_strip_gap_selected"] is False
+
+
+def test_evaluation_checks_reject_a_non_nearby_price_pair() -> None:
+    checks = evaluation_checks(
+        _objects(),
+        _gap(),
+        _objects()[5],
+        _price(),
+        "I am temporarily\nout-of-stock\nfrom our supplier",
+        "Panadol Child\n5-12Yrs Elixir 100ml\n101760\n10⁹⁹",
+        (4032, 3024),
+    )
+
+    assert checks["nearby_vertical_price_pair_selected"] is False
+
+
+def test_evaluation_checks_reject_a_valid_but_lower_ranked_pair() -> None:
+    gap = {
+        "label": "empty shelf space",
+        "score": 0.9,
+        "bbox": [0, 0, 1000, 1000],
+    }
+    best_upper = {"label": "price tag", "score": 0.9, "bbox": [100, 100, 100, 100]}
+    best_lower = {"label": "price tag", "score": 0.8, "bbox": [100, 210, 100, 100]}
+    other_upper = {"label": "price tag", "score": 0.4, "bbox": [400, 100, 100, 100]}
+    other_lower = {"label": "price tag", "score": 0.3, "bbox": [400, 210, 100, 100]}
+    objects = [gap, best_upper, best_lower, other_upper, other_lower]
+
+    checks = evaluation_checks(
+        objects,
+        gap,
+        other_upper,
+        other_lower,
+        "I am temporarily\nout-of-stock\nfrom our supplier",
+        "Panadol Child\n5-12Yrs Elixir 100ml\n101760\n10⁹⁹",
+        (2000, 2000),
+    )
+
+    assert checks["nearby_vertical_price_pair_selected"] is False
+
+
+def test_run_audit_cleans_failed_staging_and_allows_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(audit_module, "RUNS_DIR", tmp_path)
+    monkeypatch.setattr(audit_module, "load_config", lambda: object())
+
+    def fail(run_dir: Path, _run_id: str, _config: object) -> None:
+        (run_dir / "partial.json").write_text("partial", encoding="utf-8")
+        raise RuntimeError("evidence failed")
+
+    monkeypatch.setattr(audit_module, "_write_audit", fail)
+    with pytest.raises(RuntimeError, match="evidence failed"):
+        audit_module.run_audit("retryable")
+
+    assert list(tmp_path.iterdir()) == []
+
+    def succeed(run_dir: Path, _run_id: str, _config: object) -> None:
+        (run_dir / "manifest.json").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(audit_module, "_write_audit", succeed)
+    final_run_dir = audit_module.run_audit("retryable")
+
+    assert final_run_dir == tmp_path / "retryable"
+    assert (final_run_dir / "manifest.json").is_file()

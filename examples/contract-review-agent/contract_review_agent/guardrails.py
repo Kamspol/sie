@@ -35,7 +35,12 @@ def _input_text(data: Any) -> str:
     return "\n".join(parts)
 
 
-@input_guardrail
+def _unsafe_verdict(verdict: str) -> bool:
+    normalized = verdict.strip().casefold().rstrip(".,!;:")
+    return normalized != "no"
+
+
+@input_guardrail(run_in_parallel=False)
 async def safety_guardrail(
     ctx: RunContextWrapper[AppContext], agent: Agent, data: Any
 ) -> GuardrailFunctionOutput:
@@ -47,12 +52,12 @@ async def safety_guardrail(
             app,
             model,
             [{"role": "user", "content": _input_text(data)[:6000]}],
-            max_tokens=8,
+            stage="safety_guardrail",
+            max_tokens=3,
             timeout_s=25,
         )
-    except Exception as exc:  # noqa: BLE001 - configured fail-open boundary.
-        # Guard model unavailable: fail OPEN (allow the run) but make it visible.
-        # A stricter deployment might fail closed — that's a policy choice.
+    except Exception as exc:  # noqa: BLE001 - guard failures must fail closed.
+        # Guard model unavailable: block the run and make the failure visible.
         app.ledger.record(
             "Safety guardrail (granite-guardian)",
             model,
@@ -61,7 +66,7 @@ async def safety_guardrail(
             got=f"unavailable: {type(exc).__name__}",
         )
         return GuardrailFunctionOutput(
-            output_info={"error": str(exc), "model": model}, tripwire_triggered=False
+            output_info={"error": str(exc), "model": model}, tripwire_triggered=True
         )
     verdict = res.text.strip()
     app.ledger.record(
@@ -73,7 +78,7 @@ async def safety_guardrail(
         sent=f"{res.prompt_tokens:,} tok" if res.prompt_tokens else "—",
         got=verdict or "—",
     )
-    unsafe = verdict.lower().startswith("yes")
+    unsafe = _unsafe_verdict(verdict)
     return GuardrailFunctionOutput(
         output_info={"verdict": verdict, "model": model},
         tripwire_triggered=unsafe,

@@ -2,9 +2,13 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
+import maintenance_triage.review as review_module
 from maintenance_triage.evaluate import evaluate_review
 from maintenance_triage.review import (
     _map_exact_source_fields,
+    _rate_book_provenance,
     _require_entity_evidence,
     _require_gliner2_evidence,
     _require_ranked_evidence,
@@ -14,6 +18,18 @@ from maintenance_triage.review import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("run_id", ["", ".", "..", "../escape", "nested/run", "nested\\run"])
+def test_run_rejects_unsafe_run_id_before_setup(run_id: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        review_module,
+        "load_config",
+        lambda: pytest.fail("load_config must not run for an unsafe run ID"),
+    )
+
+    with pytest.raises(ValueError, match="safe directory name"):
+        review_module.run(run_id)
 
 
 def test_fixture_is_the_exact_ntsb_page_spread() -> None:
@@ -175,6 +191,17 @@ def test_review_boundary_passes_evaluation() -> None:
     assert all(check.passed for check in evaluate_review(build_review(structured_data(), ranked_evidence())))
 
 
+def test_verified_rerank_correlates_to_retrieval_query() -> None:
+    raw_dir = ROOT / "verified-run" / "raw"
+    retrieve = json.loads((raw_dir / "retrieve.json").read_text(encoding="utf-8"))
+    rerank_request = json.loads((raw_dir / "rerank-request.json").read_text(encoding="utf-8"))
+    rerank = json.loads((raw_dir / "rerank.json").read_text(encoding="utf-8"))
+    assert rerank_request["query"]["id"] == retrieve["query"]["id"]
+    assert [item["id"] for item in rerank_request["items"]] == [row["chunk_id"] for row in retrieve["ranking"]]
+    assert len(rerank["scores"]) == len(rerank_request["items"])
+    assert {row["item_id"] for row in rerank["scores"]} == {item["id"] for item in rerank_request["items"]}
+
+
 def test_review_fails_closed_on_changed_temperature() -> None:
     data = structured_data()
     data["salem_temperature"] = "130°F above ambient"
@@ -270,3 +297,103 @@ def test_verified_manifest_hashes() -> None:
     for entry in manifest["artifacts"]:
         artifact = manifest_path.parent / entry["path"]
         assert hashlib.sha256(artifact.read_bytes()).hexdigest() == entry["sha256"]
+
+    listed_paths = {entry["path"] for entry in manifest["artifacts"]}
+    actual_paths = {
+        path.relative_to(manifest_path.parent).as_posix()
+        for path in manifest_path.parent.rglob("*")
+        if path.is_file() and path != manifest_path
+    }
+    assert listed_paths == actual_paths
+
+    provenance = manifest["rate_book_provenance"]
+    assert provenance == _rate_book_provenance(manifest_path.parent / "raw")
+    assert provenance["request_ids"]
+    assert provenance["request_versions"] == {
+        request_id: provenance["version"] for request_id in provenance["request_ids"]
+    }
+
+
+def test_rate_book_provenance_prefers_request_usage_and_rejects_conflicts(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "request": {
+            "id": "request-1",
+            "credits_debited": 1,
+            "usage": {"rate_book_version": "nested-rate-v1"},
+        },
+        "usage": {"rate_book_version": "outer-rate-v1"},
+    }
+    path = tmp_path / "request.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert _rate_book_provenance(tmp_path)["version"] == "nested-rate-v1"
+
+    payload["request"]["rate_book_version"] = "direct-rate-v2"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    try:
+        _rate_book_provenance(tmp_path)
+    except RuntimeError as exc:
+        assert "conflicting rate-book versions" in str(exc)
+    else:
+        raise AssertionError("Accepted conflicting request rate-book versions")
+
+
+def test_rate_book_provenance_rejects_missing_request_version(tmp_path: Path) -> None:
+    (tmp_path / "request.json").write_text(
+        json.dumps({"request": {"id": "request-1", "credits_debited": 1}}),
+        encoding="utf-8",
+    )
+    try:
+        _rate_book_provenance(tmp_path)
+    except RuntimeError as exc:
+        assert "without a rate-book version" in str(exc)
+    else:
+        raise AssertionError("Accepted a charged request without a rate-book version")
+
+
+def test_run_cleans_failed_staging_and_allows_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(review_module, "RUNS_DIR", tmp_path)
+    monkeypatch.setattr(review_module, "load_config", dict)
+
+    def fail(run_dir: Path, _config: dict[str, object]) -> None:
+        (run_dir / "partial.json").write_text("partial", encoding="utf-8")
+        raise RuntimeError("provenance failed")
+
+    monkeypatch.setattr(review_module, "_write_run", fail)
+    with pytest.raises(RuntimeError, match="provenance failed"):
+        review_module.run("retryable")
+
+    assert list(tmp_path.iterdir()) == []
+
+    def succeed(run_dir: Path, _config: dict[str, object]) -> None:
+        (run_dir / "manifest.json").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(review_module, "_write_run", succeed)
+    final_run_dir = review_module.run("retryable")
+
+    assert final_run_dir == tmp_path / "retryable"
+    assert (final_run_dir / "manifest.json").is_file()
+
+
+def test_run_reserves_the_id_before_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(review_module, "RUNS_DIR", tmp_path)
+    monkeypatch.setattr(review_module, "load_config", dict)
+
+    def write(run_dir: Path, _config: dict[str, object]) -> None:
+        with pytest.raises(FileExistsError, match="already reserved"):
+            review_module.run("reserved")
+        (run_dir / "manifest.json").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(review_module, "_write_run", write)
+
+    final_run_dir = review_module.run("reserved")
+
+    assert final_run_dir == tmp_path / "reserved"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["reserved"]

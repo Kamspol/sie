@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,8 +20,30 @@ from insurance_claims.config import (
     load_config,
     source_by_slug,
 )
+from insurance_claims.evaluate import ARTIFACT_EXCLUDED_PATHS
 
 console = Console()
+
+
+def _validate_run_id(run_id: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id) or run_id in {
+        ".",
+        "..",
+    }:
+        raise ValueError("run_id must be one safe directory name containing only letters, digits, '.', '_', or '-'")
+    return run_id
+
+
+def _artifact_entries(run_dir: Path) -> list[dict[str, str]]:
+    return [
+        {
+            "path": path.relative_to(run_dir).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for path in sorted(run_dir.rglob("*"))
+        if path.is_file() and path.relative_to(run_dir) not in ARTIFACT_EXCLUDED_PATHS
+    ]
+
 
 POLICY_QUERY = (
     "What does the Standard Flood Insurance Policy cover for removal of non-owned flood debris "
@@ -140,6 +164,71 @@ def _write_json(path: Path, value: Any) -> None:
     )
 
 
+def _charged_request_rows(value: Any) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    if isinstance(value, dict):
+        request = value.get("request")
+        if isinstance(request, dict) and request.get("credits_debited"):
+            usage = request.get("usage")
+            if not isinstance(usage, dict):
+                usage = value.get("usage")
+            rows.append((request, usage if isinstance(usage, dict) else {}))
+        for child in value.values():
+            rows.extend(_charged_request_rows(child))
+    elif isinstance(value, list):
+        for child in value:
+            rows.extend(_charged_request_rows(child))
+    return rows
+
+
+def _request_rate_book_version(request: dict[str, Any], usage: dict[str, Any], source: str) -> str:
+    direct_present = "rate_book_version" in request
+    usage_present = "rate_book_version" in usage
+    direct = request.get("rate_book_version")
+    nested = usage.get("rate_book_version")
+    if direct_present and (not isinstance(direct, str) or not direct):
+        raise RuntimeError(f"{source} has a charged request without a rate-book version")
+    if usage_present and (not isinstance(nested, str) or not nested):
+        raise RuntimeError(f"{source} has a charged request without a rate-book version")
+    if direct_present and usage_present and direct != nested:
+        raise RuntimeError(f"{source} has conflicting rate-book versions for one request")
+    version = direct if direct_present else nested
+    if not isinstance(version, str) or not version:
+        raise RuntimeError(f"{source} has a charged request without a rate-book version")
+    return version
+
+
+def _rate_book_provenance(raw_dir: Path) -> dict[str, Any]:
+    versions: set[str] = set()
+    source_artifacts: list[str] = []
+    request_ids: list[str] = []
+    request_versions: dict[str, str] = {}
+    for path in sorted(raw_dir.glob("*.json")):
+        result = json.loads(path.read_text(encoding="utf-8"))
+        charged_rows = _charged_request_rows(result)
+        if charged_rows:
+            source_artifacts.append(f"raw/{path.name}")
+        for request, usage in charged_rows:
+            request_id = request.get("id")
+            if not isinstance(request_id, str) or not request_id:
+                raise RuntimeError(f"{path.name} has a charged request without an ID")
+            request_ids.append(request_id)
+            version = _request_rate_book_version(request, usage, path.name)
+            versions.add(version)
+            request_versions[request_id] = version
+    if len(request_ids) != len(set(request_ids)):
+        raise RuntimeError("Run contains duplicate charged request IDs")
+    if len(versions) != 1 or not request_ids:
+        raise RuntimeError("Run does not establish one settled rate book for charged requests")
+    version = versions.pop()
+    return {
+        "version": version,
+        "source_artifacts": source_artifacts,
+        "request_ids": request_ids,
+        "request_versions": request_versions,
+    }
+
+
 def _parse_document(
     client: SIEClient,
     model: str,
@@ -247,18 +336,22 @@ def _extract_claim_facts(
     provision_timeout_s: float,
 ) -> tuple[dict[str, Any], float]:
     labels = [
-        "proof of loss amount",
+        "amended proof of loss total",
         "debris removal estimate",
         "barge transportation estimate",
         "debris volume",
-        "date of loss",
-        "covered debris removal scope",
-        "excluded debris cost",
     ]
+    event_start = markdown.find("The insurer reviewed")
+    issue_start = markdown.find("## ISSUE", event_start)
+    if event_start >= 0:
+        excerpt_end = issue_start if issue_start > event_start else event_start + 4000
+        claim_excerpt = markdown[event_start:excerpt_end]
+    else:
+        claim_excerpt = markdown[:4000]
     started = time.perf_counter()
     result = client.extract(
         model,
-        Item(id="appeal-facts", text=markdown[:12000]),
+        Item(id="appeal-facts", text=claim_excerpt),
         labels=labels,
         wait_for_capacity=True,
         provision_timeout_s=provision_timeout_s,
@@ -298,7 +391,13 @@ Read the decision's background, rules, analysis, and conclusion. Separate the
 physical work FEMA directed the insurer to cover from transport, handling,
 disposal, yard work, and other costs outside that scope. Preserve the three
 published dollar amounts and the debris-volume range exactly. Record the
-additional price evidence and prior-claim checks FEMA requested.
+additional price evidence and prior-claim checks FEMA requested. Preserve that,
+before paying the July 2019 flood claim, the insurer must verify that debris
+removal for the same area underneath the building occurred before that flood.
+
+Actions must preserve the published partial-coverage result: direct payment for
+covered under-building removal and deny only excluded transport, disposal, and
+yard-work components. Never recommend denial of the entire debris-removal claim.
 
 This is a summary of a completed public appeal. Do not make a new coverage or
 payment decision. Cite only the source identifiers allowed by the schema.
@@ -344,6 +443,57 @@ schema.<|im_end|>
     return result, _json_object_from_text(content), duration_ms
 
 
+def _source_prior_claim_check(appeal_markdown: str) -> str:
+    normalized_source = " ".join(appeal_markdown.split())
+    temporal_match = re.search(
+        r"Before issuing any additional payment for the subject July 2019 flood event, "
+        r"the insurer should verify that debris removal for the same area underneath "
+        r"the building was performed before the July 2019 flood event\.",
+        normalized_source,
+        re.IGNORECASE,
+    )
+    if temporal_match is None or "proof of repairs and price" not in normalized_source.casefold():
+        raise RuntimeError("FEMA source omitted the required prior-claim evidence")
+    temporal_check = temporal_match.group().rstrip(".")
+    return f"{temporal_check}; retain proof of repairs and pricing from previous losses to prevent payment overlap"
+
+
+def _align_prior_claim_evidence(review: dict[str, Any], source_prior_claim_check: str) -> dict[str, Any]:
+    decision = review.get("decision")
+    findings = review.get("findings")
+    next_actions = review.get("next_actions")
+    if not isinstance(decision, dict) or not isinstance(findings, list) or not isinstance(next_actions, list):
+        raise TypeError("Review omitted prior-claim decision surfaces")
+    if not str(decision.get("prior_claim_check", "")).strip():
+        raise RuntimeError("Review omitted the prior-claim decision")
+    aligned_check = source_prior_claim_check
+    overlap_findings = [
+        finding
+        for finding in findings
+        if isinstance(finding, dict) and finding.get("category") == "prior_claim_overlap"
+    ]
+    action_indexes = [
+        index
+        for index, action in enumerate(next_actions)
+        if "prior claim" in str(action).casefold()
+        or "previous claim" in str(action).casefold()
+        or "payment overlap" in str(action).casefold()
+    ]
+    if len(overlap_findings) != 1 or not action_indexes:
+        raise RuntimeError("Review must contain a prior-claim finding and action")
+    decision["prior_claim_check"] = aligned_check
+    overlap_findings[0]["evidence"] = aligned_check
+    aligned_action = aligned_check
+    first_action_index = action_indexes[0]
+    duplicate_action_indexes = set(action_indexes[1:])
+    next_actions[:] = [
+        aligned_action if index == first_action_index else action
+        for index, action in enumerate(next_actions)
+        if index not in duplicate_action_indexes
+    ]
+    return review
+
+
 def _require_sources() -> None:
     config = load_config()
     required_paths = [
@@ -357,6 +507,7 @@ def _require_sources() -> None:
 
 
 def run_default_stage(run_id: str) -> Path:
+    run_id = _validate_run_id(run_id)
     run_dir = RUNS_DIR / run_id
     if run_dir.exists():
         raise FileExistsError(
@@ -443,6 +594,7 @@ def run_default_stage(run_id: str) -> Path:
 
 
 def run_generation_stage(run_id: str) -> Path:
+    run_id = _validate_run_id(run_id)
     config = load_config()
     _require_sources()
     run_dir = RUNS_DIR / run_id
@@ -472,10 +624,15 @@ def run_generation_stage(run_id: str) -> Path:
             provision_timeout_s=config.cluster.provision_timeout_s,
         )
         _write_json(raw_dir / "review-completion.json", review_raw)
+        review = _align_prior_claim_evidence(review, _source_prior_claim_check(appeal_markdown))
         _write_json(run_dir / "review.json", review)
     finally:
         client.close()
 
+    _write_json(
+        run_dir / "source-manifest.json",
+        json.loads((DATA_DIR / "source-manifest.json").read_text(encoding="utf-8")),
+    )
     manifest = {
         "run_id": run_id,
         "run_at": datetime.now(UTC).isoformat(),
@@ -488,15 +645,13 @@ def run_generation_stage(run_id: str) -> Path:
             **default_stage["models"],
             "review": config.models.review,
         },
+        "rate_book_provenance": _rate_book_provenance(raw_dir),
         "timings_ms": timings,
         "source_manifest": "source-manifest.json",
         "review": "review.json",
+        "artifacts": _artifact_entries(run_dir),
     }
     _write_json(run_dir / "manifest.json", manifest)
-    _write_json(
-        run_dir / "source-manifest.json",
-        json.loads((DATA_DIR / "source-manifest.json").read_text(encoding="utf-8")),
-    )
 
     table = Table("Model call", "Latency")
     for name, duration_ms in timings.items():

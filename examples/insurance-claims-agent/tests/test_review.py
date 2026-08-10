@@ -7,14 +7,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from sie_sdk import Item
 
 import insurance_claims.review as review_module
 from insurance_claims.evaluate import ARTIFACT_EXCLUDED_PATHS, evaluate_review, evaluate_run
 from insurance_claims.review import (
     REVIEW_SCHEMA,
+    _artifact_entries,
     _extract_claim_facts,
     _final_review,
     _json_object_from_text,
+    _rate_book_provenance,
     _require_sources,
     chunk_markdown,
     run_default_stage,
@@ -24,16 +27,26 @@ ROOT = Path(__file__).resolve().parents[1]
 VERIFIED_RUN = ROOT / "verified-run"
 
 
+@pytest.mark.parametrize("run_id", ["", ".", "..", "../escape", "nested/run", "nested\\run"])
+def test_run_stages_reject_unsafe_run_id(run_id: str) -> None:
+    with pytest.raises(ValueError, match="safe directory name"):
+        review_module.run_default_stage(run_id)
+    with pytest.raises(ValueError, match="safe directory name"):
+        review_module.run_generation_stage(run_id)
+
+
 class FakeExtractClient:
     def __init__(self) -> None:
         self.labels: list[str] | None = None
+        self.item: Item | None = None
 
     def extract(
         self,
         _model: str,
-        _item: object,
+        _item: Item,
         **kwargs: object,
     ) -> dict[str, object]:
+        self.item = _item
         self.labels = kwargs.get("labels")  # type: ignore[assignment]
         return {"data": {"entities": []}}
 
@@ -67,14 +80,25 @@ def test_claim_fact_extraction_passes_domain_labels() -> None:
     )
 
     assert client.labels == [
-        "proof of loss amount",
+        "amended proof of loss total",
         "debris removal estimate",
         "barge transportation estimate",
         "debris volume",
-        "date of loss",
-        "covered debris removal scope",
-        "excluded debris cost",
     ]
+
+
+def test_claim_fact_extraction_starts_at_appeal_when_issue_heading_is_absent() -> None:
+    client = FakeExtractClient()
+
+    _extract_claim_facts(
+        client,
+        "fastino/gliner2-large-v1",
+        "irrelevant policy preface\n\nThe insurer reviewed the amended claim.",
+        60,
+    )
+
+    assert client.item is not None
+    assert client.item["text"] == "The insurer reviewed the amended claim."
 
 
 def test_review_json_accepts_fenced_model_output() -> None:
@@ -88,7 +112,7 @@ def test_final_review_uses_native_strict_json_schema() -> None:
 
     _, parsed, _ = _final_review(
         client,
-        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.6-27B",
         appeal_markdown="appeal",
         claim_facts={},
         policy_chunks=[],
@@ -104,6 +128,10 @@ def test_final_review_uses_native_strict_json_schema() -> None:
 
 
 def test_evaluation_accepts_published_appeal_result() -> None:
+    prior_claim_check = (
+        "Review prior claims to verify debris removal underneath the building in the "
+        "same area occurred before the July 2019 flood; retain repair and pricing records."
+    )
     review = {
         "route": "scope_review_required",
         "appeal_summary": {
@@ -117,22 +145,48 @@ def test_evaluation_accepts_published_appeal_result() -> None:
             "covered_scope": ("Remove flood-borne stones from underneath the insured building to its perimeter."),
             "excluded_scope": ("Barge transport, handling, disposal, and yard removal."),
             "evidence_needed": "Other contractor estimates.",
-            "prior_claim_check": "Proof of repairs from previous claims.",
+            "prior_claim_check": prior_claim_check,
         },
         "findings": [
             {"category": "covered_removal"},
             {"category": "excluded_transport"},
             {"category": "price_support"},
-            {"category": "prior_claim_overlap"},
+            {"category": "prior_claim_overlap", "evidence": prior_claim_check},
             # Synthetic schema-valid category used only to test evaluator tolerance.
             {"category": "other"},
         ],
+        "next_actions": [f"Insurer to {prior_claim_check[0].lower()}{prior_claim_check[1:]}"],
     }
 
     assert all(check.passed for check in evaluate_review(review))
 
 
+def test_evaluation_rejects_a_later_ungrounded_prior_claim_value() -> None:
+    grounded = (
+        "Review prior claims to verify debris removal underneath the building in the "
+        "same area occurred before the July 2019 flood; retain repair and pricing records."
+    )
+    review = {
+        "decision": {"prior_claim_check": grounded},
+        "findings": [
+            {"category": "prior_claim_overlap", "evidence": grounded},
+            {
+                "category": "prior_claim_overlap",
+                "evidence": "Check prior claim payment overlap without source details.",
+            },
+        ],
+        "next_actions": [grounded, "Review a prior claim without source details."],
+    }
+
+    checks = {check.name: check for check in evaluate_review(review)}
+    assert checks["prior-claim-overlap"].passed is False
+
+
 def test_evaluation_rejects_the_wrong_proof_of_loss_amount() -> None:
+    prior_claim_check = (
+        "Review prior claims to verify debris removal underneath the building in the "
+        "same area occurred before the July 2019 flood; retain repair and pricing records."
+    )
     review = {
         "route": "scope_review_required",
         "appeal_summary": {
@@ -146,18 +200,75 @@ def test_evaluation_rejects_the_wrong_proof_of_loss_amount() -> None:
             "covered_scope": "Remove flood-borne stones from underneath the insured building to its perimeter.",
             "excluded_scope": "Barge transport, handling, disposal, and yard removal.",
             "evidence_needed": "Other contractor estimates.",
-            "prior_claim_check": "Proof of repairs from previous claims.",
+            "prior_claim_check": prior_claim_check,
         },
         "findings": [
             {"category": "covered_removal"},
             {"category": "excluded_transport"},
             {"category": "price_support"},
-            {"category": "prior_claim_overlap"},
+            {"category": "prior_claim_overlap", "evidence": prior_claim_check},
         ],
+        "next_actions": [f"Insurer to {prior_claim_check[0].lower()}{prior_claim_check[1:]}"],
     }
 
     checks = {check.name: check for check in evaluate_review(review)}
     assert {name for name, check in checks.items() if not check.passed} == {"proof-of-loss-amount"}
+
+
+def test_prior_claim_alignment_preserves_timing_in_finding_and_action() -> None:
+    review = {
+        "decision": {
+            "prior_claim_check": (
+                "Review prior claims to verify debris removal for the same area "
+                "underneath the building was performed before the July 2019 flood event"
+            )
+        },
+        "findings": [
+            {
+                "category": "prior_claim_overlap",
+                "evidence": "Verify prior payments.",
+            }
+        ],
+        "next_actions": [
+            "Insurer to verify prior claim payments.",
+            "Provide repair records from previous claims.",
+            "Keep the unrelated coverage action.",
+        ],
+    }
+
+    source_check = (
+        "Before issuing any additional payment for the subject July 2019 flood event, "
+        "the insurer should verify that debris removal for the same area underneath "
+        "the building was performed before the July 2019 flood event; retain proof "
+        "of repairs and pricing from previous losses to prevent payment overlap"
+    )
+    aligned = review_module._align_prior_claim_evidence(review, source_check)
+    values = (
+        aligned["decision"]["prior_claim_check"],
+        aligned["findings"][0]["evidence"],
+        aligned["next_actions"][0],
+    )
+    assert all("before the July 2019 flood" in value for value in values)
+    assert all("proof of repairs and pricing" in value for value in values)
+    assert aligned["next_actions"] == [
+        values[2],
+        "Keep the unrelated coverage action.",
+    ]
+
+
+def test_prior_claim_alignment_is_derived_from_the_fema_source() -> None:
+    source = (
+        "The policyholder should provide proof of repairs and price from the previous "
+        "losses. Before issuing any additional payment for the subject July 2019 flood "
+        "event, the insurer should verify that debris removal for the same area "
+        "underneath the building was performed before the July 2019 flood event."
+    )
+
+    result = review_module._source_prior_claim_check(source)
+
+    assert "same area underneath the building" in result
+    assert "before the July 2019 flood event" in result
+    assert "proof of repairs and pricing" in result
 
 
 def test_existing_run_id_has_an_actionable_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -201,6 +312,25 @@ def test_artifact_exclusions_only_apply_at_the_run_root(tmp_path: Path) -> None:
     assert {"nested/README.md", "nested/manifest.json"} <= artifact_paths
 
 
+def test_generation_manifest_entries_cover_every_pre_manifest_artifact(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "review.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("run documentation\n", encoding="utf-8")
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "response.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "manifest.json").write_text("{}\n", encoding="utf-8")
+
+    entries = _artifact_entries(tmp_path)
+
+    assert {entry["path"] for entry in entries} == {
+        "raw/response.json",
+        "review.json",
+    }
+    assert all(len(entry["sha256"]) == 64 for entry in entries)
+
+
 def test_verified_evaluation_recomputes_from_the_recorded_review() -> None:
     review = json.loads((VERIFIED_RUN / "review.json").read_text(encoding="utf-8"))
     recorded = json.loads((VERIFIED_RUN / "evaluation.json").read_text(encoding="utf-8"))
@@ -224,3 +354,73 @@ def test_verified_manifest_pins_every_recorded_artifact() -> None:
     assert set(artifacts) == expected_paths
     for path, expected_hash in artifacts.items():
         assert hashlib.sha256((VERIFIED_RUN / path).read_bytes()).hexdigest() == expected_hash
+
+    provenance = manifest["rate_book_provenance"]
+    assert provenance == _rate_book_provenance(VERIFIED_RUN / "raw")
+    assert len(provenance["request_ids"]) == 5
+    assert provenance["request_versions"] == {
+        request_id: provenance["version"] for request_id in provenance["request_ids"]
+    }
+
+
+def test_rate_book_provenance_rejects_a_charged_request_without_its_own_version(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "complete.json").write_text(
+        json.dumps(
+            {
+                "request": {
+                    "id": "request-1",
+                    "credits_debited": 1,
+                    "rate_book_version": "rate-v1",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "missing.json").write_text(
+        json.dumps({"request": {"id": "request-2", "credits_debited": 1}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="without a rate-book version"):
+        _rate_book_provenance(tmp_path)
+
+
+def test_rate_book_provenance_prefers_request_usage(tmp_path: Path) -> None:
+    (tmp_path / "nested-usage.json").write_text(
+        json.dumps(
+            {
+                "request": {
+                    "id": "request-1",
+                    "credits_debited": 1,
+                    "usage": {"rate_book_version": "nested-rate-v1"},
+                },
+                "usage": {"rate_book_version": "outer-rate-v1"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _rate_book_provenance(tmp_path)["version"] == "nested-rate-v1"
+
+
+def test_rate_book_provenance_rejects_conflicting_request_versions(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "conflict.json").write_text(
+        json.dumps(
+            {
+                "request": {
+                    "id": "request-1",
+                    "credits_debited": 1,
+                    "rate_book_version": "direct-rate-v1",
+                    "usage": {"rate_book_version": "usage-rate-v2"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="conflicting rate-book versions"):
+        _rate_book_provenance(tmp_path)

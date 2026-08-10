@@ -63,6 +63,10 @@ uv run review-pa --run-id local
 uv run eval-pa runs/local
 ```
 
+If the process crashes, it can leave `runs/.<run-id>.lock` and a
+`runs/.<run-id>-*` staging directory. Remove those exact abandoned paths before
+retrying the same run ID.
+
 Set `SIE_CLUSTER_URL` and `SIE_API_KEY` to use SIE Cloud. The default points to
 a local server at `http://localhost:8080`.
 
@@ -72,6 +76,7 @@ a local server at `http://localhost:8080`.
 runs/<run-id>/manifest.json                    endpoint, model IDs, source hash, latency
 runs/<run-id>/raw/parse.json                   complete Docling response
 runs/<run-id>/raw/retrieve.json                embeddings and cosine ranking
+runs/<run-id>/raw/rerank-request.json          exact reranker query and candidate IDs
 runs/<run-id>/raw/rerank.json                  complete reranker response
 runs/<run-id>/raw/entities.json                combined GLiNER entity spans
 runs/<run-id>/raw/entities-requirement-<index>.json per-requirement GLiNER entity spans
@@ -85,9 +90,7 @@ runs/<run-id>/review.json                      validated reproduction of the CMS
 runs/<run-id>/evaluation.json                  source, arithmetic, and boundary checks
 ```
 
-The manifest records `SIE_SERVER_COMMIT` and `SIE_RUN_COMMAND` when they are
-present in the environment. Recorded latency includes model provisioning and is
-not a performance claim.
+Recorded latency includes model provisioning and is not a performance claim.
 The verified manifest preserves the upstream-style Docling name configured
 during acquisition and the canonical `docling` ID that SIE actually served.
 New runs use the canonical ID directly.

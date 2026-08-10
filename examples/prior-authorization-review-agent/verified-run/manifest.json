@@ -1,10 +1,8 @@
 {
-  "created_at": "2026-07-25T02:35:39.667778+00:00",
-  "endpoint": "http://127.0.0.1:8080",
-  "sie_server_commit": "4b5ea9ccd5d5fc07c56edfea790080b05e17f0d2",
-  "run_command": "Modal exact-source reference examples against public SIE main at 4b5ea9c",
+  "created_at": "2026-08-09T22:39:59.037790+00:00",
+  "endpoint": "https://api.superlinked.com",
   "models": {
-    "parse": "docling-project/docling",
+    "parse": "docling",
     "retrieve": "BAAI/bge-m3",
     "rerank": "Qwen/Qwen3-Reranker-4B",
     "entities": "urchade/gliner_multi-v2.1",
@@ -13,6 +11,70 @@
   "fixture": {
     "path": "fixtures/cms-l1851-insufficient-documentation.html",
     "sha256": "aec2408ff0e00b9960bf9e7879a7213942d32e8980da801a2c71acef4755cf91"
+  },
+  "rate_book_provenance": {
+    "version": "2026-07-26-production-bootstrap-v2",
+    "source_artifacts": [
+      "raw/entities-case-0.json",
+      "raw/entities-case-1.json",
+      "raw/entities-case-2.json",
+      "raw/entities-case-3.json",
+      "raw/entities-case-4.json",
+      "raw/entities-requirement-0.json",
+      "raw/gliner2-outcome.json",
+      "raw/gliner2-requirements.json",
+      "raw/gliner2-submission.json",
+      "raw/rerank.json",
+      "raw/retrieve.json"
+    ],
+    "request_ids": [
+      "019fe8ae-cb93-76c1-a002-61865cdc150a",
+      "019fe8ae-cc66-7c30-99ff-1be213f92617",
+      "019fe8ae-cd46-7eb2-b973-3629be2b7238",
+      "019fe8ae-ce14-7c10-a1d0-7246e1e84bdb",
+      "019fe8ae-cef4-77c3-816b-0e1a1f755960",
+      "019fe8ae-cab6-74a3-90f4-7697b2b69a8e",
+      "019fe8ae-d19f-7160-9d01-b0e62fa8dd18",
+      "019fe8ae-cfcc-7540-bb3b-0a7ac5aecc43",
+      "019fe8ae-d0b3-72f3-b9c4-a69d8ac6040e",
+      "019fe8ae-c909-7a13-a7f5-c912a97f62fb",
+      "019fe8ae-c07a-78a2-9976-7ada45b03c93",
+      "019fe8ae-c13f-7010-bf31-73dad483411c",
+      "019fe8ae-c1ee-7af3-a69d-86ec0f5b6750",
+      "019fe8ae-c2a9-7c12-990b-24f58845ff85",
+      "019fe8ae-c356-7a70-9386-c43b2ca4d064",
+      "019fe8ae-c411-7270-bc0b-087bb80d62f6",
+      "019fe8ae-c4ba-74d3-866a-3c98b780c7ec",
+      "019fe8ae-c572-7171-a5cd-586d4ca32bc9",
+      "019fe8ae-c623-73a0-9cb3-29d240dcaa34",
+      "019fe8ae-c6e2-7200-b207-79879ea49243",
+      "019fe8ae-c799-7af3-96ad-841eae76c210",
+      "019fe8ae-c849-7ad3-a775-a1684a5029db"
+    ],
+    "request_versions": {
+      "019fe8ae-cb93-76c1-a002-61865cdc150a": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-cc66-7c30-99ff-1be213f92617": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-cd46-7eb2-b973-3629be2b7238": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-ce14-7c10-a1d0-7246e1e84bdb": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-cef4-77c3-816b-0e1a1f755960": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-cab6-74a3-90f4-7697b2b69a8e": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-d19f-7160-9d01-b0e62fa8dd18": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-cfcc-7540-bb3b-0a7ac5aecc43": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-d0b3-72f3-b9c4-a69d8ac6040e": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-c909-7a13-a7f5-c912a97f62fb": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-c07a-78a2-9976-7ada45b03c93": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-c13f-7010-bf31-73dad483411c": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-c1ee-7af3-a69d-86ec0f5b6750": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-c2a9-7c12-990b-24f58845ff85": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-c356-7a70-9386-c43b2ca4d064": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-c411-7270-bc0b-087bb80d62f6": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-c4ba-74d3-866a-3c98b780c7ec": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-c572-7171-a5cd-586d4ca32bc9": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-c623-73a0-9cb3-29d240dcaa34": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-c6e2-7200-b207-79879ea49243": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-c799-7af3-96ad-841eae76c210": "2026-07-26-production-bootstrap-v2",
+      "019fe8ae-c849-7ad3-a775-a1684a5029db": "2026-07-26-production-bootstrap-v2"
+    }
   },
   "artifacts": [
     {
@@ -25,27 +87,27 @@
     },
     {
       "path": "raw/entities-case-0.json",
-      "sha256": "7cc13bed69de37886d91ab709db0eb09213450bb1d177014e0a503024cfd01ff"
+      "sha256": "c6781416470c28e0c119ef561d31ee6c3b0863af26dec9d9edfecf6f2a20fe07"
     },
     {
       "path": "raw/entities-case-1.json",
-      "sha256": "842d45572b3a3e2bd84e9f60eb75c5c7227725d8d58de993ab03db37b82f8d9a"
+      "sha256": "53b0ee84ca07c8cb065bf806fa7ccc5462332520937e2a82ea2ac59cdfb3e1be"
     },
     {
       "path": "raw/entities-case-2.json",
-      "sha256": "9df72fcaacc8c68f9eed13f58982eb42a044073122cdd8dcb30400500cb9982e"
+      "sha256": "42953cdd9a8d60c7c7ab30d707b3c76e1c23cfb96996d43e8992c92ea72a907a"
     },
     {
       "path": "raw/entities-case-3.json",
-      "sha256": "f06147d7c35393adf4dff19b2600488334768120f98d72ed4d16b6f2e25cd9a9"
+      "sha256": "72e2136c207ca220bc4a2db2a062bb32454770783d2a095a092dbd6d55cc0190"
     },
     {
       "path": "raw/entities-case-4.json",
-      "sha256": "d97c6eac7c79d1fa503b09d6bce5204308de232d31176bd206c928711565dc44"
+      "sha256": "90e08a37525b1039c6f7a2e279ba4967dbb7ee48a2177acc06625b5cc953f7d3"
     },
     {
       "path": "raw/entities-requirement-0.json",
-      "sha256": "0c4ba08af8b389a288b44621514d81c0eb858070ee65a7a8c23a71a884f7a1b2"
+      "sha256": "c570d1f63188940b724fed1ccf86334c6c230277d999cb1f73298f4b14d6e0f7"
     },
     {
       "path": "raw/entities.json",
@@ -53,15 +115,15 @@
     },
     {
       "path": "raw/gliner2-outcome.json",
-      "sha256": "c9ec5d4ff68870786a01c63c06146881433e2f3c62a952e4d013d27655e5003f"
+      "sha256": "414ad2e68bebca5f9be9accb2f27ef0da26340b214404fa1414e68ef2717146a"
     },
     {
       "path": "raw/gliner2-requirements.json",
-      "sha256": "809de1f98b358d9b6a6d094ef6e9754b32bfa28d94a8d7c2ae3312368754d3f2"
+      "sha256": "0b96f010e77c5cb6864cf3a39cc5228119188ddde6ee9b0080fb03a256383593"
     },
     {
       "path": "raw/gliner2-submission.json",
-      "sha256": "16ffc2a78032eaa3df46f105d8eb9156f471865b85a5133df9e89e5a97ed5008"
+      "sha256": "3b20a79d81ca9a153ded895d03dfb8bdfdbed050b40f6d50fef5c4e544307edc"
     },
     {
       "path": "raw/mapped.json",
@@ -69,15 +131,19 @@
     },
     {
       "path": "raw/parse.json",
-      "sha256": "9fc49a18e11c8ad7bfbff26dbafbdeee4dfa09901d8986c0655121c6e8fb315f"
+      "sha256": "3e5e37536b9d0e49ec8064863eebb1bcb6588d9304bbda4984bb972f744afac5"
+    },
+    {
+      "path": "raw/rerank-request.json",
+      "sha256": "071117cd0e5212499f6fc20c30f4fe61869ec43c4d06454f4cb5ed2dfb743c8d"
     },
     {
       "path": "raw/rerank.json",
-      "sha256": "515be530e03bd31a476cfcbcf48bd2bc8625931d301997d501d3e4347236849c"
+      "sha256": "e6a55f114d2315a9b502878255cfb885256403a96d2405e9f8f7fd96baf1eb81"
     },
     {
       "path": "raw/retrieve.json",
-      "sha256": "50ee8a23ae7e74cf9ad49c81729191b4264652b89f254f00db4524e1f18a9cbd"
+      "sha256": "28e3ca0bd10305f9045a66b6f5404dfe2c13c27724c3905af2ae3bf87afe11f8"
     },
     {
       "path": "review.json",
@@ -94,53 +160,53 @@
     {
       "stage": "parse",
       "model": "docling",
-      "configured_model": "docling-project/docling",
-      "latency_ms": 35066.1
+      "configured_model": "docling",
+      "latency_ms": 342.6
     },
     {
       "stage": "retrieve",
       "model": "BAAI/bge-m3",
-      "latency_ms": 6515.2
+      "latency_ms": 2190.6
     },
     {
       "stage": "rerank",
       "model": "Qwen/Qwen3-Reranker-4B",
-      "latency_ms": 10605.6
+      "latency_ms": 433.7
     },
     {
       "stage": "entities_requirement_0",
       "model": "urchade/gliner_multi-v2.1",
-      "latency_ms": 11180.6
+      "latency_ms": 209.9
     },
     {
       "stage": "entities_case_0",
       "model": "urchade/gliner_multi-v2.1",
-      "latency_ms": 168.2
+      "latency_ms": 208.1
     },
     {
       "stage": "entities_case_1",
       "model": "urchade/gliner_multi-v2.1",
-      "latency_ms": 109.9
+      "latency_ms": 223.8
     },
     {
       "stage": "entities_case_2",
       "model": "urchade/gliner_multi-v2.1",
-      "latency_ms": 376.7
+      "latency_ms": 210.0
     },
     {
       "stage": "entities_case_3",
       "model": "urchade/gliner_multi-v2.1",
-      "latency_ms": 27.3
+      "latency_ms": 224.5
     },
     {
       "stage": "entities_case_4",
       "model": "urchade/gliner_multi-v2.1",
-      "latency_ms": 29.5
+      "latency_ms": 220.0
     },
     {
       "stage": "gliner2_requirements",
       "model": "fastino/gliner2-large-v1",
-      "latency_ms": 10098.2,
+      "latency_ms": 220.2,
       "source_chunk_ids": [
         "chunk-2"
       ],
@@ -155,7 +221,7 @@
     {
       "stage": "gliner2_submission",
       "model": "fastino/gliner2-large-v1",
-      "latency_ms": 56.4,
+      "latency_ms": 244.1,
       "source_chunk_ids": [
         "chunk-4",
         "chunk-5",
@@ -174,7 +240,7 @@
     {
       "stage": "gliner2_outcome",
       "model": "fastino/gliner2-large-v1",
-      "latency_ms": 49.6,
+      "latency_ms": 223.0,
       "source_chunk_ids": [
         "chunk-9",
         "chunk-10"
@@ -191,7 +257,7 @@
     "parse",
     "retrieve",
     "rerank",
-    "entities_requirements",
+    "entities_requirement",
     "entities_case",
     "gliner2_requirements",
     "gliner2_submission",

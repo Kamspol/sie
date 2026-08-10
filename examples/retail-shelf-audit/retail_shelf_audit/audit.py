@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
+import re
+import shutil
+import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +24,7 @@ from retail_shelf_audit.config import (
     ROOT,
     RUNS_DIR,
     SOURCE_IMAGE,
+    RuntimeConfig,
     load_config,
 )
 
@@ -221,15 +226,78 @@ def build_evidence(
     }
 
 
+def evaluation_checks(
+    objects: list[dict[str, Any]],
+    gap: dict[str, Any],
+    upper: dict[str, Any],
+    lower: dict[str, Any],
+    upper_text: str,
+    lower_text: str,
+    image_size: tuple[int, int],
+) -> dict[str, bool]:
+    try:
+        gap_ok = select_gap(objects, image_size) == gap
+    except (KeyError, TypeError, ValueError):
+        gap_ok = False
+    try:
+        candidates = nearby_price_candidates(objects, gap)
+        selected_upper, selected_lower = select_vertical_pair(candidates)
+        pair_ok = selected_upper == upper and selected_lower == lower
+    except (KeyError, TypeError, ValueError):
+        pair_ok = False
+    try:
+        ocr_ok = len(ocr_fragments(upper_text, lower_text)) == 7
+    except (TypeError, ValueError):
+        ocr_ok = False
+    return {
+        "non_strip_gap_selected": gap_ok,
+        "nearby_vertical_price_pair_selected": pair_ok,
+        "minimum_ocr_fragments_recovered": ocr_ok,
+    }
+
+
 def _timed(call: Any) -> tuple[Any, float]:
     started = time.perf_counter()
     result = call()
     return result, round((time.perf_counter() - started) * 1000, 1)
 
 
+def _validate_run_id(run_id: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id) or run_id in {
+        ".",
+        "..",
+    }:
+        raise ValueError("run_id must be one safe directory name containing only letters, digits, '.', '_', or '-'")
+    return run_id
+
+
 def run_audit(run_id: str) -> Path:
+    run_id = _validate_run_id(run_id)
     config = load_config()
-    run_dir = RUNS_DIR / run_id
+    final_run_dir = RUNS_DIR / run_id
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    reservation_dir = RUNS_DIR / f".{run_id}.lock"
+    try:
+        reservation_dir.mkdir()
+    except FileExistsError as exc:
+        raise FileExistsError(f"Run ID is already reserved: {run_id}") from exc
+    try:
+        if final_run_dir.exists():
+            raise FileExistsError(f"Run evidence already exists at {final_run_dir}")
+        staging_dir = Path(tempfile.mkdtemp(prefix=f".{run_id}-", dir=RUNS_DIR))
+        try:
+            _write_audit(staging_dir, run_id, config)
+            staging_dir.rename(final_run_dir)
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+    finally:
+        with contextlib.suppress(OSError):
+            reservation_dir.rmdir()
+    return final_run_dir
+
+
+def _write_audit(run_dir: Path, run_id: str, config: RuntimeConfig) -> None:
     raw_dir = run_dir / "raw"
     crops_dir = run_dir / "crops"
     raw_dir.mkdir(parents=True, exist_ok=False)
@@ -274,6 +342,26 @@ def run_audit(run_id: str) -> Path:
             ocr_timings[record["candidate_id"]] = duration_ms
 
         upper_record, lower_record = crop_records
+        checks = evaluation_checks(
+            objects,
+            gap,
+            upper_detection,
+            lower_detection,
+            upper_record["text"],
+            lower_record["text"],
+            image_size,
+        )
+        passed = all(checks.values())
+        write_json(
+            run_dir / "evaluation.json",
+            {
+                "passed": passed,
+                "checks": checks,
+            },
+        )
+        if not passed:
+            failed = sorted(name for name, ok in checks.items() if not ok)
+            raise RuntimeError(f"Retail evidence checks failed ({', '.join(failed)}); manifest not published")
         evidence = build_evidence(
             gap,
             lower_record["source_detection"],
@@ -303,7 +391,13 @@ def run_audit(run_id: str) -> Path:
             },
         )
     output_paths = sorted(
-        (*raw_dir.glob("*.json"), *crops_dir.glob("*.jpg"), run_dir / "selection.json", run_dir / "evidence.json")
+        (
+            *raw_dir.glob("*.json"),
+            *crops_dir.glob("*.jpg"),
+            run_dir / "selection.json",
+            run_dir / "evidence.json",
+            run_dir / "evaluation.json",
+        )
     )
     write_json(
         run_dir / "manifest.json",
@@ -312,6 +406,7 @@ def run_audit(run_id: str) -> Path:
             "completed_at": datetime.now(UTC).isoformat(),
             "endpoint": config.base_url,
             "execution": "SIE API",
+            "models": {"detection": DINO_MODEL, "ocr": OCR_MODEL},
             "checksum_scope": "source input plus every generated evidence file except this manifest",
             "source_input": {
                 "path": SOURCE_IMAGE.relative_to(ROOT).as_posix(),
@@ -328,9 +423,9 @@ def run_audit(run_id: str) -> Path:
                 "grounding_dino": detector_ms,
                 "lighton_ocr_candidates": ocr_timings,
             },
+            "timing_note": "Diagnostic run timing, not a benchmark.",
         },
     )
-    return run_dir
 
 
 def main() -> None:

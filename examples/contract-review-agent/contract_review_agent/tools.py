@@ -12,14 +12,44 @@ import base64
 import re
 import sqlite3
 import time
+from collections import Counter
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 from agents import RunContextWrapper, Runner, function_tool
+from pydantic import BaseModel, Field
 from sie_sdk import Item
 
 from .data.make_sample import SCHEMA_DDL, TODAY
-from .runtime import AppContext, GenResult, instruct_once, prompt_once
+from .runtime import AppContext, GenResult, instruct_once, prompt_once, record_api_call
+
+COMMERCIAL_FACTS_QUERY = (
+    "governing law, exclusivity, term, letter of credit, purchase minimum, "
+    "and reporting obligations"
+)
+
+
+class ClauseRiskFinding(BaseModel):
+    clause: str = Field(pattern=r"^Section \d+(?:\.\d+)+$")
+    issue: str = Field(
+        min_length=1,
+        max_length=400,
+        description=(
+            "Current source-grounded clause mechanics and resulting risk; do not "
+            "describe a proposed redline as existing contract language"
+        ),
+    )
+    severity: Literal["low", "medium", "high"]
+    suggested_redline: str = Field(
+        min_length=1,
+        max_length=400,
+        description="A proposed change, kept distinct from current clause mechanics",
+    )
+
+
+class ClauseRiskAnalysis(BaseModel):
+    risks: list[ClauseRiskFinding] = Field(min_length=1, max_length=8)
 
 
 def _tok(n: int | None) -> str:
@@ -28,6 +58,29 @@ def _tok(n: int | None) -> str:
 
 def _tps(res: GenResult) -> str:
     return f"{res.tokens_per_s:.0f} tok/s" if res.tokens_per_s else "—"
+
+
+def _validated_clause_risk_output(value: object, source: str) -> str:
+    output = str(value).strip()
+    if len(output) < 256:
+        raise RuntimeError("Clause-risk analysis returned an incomplete response")
+    cited_sections = set(re.findall(r"\bSection\s+(\d+(?:\.\d+)+)\b", output))
+    source_sections = set(re.findall(r"\b(\d+(?:\.\d+)+)\b", source))
+    if not cited_sections or not cited_sections <= source_sections:
+        unexpected = sorted(cited_sections - source_sections)
+        raise RuntimeError(
+            "Clause-risk analysis must cite only exact sections from retrieved "
+            f"clauses; unexpected sections: {unexpected}"
+        )
+    return output
+
+
+def _format_clause_risk_analysis(analysis: ClauseRiskAnalysis) -> str:
+    return "\n\n".join(
+        f"{risk.clause} | severity: {risk.severity}\n"
+        f"Issue: {risk.issue}\nSuggested redline: {risk.suggested_redline}"
+        for risk in analysis.risks
+    )
 
 
 def _split_clauses(text: str, target: int = 900) -> list[str]:
@@ -77,6 +130,13 @@ async def _clause_index(
         wait_for_capacity=True,
         provision_timeout_s=app.provision_timeout_s,
     )
+    record_api_call(
+        app,
+        "encode",
+        embed_model,
+        results,
+        stage="search_clauses:index",
+    )
     dt = time.monotonic() - t0
     matrix = np.vstack([np.asarray(r["dense"], dtype=np.float32) for r in results])
     app.ledger.record(
@@ -98,8 +158,9 @@ async def _clause_index(
 # ──────────────────────────────────────────────────────────────────────────
 @function_tool(failure_error_function=None)
 async def classify_document(ctx: RunContextWrapper[AppContext]) -> str:
-    """Classify the contract under review as MSA, NDA, SOW, or Other, with a
-    one-line reason. A fast first-pass triage over the loaded contract."""
+    """Classify the contract under review as MSA, NDA, SOW, Distributor
+    Agreement, or Other, with a one-line reason. A fast first-pass triage over
+    the loaded contract."""
     app = ctx.context
     model = app.cfg["models"]["triage"]
     res = await instruct_once(
@@ -108,11 +169,16 @@ async def classify_document(ctx: RunContextWrapper[AppContext]) -> str:
         [
             {
                 "role": "system",
-                "content": "You label legal documents. Reply with the type only "
-                "(MSA, NDA, SOW, or Other) followed by a short reason.",
+                "content": (
+                    "You label legal documents. Reply with exactly one type "
+                    "(MSA, NDA, SOW, Distributor Agreement, or Other) followed by "
+                    "a short reason. A document titled Distributor Agreement is a "
+                    "Distributor Agreement, not an MSA."
+                ),
             },
             {"role": "user", "content": app.contract_text[:1500]},
         ],
+        stage="classify_document",
         max_tokens=60,
     )
     app.ledger.record(
@@ -125,7 +191,9 @@ async def classify_document(ctx: RunContextWrapper[AppContext]) -> str:
         got=_tok(res.completion_tokens),
         throughput=_tps(res),
     )
-    return res.text.strip()
+    result = res.text.strip()
+    app.clause_cache["classification_result"] = result
+    return result
 
 
 @function_tool(failure_error_function=None)
@@ -142,7 +210,14 @@ async def read_signature_page(ctx: RunContextWrapper[AppContext], question: str)
         [
             {
                 "role": "system",
-                "content": "You are a meticulous contracts paralegal. Answer only from what is visible in the image.",
+                "content": (
+                    "You are a meticulous contracts paralegal. Answer only from what "
+                    "is visible in the image. Describe only the visible page or image; "
+                    "never infer where the full contract ends. Treat a literal `/s/ "
+                    "Name` as an explicit signature mark. List partial evidence "
+                    "precisely; never replace it with a blanket statement that no "
+                    "signatures are present."
+                ),
             },
             {
                 "role": "user",
@@ -155,6 +230,7 @@ async def read_signature_page(ctx: RunContextWrapper[AppContext], question: str)
                 ],
             },
         ],
+        stage="read_signature_page",
         max_tokens=220,
     )
     app.ledger.record(
@@ -171,11 +247,33 @@ async def read_signature_page(ctx: RunContextWrapper[AppContext], question: str)
 
 
 @function_tool(failure_error_function=None)
-async def analyze_clause_risks(ctx: RunContextWrapper[AppContext], clauses: str) -> str:
-    """Delegate deep legal risk analysis of specific clauses to a specialist
-    reasoning agent (the largest model). Pass the clause text to analyze; get
-    back per-clause issues with severity and suggested redlines."""
+async def analyze_clause_risks(ctx: RunContextWrapper[AppContext]) -> str:
+    """Analyze the clauses returned by the required retrieval steps."""
     app = ctx.context
+    search_results = app.clause_cache.get("search_results")
+    if not isinstance(search_results, dict) or not search_results:
+        raise RuntimeError("Clause-risk analysis requires saved search results")
+    clause_topics: dict[str, list[str]] = {}
+    for query, clauses in search_results.items():
+        if (
+            not isinstance(query, str)
+            or not query.strip()
+            or not isinstance(clauses, list)
+            or any(
+                not isinstance(clause, str) or not clause.strip() for clause in clauses
+            )
+        ):
+            raise RuntimeError(
+                "Clause-risk search results must map string queries to lists of strings"
+            )
+        for clause in clauses:
+            clause_topics.setdefault(clause, []).append(query)
+    if not clause_topics:
+        raise RuntimeError("Clause-risk analysis found no saved clauses")
+    clauses = "\n\n===\n\n".join(
+        f"Topics: {', '.join(topics)}\n\n{clause}"
+        for clause, topics in clause_topics.items()
+    )
     model = app.cfg["models"]["reasoning"]
     t0 = time.monotonic()
     result = await Runner.run(
@@ -197,7 +295,11 @@ async def analyze_clause_risks(ctx: RunContextWrapper[AppContext], clauses: str)
         got=_tok(out_tok),
         throughput=f"{out_tok / dt:.0f} tok/s" if out_tok and dt > 0 else "—",
     )
-    return str(result.final_output)
+    analysis = result.final_output_as(ClauseRiskAnalysis)
+    app.clause_cache["risk_analysis"] = analysis.model_dump(mode="json")
+    return _validated_clause_risk_output(
+        _format_clause_risk_analysis(analysis), clauses
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -205,9 +307,9 @@ async def analyze_clause_risks(ctx: RunContextWrapper[AppContext], clauses: str)
 # ──────────────────────────────────────────────────────────────────────────
 @function_tool(failure_error_function=None)
 async def ocr_signature_page(ctx: RunContextWrapper[AppContext]) -> str:
-    """OCR the executed signature page (a scanned image) into markdown text.
-    Use this to recover who signed, their titles, and the execution date —
-    details that exist only on the scan, not in the contract body."""
+    """OCR the supplied signature-page image into markdown text.
+    Use this to recover visible signatories, titles, signature marks, and dates —
+    details that may exist only on the scan, not in the contract body."""
     app = ctx.context
     model = app.cfg["models"]["ocr"]
     t0 = time.monotonic()
@@ -217,6 +319,7 @@ async def ocr_signature_page(ctx: RunContextWrapper[AppContext]) -> str:
         wait_for_capacity=True,
         provision_timeout_s=app.provision_timeout_s,
     )
+    record_api_call(app, "extract", model, res, stage="ocr_signature_page")
     dt = time.monotonic() - t0
     entities = res.get("entities") or []
     markdown = entities[0]["text"] if entities else "(no text recognized)"
@@ -256,6 +359,7 @@ async def extract_entities(ctx: RunContextWrapper[AppContext]) -> str:
         wait_for_capacity=True,
         provision_timeout_s=app.provision_timeout_s,
     )
+    record_api_call(app, "extract", model, res, stage="extract_entities")
     dt = time.monotonic() - t0
     entities = res.get("entities") or []
     app.ledger.record(
@@ -275,7 +379,7 @@ async def extract_entities(ctx: RunContextWrapper[AppContext]) -> str:
 
 @function_tool(failure_error_function=None)
 async def search_clauses(ctx: RunContextWrapper[AppContext], query: str) -> str:
-    """Find the clauses most relevant to a topic (e.g. 'automatic renewal',
+    """Find the clauses most relevant to a topic (e.g. 'renewal mechanics',
     'limitation of liability', 'indemnification'). Dense-embedding retrieval
     followed by a cross-encoder rerank; returns the top clauses verbatim."""
     app = ctx.context
@@ -293,6 +397,13 @@ async def search_clauses(ctx: RunContextWrapper[AppContext], query: str) -> str:
         wait_for_capacity=True,
         provision_timeout_s=app.provision_timeout_s,
     )
+    record_api_call(
+        app,
+        "encode",
+        embed_model,
+        q,
+        stage="search_clauses:encode",
+    )
     qv = np.asarray(q["dense"], dtype=np.float32)
     denom = np.linalg.norm(matrix, axis=1) * (np.linalg.norm(qv) + 1e-9) + 1e-9
     sims = (matrix @ qv) / denom
@@ -307,6 +418,13 @@ async def search_clauses(ctx: RunContextWrapper[AppContext], query: str) -> str:
         wait_for_capacity=True,
         provision_timeout_s=app.provision_timeout_s,
     )
+    record_api_call(
+        app,
+        "score",
+        rerank_model,
+        scored,
+        stage="search_clauses:score",
+    )
     dt = time.monotonic() - t0
     app.ledger.record(
         "Rerank candidate clauses",
@@ -319,6 +437,10 @@ async def search_clauses(ctx: RunContextWrapper[AppContext], query: str) -> str:
     )
     ranked = sorted(scored["scores"], key=lambda s: s["rank"])[:k_res]
     top = [candidates[int(s["item_id"])] for s in ranked]
+    search_results = app.clause_cache.setdefault("search_results", {})
+    if not isinstance(search_results, dict):
+        raise TypeError("Clause search cache has an invalid shape")
+    search_results[query] = top
     return "\n\n---\n\n".join(top) if top else "(no relevant clauses found)"
 
 
@@ -367,12 +489,35 @@ def _clean_sql(raw: str) -> str:
     return sql.strip().rstrip(";").strip()
 
 
-def _run_select(db_path: str, sql: str) -> tuple[list[str], list[tuple]]:
+def _run_select(
+    db_path: str, sql: str, params: dict[str, str] | None = None
+) -> tuple[list[str], list[tuple]]:
     conn = sqlite3.connect(db_path)
     try:
-        cur = conn.execute(sql)
+        cur = conn.execute(sql, params or {})
         cols = [d[0] for d in cur.description] if cur.description else []
-        return cols, cur.fetchmany(50)
+        return cols, cur.fetchall()
+    finally:
+        conn.close()
+
+
+_SCOPED_OBLIGATION_COLUMNS = (
+    "counterparty",
+    "status",
+    "obligation",
+    "due_date",
+    "amount_usd",
+)
+
+
+def _open_obligation_rows(db_path: str, counterparty: str) -> list[tuple]:
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(
+            "SELECT counterparty, status, obligation, due_date, amount_usd "
+            "FROM obligations WHERE counterparty = ? AND status = 'open'",
+            (counterparty,),
+        ).fetchall()
     finally:
         conn.close()
 
@@ -388,9 +533,18 @@ async def query_obligations_db(
     app = ctx.context
     model = app.cfg["models"]["sql"]
     mode = (app.cfg.get("sql") or {}).get("mode", "instruct")
+    scoped_question = question
+    if app.obligation_counterparty:
+        scoped_question += (
+            "\nReturn every row whose counterparty equals the named SQLite parameter "
+            ":counterparty and whose status exactly equals 'open'. Use :counterparty "
+            "in the WHERE clause; do not copy or invent a literal counterparty value. "
+            "Include counterparty, status, obligation, due_date, and amount_usd in "
+            "SELECT. Order by due_date. Do not use LIMIT or a date window."
+        )
     if mode == "prompt":
         prompt = _SQLCODER_PROMPT.format(
-            question=question,
+            question=scoped_question,
             schema=SCHEMA_DDL,
             today=TODAY,
         )
@@ -398,6 +552,7 @@ async def query_obligations_db(
             app,
             model,
             prompt,
+            stage="query_obligations_db",
             max_tokens=256,
             stop=[";", "```", "\n\n\n"],
         )
@@ -414,10 +569,11 @@ async def query_obligations_db(
                     "role": "user",
                     "content": _SQL_CHAT_USER.format(
                         schema=SCHEMA_DDL,
-                        question=question,
+                        question=scoped_question,
                     ),
                 },
             ],
+            stage="query_obligations_db",
             max_tokens=256,
         )
     else:
@@ -436,17 +592,54 @@ async def query_obligations_db(
     sql = _clean_sql(res.text)
     if not sql.lower().startswith("select"):
         return f"Generated query was not a SELECT, so it was not run:\n{sql}"
+    sql_params: dict[str, str] | None = None
+    if app.obligation_counterparty:
+        if ":counterparty" not in sql:
+            return (
+                "Generated query omitted the required bound :counterparty parameter."
+                f"\nSQL: {sql}"
+            )
+        sql_params = {"counterparty": app.obligation_counterparty}
     try:
-        cols, rows = _run_select(app.db_path, sql)
-    except sqlite3.Error as exc:
+        cols, rows = _run_select(app.db_path, sql, sql_params)
+    except (sqlite3.Error, sqlite3.Warning) as exc:
         return f"SQL error: {exc}\nQuery was:\n{sql}"
+    if app.obligation_counterparty:
+        required_scope_columns = set(_SCOPED_OBLIGATION_COLUMNS)
+        missing_scope_columns = required_scope_columns - set(cols)
+        if missing_scope_columns:
+            return (
+                "Generated query omitted columns required for exact contract "
+                f"scoping: {', '.join(sorted(missing_scope_columns))}.\nSQL: {sql}"
+            )
+        scope_indexes = [cols.index(column) for column in _SCOPED_OBLIGATION_COLUMNS]
+        returned_scope_rows = [
+            tuple(row[index] for index in scope_indexes) for row in rows
+        ]
+        expected_scope_rows = _open_obligation_rows(
+            app.db_path, app.obligation_counterparty
+        )
+        returned_scope = Counter(returned_scope_rows)
+        expected_scope = Counter(expected_scope_rows)
+        if returned_scope != expected_scope:
+            scope_difference = (returned_scope - expected_scope) + (
+                expected_scope - returned_scope
+            )
+            return (
+                "Generated query returned incomplete contract scope: expected "
+                f"{len(expected_scope_rows)} open rows, got "
+                f"{len(returned_scope_rows)}; differing rows: "
+                f"{dict(scope_difference)}.\nSQL: {sql}"
+            )
     if not rows:
         return f"Query ran but returned no rows.\nSQL: {sql}"
     header = " | ".join(cols)
     body = "\n".join(
         " | ".join("" if v is None else str(v) for v in row) for row in rows
     )
-    return f"SQL: {sql}\n\n{header}\n{body}"
+    result = f"SQL: {sql}\n\n{header}\n{body}"
+    app.clause_cache["obligations_result"] = result
+    return result
 
 
 ALL_TOOLS = [

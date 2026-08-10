@@ -57,8 +57,21 @@
       "rank": 10
     }
   ],
-  "query_id": "cms-l1851-query",
   "usage": {
-    "input_tokens": 1434
+    "input_tokens": 1434,
+    "credits_charged": 69,
+    "rate_book_version": "2026-07-26-production-bootstrap-v2"
+  },
+  "request": {
+    "id": "019fe8ae-c909-7a13-a7f5-c912a97f62fb",
+    "credits_debited": 69,
+    "rate_book_version": "2026-07-26-production-bootstrap-v2",
+    "usage": {
+      "input_tokens": 1434,
+      "pairs": 11,
+      "credits_charged": 69,
+      "rate_book_version": "2026-07-26-production-bootstrap-v2"
+    },
+    "execution_identity_sha256": "a61058c96cb7d88459f63949845a8b35aa0b258042898d6159adf80eff846963"
   }
 }

@@ -10,7 +10,7 @@ from typing import Any
 
 from sie_sdk import SIEAsyncClient
 
-from .native_model import RequiredToolStep, SIENativeModel
+from .native_model import RequiredToolStep, SIENativeModel, api_call_row
 
 
 def provision_timeout_from(cfg: dict[str, Any]) -> float:
@@ -22,15 +22,19 @@ def model_for(
     model_id: str,
     client: SIEAsyncClient,
     *,
+    stage: str,
     provision_timeout_s: float,
     required_tool_sequence: tuple[RequiredToolStep, ...] = (),
+    api_calls: list[dict[str, Any]] | None = None,
 ) -> SIENativeModel:
     """Bind one SIE catalog model to the Agents SDK native model interface."""
     return SIENativeModel(
         model_id,
         client,
+        stage=stage,
         provision_timeout_s=provision_timeout_s,
         required_tool_sequence=required_tool_sequence,
+        api_calls=api_calls,
     )
 
 
@@ -110,12 +114,35 @@ class AppContext:
     contract_text: str
     scan_path: str
     db_path: str
+    obligation_counterparty: str | None = None
+    api_calls: list[dict[str, Any]] = field(default_factory=list)
     reasoning_agent: Any = None
     clause_cache: dict[str, Any] = field(default_factory=dict)
 
     @property
     def provision_timeout_s(self) -> float:
         return provision_timeout_from(self.cfg)
+
+
+def record_api_call(
+    app: AppContext,
+    sie_fn: str,
+    requested_model: str,
+    result: Any,
+    *,
+    stage: str,
+) -> None:
+    """Record only non-payload response metadata for checked run evidence."""
+    rows = result if isinstance(result, list) else [result]
+    response = next((row for row in rows if isinstance(row, dict)), {})
+    app.api_calls.append(
+        api_call_row(
+            stage=stage,
+            function=sie_fn,
+            requested_model=requested_model,
+            response=response,
+        )
+    )
 
 
 def _data_uri_image(value: str) -> tuple[bytes, str]:
@@ -191,6 +218,7 @@ async def instruct_once(
     model: str,
     messages: list[dict[str, Any]],
     *,
+    stage: str,
     max_tokens: int = 512,
     temperature: float = 0.0,
     timeout_s: float | None = None,
@@ -216,6 +244,7 @@ async def instruct_once(
         if timeout_s is not None
         else await call
     )
+    record_api_call(app, "generate", model, result, stage=stage)
     return _generation_result(result, time.monotonic() - started)
 
 
@@ -224,6 +253,7 @@ async def prompt_once(
     model: str,
     prompt: str,
     *,
+    stage: str,
     max_tokens: int = 256,
     temperature: float = 0.0,
     stop: list[str] | None = None,
@@ -239,4 +269,5 @@ async def prompt_once(
         wait_for_capacity=True,
         provision_timeout_s=app.provision_timeout_s,
     )
+    record_api_call(app, "generate", model, result, stage=stage)
     return _generation_result(result, time.monotonic() - started)
