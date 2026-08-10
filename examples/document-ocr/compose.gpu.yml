@@ -11,7 +11,7 @@ services:
       - --port
       - "8080"
       - --preload
-      - lightonai/LightOnOCR-2-1B,naver-clova-ix/donut-base-finetuned-cord-v2,urchade/gliner_multi-v2.1,zai-org/GLM-OCR,PaddlePaddle/PaddleOCR-VL-1.5
+      - lightonai/LightOnOCR-2-1B,naver-clova-ix/donut-base-finetuned-cord-v2,urchade/gliner_multi-v2.1,zai-org/GLM-OCR,PaddlePaddle/PaddleOCR-VL-1.6
     ports:
       - "8080:8080"
     restart: unless-stopped

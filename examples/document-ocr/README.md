@@ -196,7 +196,7 @@ GPU-only models show up disabled on the CPU compose).
 
 | Stage | Default (preloaded) | Alternates |
 |---|---|---|
-| Recognition | `lightonai/LightOnOCR-2-1B` (2.1B, Markdown output) | `PaddlePaddle/PaddleOCR-VL-1.5` (GPU image); `zai-org/GLM-OCR` (9B, GPU only) |
+| Recognition | `lightonai/LightOnOCR-2-1B` (2.1B, Markdown output) | `PaddlePaddle/PaddleOCR-VL-1.6` (GPU image); `zai-org/GLM-OCR` (9B, GPU only) |
 | Structured | `naver-clova-ix/donut-base-finetuned-cord-v2` | `naver-clova-ix/donut-base-finetuned-docvqa`; `naver-clova-ix/donut-base-finetuned-rvlcdip` (16-class document classifier) |
 | Zero-shot NER | `urchade/gliner_multi-v2.1` | `urchade/gliner_large-v2.1`; `urchade/gliner_multi_pii-v1`; `numind/NuNER_Zero` (different architecture, useful contrast against GLiNER) |
 

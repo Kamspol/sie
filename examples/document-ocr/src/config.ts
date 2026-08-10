@@ -14,9 +14,9 @@ export const RECOGNITION_MODELS: ModelOption[] = [
     description: "Pixtral encoder + Qwen3 decoder, 2.1B. Strong Markdown output across dense layouts. ~4 GB to download on first call.",
   },
   {
-    id: "PaddlePaddle/PaddleOCR-VL-1.5",
-    label: "PaddleOCR-VL-1.5 (GPU image)",
-    description: "Paddle's VLM-OCR, 1.5B. Six task modes. Available on the CUDA image (compose.gpu.yml).",
+    id: "PaddlePaddle/PaddleOCR-VL-1.6",
+    label: "PaddleOCR-VL-1.6 (GPU image)",
+    description: "Paddle's VLM-OCR, 0.9B. Six task modes. Available on the CUDA image (compose.gpu.yml).",
     options: { task: "ocr" },
     gpuRequired: true,
   },
