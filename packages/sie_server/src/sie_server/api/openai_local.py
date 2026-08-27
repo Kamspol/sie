@@ -42,7 +42,7 @@ from sie_server.adapters._generation_base import (
 )
 from sie_server.adapters.mlx.generation import MLXGenerationAdapter, normalize_mlx_seed
 from sie_server.adapters.sglang.generation import SGLangGenerationAdapter
-from sie_server.api.helpers import ModelStateChecker
+from sie_server.api.helpers import ModelStateChecker, ensure_finite_scores, openai_error_response
 from sie_server.api.options import resolve_runtime_options
 from sie_server.api.score import score_usage_from_output
 from sie_server.api.validation import validate_machine_profile_header, validate_signed_i64
@@ -759,7 +759,20 @@ async def chat_completions(
     MLX remains the non-CUDA backend. CUDA profiles proxy to the exact SGLang
     subprocess the registry loaded for the requested model/profile. The child
     URL and served model name always come from that adapter, never the body.
+
+    Errors are emitted as top-level OpenAI ``{"error": {...}}`` envelopes
+    (never FastAPI's ``{"detail": ...}`` wrapper), matching ``/v1/completions``.
     """
+    try:
+        return await _chat_completions(http_request, x_machine_profile)
+    except HTTPException as exc:
+        return openai_error_response(exc)
+
+
+async def _chat_completions(
+    http_request: Request,
+    x_machine_profile: str | None,
+) -> Response | StreamingResponse:
     validate_machine_profile_header(x_machine_profile)
 
     body = await _read_json_body(http_request)
@@ -984,7 +997,20 @@ async def rerank(
     Request: ``{model, query, documents: [str], top_n?, return_documents?}``.
     Response: ``{model, results: [{index, relevance_score, document?}], usage}``
     sorted by descending relevance.
+
+    Errors are emitted as top-level OpenAI ``{"error": {...}}`` envelopes
+    (never FastAPI's ``{"detail": ...}`` wrapper), matching ``/v1/completions``.
     """
+    try:
+        return await _rerank(http_request, x_machine_profile)
+    except HTTPException as exc:
+        return openai_error_response(exc)
+
+
+async def _rerank(
+    http_request: Request,
+    x_machine_profile: str | None,
+) -> JSONResponse:
     validate_machine_profile_header(x_machine_profile)
 
     body = await _read_json_body(http_request)
@@ -1065,6 +1091,9 @@ async def rerank(
 
         score_output: ScoreOutput = worker_result.output
         scores = [float(score_output.scores[i]) for i in range(score_output.batch_size)]
+        # Fail closed on non-finite (NaN/inf) model output before serialization;
+        # the HTTPException is re-emitted as the OpenAI error envelope by rerank().
+        ensure_finite_scores(scores, model)
         usage = score_usage_from_output(score_output)
         if usage is None:
             raise HTTPException(

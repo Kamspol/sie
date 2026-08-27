@@ -33,6 +33,7 @@ import tempfile
 import threading
 import uuid
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any, cast
 
 import httpx
@@ -73,9 +74,8 @@ _ABORT_REQUEST_TIMEOUT_S = float(os.environ.get("SIE_SGLANG_ABORT_REQUEST_TIMEOU
 # distribution. A guard's verdict usually sits at position 0, but a leading
 # whitespace/punctuation/preamble token can push it back a slot — so we scan
 # the first few positions for the first one that carries a Yes/No top_logprobs
-# distribution. Mirrors the eval runner's ``content[:3]`` scan
-# (``sie_bench.eval.generation_runner._p_unsafe_from_logprobs``) so serving and
-# eval agree on which position the verdict is read from.
+# distribution. The first-three-position scan keeps serving aligned with the
+# evaluation convention for locating the verdict.
 _GUARD_VERDICT_SCAN_POSITIONS = 3
 
 
@@ -338,6 +338,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
 
         self._process: subprocess.Popen[bytes] | None = None
         self._server_url: str | None = None
+        self._port: int | None = None
         self._device: str | None = None
         self._output_file: tempfile._TemporaryFileWrapper | None = None
         # Shared httpx client. Opened lazily on the first ``generate()`` call
@@ -446,12 +447,30 @@ class SGLangGenerationAdapter(GenerationAdapter):
         self._device = device
         device_index = _server.parse_device_index(device)
         port = _server.find_free_port()
+        self._port = port
         self._server_url = f"http://localhost:{port}"
 
+        # The port (and, once opened, the log fd) belong to this adapter from
+        # the reservation above onward, so every raise below hands them back
+        # rather than leaking one slot of the 100-port span per attempt: a full
+        # /tmp in open_output_log, a failed exec, the pre-launch speculative
+        # validation, or a cancelled load included.
+        try:
+            self._start_server(port=port, device_index=device_index, server_url=self._server_url)
+        except BaseException:
+            self._abort_failed_load()
+            raise
+
+    def _start_server(self, *, port: int, device_index: int, server_url: str) -> None:
+        """Launch the SGLang child and block until it serves the model.
+
+        Always called under ``load``'s abort-on-failure guard, so it raises
+        without cleaning up the port or log itself.
+        """
         logger.info(
             "Starting SGLang generation server for %s on device=%s (gpu_id=%d) at port %d",
             self._model_name_or_path,
-            device,
+            self._device,
             device_index,
             port,
         )
@@ -558,18 +577,21 @@ class SGLangGenerationAdapter(GenerationAdapter):
         )
 
         if not _server.wait_for_server(
-            self._server_url,
+            server_url,
             self._process,
             output_file=self._output_file,
             timeout_s=self._startup_timeout_s,
         ):
+            # Capture crash-vs-timeout before terminate makes poll() ambiguous.
+            crash_exit_code = self._process.poll()
             log_path = getattr(self._output_file, "name", None)
             if log_path:
                 logger.error("SGLang failed to reach health. log_path=%s", log_path)
                 logger.error("SGLang startup log tail:\n%s", _tail_file(str(log_path)))
             _server.terminate_process(self._process)
             self._process = None
-            raise _server.startup_failure_error(self._output_file)
+            # Build the error before `load`'s abort deletes the log it reads.
+            raise _server.startup_failure_error(self._output_file, crash_exit_code=crash_exit_code)
 
         # Best-effort runtime verification that the
         # ``--grammar-backend`` flag actually took effect. SGLang's
@@ -588,6 +610,22 @@ class SGLangGenerationAdapter(GenerationAdapter):
             self._model_name_or_path,
             self._server_url,
         )
+
+    def _abort_failed_load(self) -> None:
+        """Tear down a partially-started child + reset state after a failed load.
+
+        The registry does not call unload() on a failed load, so this mirrors
+        unload(): terminate the child, release the reserved port, drop the temp
+        log, and clear _server_url/_device so the adapter does not look "loaded"
+        (_check_loaded() gates only on _server_url). Mirrors the MLX sibling.
+        """
+        _server.terminate_process(self._process)
+        self._process = None
+        _server.release_port(self._port)
+        self._port = None
+        self._server_url = None
+        self._device = None
+        self._cleanup_output_log()
 
     def _verify_grammar_backend_log(self) -> None:
         """Scan ``self._output_file`` for evidence SGLang accepted the
@@ -891,8 +929,27 @@ class SGLangGenerationAdapter(GenerationAdapter):
             logger.info("Shutting down SGLang generation server for %s", self._model_name_or_path)
             _server.terminate_process(self._process)
             self._process = None
+        # Release only after the child is down so a concurrent load can't be
+        # handed a port the dying child still holds bound.
+        _server.release_port(self._port)
+        self._port = None
         self._server_url = None
         self._device = None
+        self._cleanup_output_log()
+
+    def _cleanup_output_log(self) -> None:
+        """Close + delete the subprocess stdout/stderr log (best-effort, idempotent).
+
+        Without this, one ``sglang_*.log`` leaks into /tmp per load — unbounded
+        under LRU-eviction / hot-reload churn — and the open fd is held for the
+        subprocess lifetime. Mirrors the MLX sibling's cleanup.
+        """
+        if self._output_file is not None:
+            with contextlib.suppress(OSError):
+                self._output_file.close()
+            with contextlib.suppress(OSError):
+                Path(self._output_file.name).unlink()
+            self._output_file = None
 
     def memory_footprint(self) -> int:
         # SGLang pre-allocates in the subprocess; let the registry measure GPU.

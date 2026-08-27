@@ -236,6 +236,14 @@ async def test_streaming_publishes_per_chunk_with_terminal(monkeypatch: pytest.M
     # ACK happened.
     msg.ack.assert_awaited()
     _assert_one_generation_completion(telemetry, outcome="success")
+    # Worker-side phase boundary (#3136): one worker-wait observation per
+    # dispatched request, labeled with the grammar mode ("none" here) so the
+    # structured-output stall decomposes into worker wait vs engine TTFT.
+    telemetry.worker_wait_observed.assert_called_once()
+    wait_kwargs = telemetry.worker_wait_observed.call_args.kwargs
+    assert wait_kwargs["model"] == "test/model"
+    assert wait_kwargs["grammar"] == "none"
+    assert wait_kwargs["duration_s"] >= 0
 
 
 @pytest.mark.asyncio
@@ -991,6 +999,33 @@ async def test_grammar_compile_runs_once_per_schema(monkeypatch: pytest.MonkeyPa
     await proc2.process(msg2, "test/model")
 
     assert len(calls) == 1, f"expected exactly one compile, got {len(calls)}"
+
+
+@pytest.mark.asyncio
+async def test_worker_wait_phase_is_labeled_with_grammar_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Grammar dispatches stamp their kind on the worker-wait phase metric so
+    the #3136 structured-output stall decomposes by cohort.
+    """
+    telemetry = _capture_worker_completion(monkeypatch)
+    script = [
+        GenerationChunk(text_delta="ok", is_first=True),
+        GenerationChunk(text_delta="", done=True, finish_reason="stop", prompt_tokens=1, completion_tokens=1),
+    ]
+    nc = AsyncMock()
+    proc = StreamingProcessor(nc=nc, registry=_make_registry(_FakeGenAdapter(script)), worker_id="w1")
+
+    grammar_payload = {
+        "kind": "json_schema",
+        "value": {"type": "object", "properties": {"x": {"type": "integer"}}},
+    }
+    wi = _make_work_item(generate={"prompt": "Hi", "max_new_tokens": 8, "grammar": grammar_payload})
+    await proc.process(_make_msg(wi), "test/model")
+
+    telemetry.worker_wait_observed.assert_called_once()
+    kwargs = telemetry.worker_wait_observed.call_args.kwargs
+    assert kwargs["model"] == "test/model"
+    assert kwargs["grammar"] == "json_schema"
+    assert kwargs["duration_s"] >= 0
 
 
 @pytest.mark.asyncio

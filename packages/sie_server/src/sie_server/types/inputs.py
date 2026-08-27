@@ -8,9 +8,13 @@ Mapping-shaped media uses TypedDict where permissive compatibility is required;
 audio uses a strict msgspec struct because it crosses a bounded binary boundary.
 """
 
-from typing import Any, Literal, TypedDict, TypeGuard, cast, overload
+import io
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, TypeGuard, cast, overload
 
 import msgspec
+
+if TYPE_CHECKING:
+    from PIL import Image as PILImage
 
 
 class ImageInput(TypedDict, total=False):
@@ -255,6 +259,60 @@ def media_bytes(media: object, *, kind: str = "media") -> bytes:
         f"{kind} data must be bytes, got {type(data).__name__} "
         "(base64 JSON strings must be decoded to bytes before inference)"
     )
+
+
+def decode_image(
+    media: object,
+    *,
+    kind: str = "image",
+    item_index: int | None = None,
+    image_index: int | None = None,
+) -> "PILImage.Image":
+    """Decode a media input's bytes into an RGB PIL image.
+
+    Centralizes the ``Image.open(io.BytesIO(media_bytes(...)))`` + RGB-convert
+    idiom every image consumer repeated, and closes the error-mapping gap it
+    left open: PIL raises ``UnidentifiedImageError`` (an ``OSError`` subclass)
+    on bytes that are valid base64 but not a decodable image, which missed the
+    ``ValueError`` -> 400 INVALID_INPUT mapping and surfaced as a 500
+    ``INFERENCE_ERROR`` leaking a ``BytesIO`` repr. Routing every user-input
+    ``Image.open`` through this helper turns undecodable bytes into a typed
+    :class:`InvalidMediaError` (-> 400 on both the HTTP and queue paths, see
+    that class), phrased in the same JSON-path style msgspec uses for corrupt
+    base64 ("Invalid base64 encoded string - at `$.items[0].images[0].data`").
+
+    Args:
+        media: The media input mapping (e.g. an :class:`ImageInput`).
+        kind: Human label used in the error message.
+        item_index: Request-local item index, used in the error's JSON path
+            when the call site knows it (``*`` placeholder otherwise).
+        image_index: Index within the item's ``images`` list, when known.
+
+    Returns:
+        The decoded image, converted to RGB when needed.
+
+    Raises:
+        InvalidMediaError: If ``media`` violates the bytes contract (see
+            :func:`media_bytes`) or its bytes are not a decodable image.
+    """
+    from PIL import Image as PILImage  # noqa: PLC0415 — deferred: PIL is an optional dependency
+
+    data = media_bytes(media, kind=kind)
+    try:
+        img = PILImage.open(io.BytesIO(data))
+        # Force the full decode: PIL is lazy, so truncated bytes behind a
+        # valid header would otherwise fail later, inside a processor, as an
+        # untyped OSError (-> 500).
+        img.load()
+    except (OSError, ValueError, SyntaxError) as exc:
+        item = "*" if item_index is None else str(item_index)
+        image = "*" if image_index is None else str(image_index)
+        raise InvalidMediaError(
+            f"{kind} data is not a decodable image - at `$.items[{item}].images[{image}].data`"
+        ) from exc
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    return img
 
 
 # =============================================================================

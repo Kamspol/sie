@@ -30,6 +30,7 @@ use tokio::sync::{broadcast, oneshot, Notify};
 use crate::observability::metrics::{
     self as telemetry, GenerationEvent, GenerationEventOutcome, GenerationEventReason,
 };
+use crate::queue::lane_admission::LaneReservation;
 
 /// Broadcast channel capacity for the per-request SSE chunk tap.
 ///
@@ -170,7 +171,7 @@ fn default_tool_call_type() -> String {
 }
 
 /// Wire-level allowlist for ``finish_reason`` values produced by the
-/// worker. OpenAI canonical values plus the SIE-internal additions for
+/// worker. OpenAI canonical values plus the gateway-specific additions for
 /// gateway-driven cancellation and error surfacing. Keep in lockstep with
 /// ``GenerationChunk.finish_reason`` in the Python adapter.
 fn is_known_finish_reason(reason: &str) -> bool {
@@ -388,6 +389,11 @@ pub struct StreamCollector {
     /// than surfacing an empty body. Overwritten on every bump; a
     /// successful new attempt (no rewind) simply never reads it.
     snapshot: Option<AttemptSnapshot>,
+    /// Per-lane in-flight reservation, released when this collector drops.
+    /// Installed by the publish path after the lane admission check; `None`
+    /// on a collector built outside it. See
+    /// [`crate::queue::lane_admission`].
+    pub lane_reservation: Option<LaneReservation>,
 }
 
 /// State saved by ``bump_attempt_generation`` so a failed-publish
@@ -446,6 +452,7 @@ impl StreamCollector {
             abandoned_attempt_id: None,
             client_disconnected: Arc::new(AtomicBool::new(false)),
             snapshot: None,
+            lane_reservation: None,
         }
     }
 

@@ -117,7 +117,7 @@ def load_model_configs(models_dir: Path | str, *, require_pinned_revision: bool 
     """Load all model configs from a directory (local or cloud).
 
     Args:
-        models_dir: Path to the models directory (local path, s3://, gs://, abfs://, or abfss://).
+        models_dir: Path to the models directory (local path, s3://, gs://, abfs(s)://, or oss://).
         require_pinned_revision: When True, reject any HF-backed config that does not pin an
             immutable ``hf_revision``. Off by default so the full dev catalog
             (which carries an unpinned long tail) still loads; the managed serving/staging

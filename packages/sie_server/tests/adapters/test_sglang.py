@@ -1,6 +1,8 @@
 """Tests for SGLang embedding adapter (HTTP server mode)."""
 
+import socket
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -308,6 +310,138 @@ class TestSGLangEmbeddingAdapter:
         mock_getpgid.assert_called_with(12345)
         assert adapter._server_url is None
         assert adapter._process is None
+
+    @patch("sie_server.adapters.sglang._server.os.getpgid")
+    @patch("sie_server.adapters.sglang._server.os.killpg")
+    def test_unload_releases_port_and_cleans_output_log(
+        self,
+        mock_killpg: MagicMock,
+        mock_getpgid: MagicMock,
+    ) -> None:
+        """Unload returns the reserved port to the pool and removes the temp log."""
+        mock_process = MagicMock()
+        mock_process.pid = 12345
+        mock_process.wait.return_value = None
+        mock_getpgid.return_value = 12345
+
+        adapter = SGLangEmbeddingAdapter("test-model")
+        adapter._process = mock_process
+        adapter._server_url = "http://localhost:30000"
+        adapter._port = 30000
+        adapter._output_file = _server.open_output_log(prefix="sie_test_sglang_")
+        log_path = Path(adapter._output_file.name)
+
+        # Order matters: releasing the port before the child is down would hand
+        # a live port to a concurrent load, so record both calls on one list.
+        events: list[str] = []
+        with (
+            patch(
+                "sie_server.adapters.sglang._server.terminate_process",
+                side_effect=lambda *_args, **_kwargs: events.append("terminate"),
+            ),
+            patch(
+                "sie_server.adapters.sglang._server.release_port",
+                side_effect=lambda port: events.append(f"release:{port}"),
+            ),
+        ):
+            adapter.unload()
+
+        assert events == ["terminate", "release:30000"]
+        assert adapter._port is None
+        assert adapter._output_file is None
+        assert not log_path.exists()
+
+    @patch("sie_server.adapters.sglang._server.os.getpgid")
+    @patch("sie_server.adapters.sglang._server.os.killpg")
+    @patch("sie_server.adapters.sglang._server.wait_for_server", return_value=False)
+    @patch("sie_server.adapters.sglang._server.subprocess.Popen")
+    @patch("sie_server.adapters.sglang._server.find_free_port")
+    def test_load_failure_releases_port_and_cleans_output_log(
+        self,
+        mock_find_port: MagicMock,
+        mock_popen: MagicMock,
+        mock_wait: MagicMock,
+        mock_killpg: MagicMock,
+        mock_getpgid: MagicMock,
+    ) -> None:
+        """A startup-health failure must not leak the reserved port or the temp log."""
+        mock_find_port.return_value = 30000
+        mock_process = MagicMock()
+        mock_process.pid = 12345
+        mock_process.poll.return_value = None  # Process running but not healthy (timeout path)
+        mock_popen.return_value = mock_process
+        mock_getpgid.return_value = 12345
+
+        # A real temp file, so the assertion below is "gone from disk" rather
+        # than the weaker "attribute was reset".
+        real_log = _server.open_output_log(prefix="sie_test_sglang_")
+        log_path = Path(real_log.name)
+
+        adapter = SGLangEmbeddingAdapter("test-model")
+        with (
+            patch("sie_server.adapters.sglang._server.open_output_log", return_value=real_log),
+            patch("sie_server.adapters.sglang._server.release_port") as mock_release,
+            pytest.raises(RuntimeError, match="failed to start"),
+        ):
+            adapter.load("cuda:0")
+
+        mock_release.assert_called_once_with(30000)
+        assert adapter._port is None
+        assert adapter._server_url is None
+        assert adapter._output_file is None
+        assert not log_path.exists()
+
+    @patch("sie_server.adapters.sglang._server.open_output_log", side_effect=OSError("no space left on device"))
+    @patch("sie_server.adapters.sglang._server.find_free_port")
+    def test_output_log_failure_releases_port(
+        self,
+        mock_find_port: MagicMock,
+        mock_open_log: MagicMock,
+    ) -> None:
+        """The port is reserved before the log is opened, so a /tmp failure must
+        still hand it back — otherwise repeated failures exhaust the span.
+        """
+        mock_find_port.return_value = 30000
+
+        adapter = SGLangEmbeddingAdapter("test-model")
+        with (
+            patch("sie_server.adapters.sglang._server.release_port") as mock_release,
+            pytest.raises(OSError, match="no space left on device"),
+        ):
+            adapter.load("cuda:0")
+
+        mock_release.assert_called_once_with(30000)
+        assert adapter._port is None
+        assert adapter._server_url is None
+
+    @patch("sie_server.adapters.sglang._server.subprocess.Popen", side_effect=OSError("exec format error"))
+    @patch("sie_server.adapters.sglang._server.find_free_port")
+    def test_launch_failure_releases_port_and_cleans_output_log(
+        self,
+        mock_find_port: MagicMock,
+        mock_popen: MagicMock,
+    ) -> None:
+        """A failed exec must release the port and delete the log it opened."""
+        mock_find_port.return_value = 30000
+
+        # A real temp file, so the assertion below is "gone from disk" rather
+        # than the weaker "attribute was reset".
+        real_log = _server.open_output_log(prefix="sie_test_sglang_")
+        log_path = Path(real_log.name)
+
+        adapter = SGLangEmbeddingAdapter("test-model")
+        with (
+            patch("sie_server.adapters.sglang._server.open_output_log", return_value=real_log),
+            patch("sie_server.adapters.sglang._server.release_port") as mock_release,
+            pytest.raises(OSError, match="exec format error"),
+        ):
+            adapter.load("cuda:0")
+
+        mock_release.assert_called_once_with(30000)
+        assert adapter._port is None
+        assert adapter._server_url is None
+        assert adapter._output_file is None
+        assert not log_path.exists()
 
     def test_encode_before_load_raises(self) -> None:
         """Encode before load raises error."""
@@ -634,3 +768,124 @@ class TestSGLangLoRA:
         adapter.set_active_lora("legal")
         with pytest.raises(ValueError, match=r"LoRA 'legal' not loaded.*Available: \[\]"):
             adapter.encode(items, output_types=["dense"])
+
+
+class TestPortReservation:
+    """find_free_port reserves ports; release_port returns them to the pool."""
+
+    def test_release_returns_reserved_port_to_pool(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(_server, "_RESERVED_PORTS", set())
+        port = _server.find_free_port()
+        assert port in _server._RESERVED_PORTS
+        _server.release_port(port)
+        assert port not in _server._RESERVED_PORTS
+
+    def test_exhausted_span_recovers_after_release(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Releasing one port un-bricks allocation after the span exhausts.
+
+        This is the LRU eviction→reload churn scenario: without release_port
+        the reserved set only grows, and once all 100 ports are reserved every
+        generation-model load fails until a full process restart.
+        """
+        # Anchor the scan on a port the OS just proved bindable, so the test
+        # doesn't depend on the state of the real SGLang range (30000-30099).
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("localhost", 0))
+            anchor = s.getsockname()[1]
+        monkeypatch.setattr(_server, "_RESERVED_PORTS", set(range(anchor, anchor + 100)))
+        with pytest.raises(RuntimeError, match="Could not find free port"):
+            _server.find_free_port(anchor)
+        _server.release_port(anchor)
+        assert _server.find_free_port(anchor) == anchor
+
+    def test_release_tolerates_none_and_unreserved_ports(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(_server, "_RESERVED_PORTS", set())
+        _server.release_port(None)
+        _server.release_port(54321)  # never reserved — must be a no-op
+        assert not _server._RESERVED_PORTS
+
+
+class TestKernelCacheEnvironment:
+    def test_disabled_without_root(self) -> None:
+        assert _server._kernel_cache_env({}, device_index=0) == {}
+
+    @patch("sie_server.adapters.sglang._server.subprocess.run")
+    def test_gpu_key_uses_driver_inventory_without_initializing_cuda(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = MagicMock(stdout="NVIDIA H100 80GB HBM3\nNVIDIA H200\n")
+
+        first_key = _server._gpu_cache_key(0)
+        second_key = _server._gpu_cache_key(1)
+
+        assert first_key is not None
+        assert first_key.startswith("gpu-")
+        assert second_key is not None
+        assert second_key.startswith("gpu-")
+        assert first_key != second_key
+        assert mock_run.call_args.args[0] == [
+            "nvidia-smi",
+            "--query-gpu=name",
+            "--format=csv,noheader",
+        ]
+
+    def test_scopes_upstream_caches_by_abi_and_gpu(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(_server, "_installed_jit_abi_key", lambda: "abi123")
+        monkeypatch.setattr(_server, "_gpu_cache_key", lambda _device_index: "sm120-gpu123")
+
+        env = {_server.KERNEL_CACHE_ROOT_ENV_VAR: str(tmp_path)}
+        cache_env = _server._kernel_cache_env(env, device_index=0)
+
+        namespace = tmp_path / "v1" / "abi123" / "sm120-gpu123" / "device-0"
+        assert cache_env["SGLANG_DG_CACHE_DIR"] == str(namespace / "deep-gemm")
+        assert cache_env["FLASHINFER_WORKSPACE_BASE"] == str(namespace / "flashinfer")
+        assert cache_env["CUTE_DSL_CACHE_DIR"] == str(namespace / "cutlass")
+        assert cache_env["TRITON_CACHE_DIR"] == str(namespace / "triton")
+        assert all(Path(path).is_dir() for path in cache_env.values())
+
+    def test_explicit_upstream_path_wins(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(_server, "_installed_jit_abi_key", lambda: "abi123")
+        monkeypatch.setattr(_server, "_gpu_cache_key", lambda _device_index: "sm90-gpu123")
+        explicit = tmp_path / "operator-deep-gemm"
+        env = {
+            _server.KERNEL_CACHE_ROOT_ENV_VAR: str(tmp_path / "managed"),
+            "SGLANG_DG_CACHE_DIR": str(explicit),
+        }
+
+        cache_env = _server._kernel_cache_env(env, device_index=0)
+
+        assert "SGLANG_DG_CACHE_DIR" not in cache_env
+        assert not explicit.exists()
+        assert "TRITON_CACHE_DIR" in cache_env
+
+    def test_invalid_or_unwritable_root_falls_back(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(_server, "_installed_jit_abi_key", lambda: "abi123")
+        monkeypatch.setattr(_server, "_gpu_cache_key", lambda _device_index: "sm90-gpu123")
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("x")
+
+        assert _server._kernel_cache_env({_server.KERNEL_CACHE_ROOT_ENV_VAR: "relative"}, device_index=0) == {}
+        assert _server._kernel_cache_env({_server.KERNEL_CACHE_ROOT_ENV_VAR: str(blocker)}, device_index=0) == {}
+
+        with patch(
+            "sie_server.adapters.sglang._server.tempfile.NamedTemporaryFile",
+            side_effect=OSError("read-only cache"),
+        ):
+            assert (
+                _server._kernel_cache_env(
+                    {_server.KERNEL_CACHE_ROOT_ENV_VAR: str(tmp_path / "read-only")},
+                    device_index=0,
+                )
+                == {}
+            )
+
+
+def test_startup_failure_error_distinguishes_crash_from_timeout() -> None:
+    """A dead child is a crash, not a timeout: the loader reclassifies
+    timeout-shaped messages as ModelLoadTimeoutError stamped with elapsed
+    time, so the crash message must never match that pattern.
+    """
+    timeout_error = _server.startup_failure_error(None)
+    assert "failed to start within timeout" in str(timeout_error)
+
+    crash_error = _server.startup_failure_error(None, crash_exit_code=-9)
+    assert "process exited during startup (exit code -9)" in str(crash_error)
+    assert "failed to start within timeout" not in str(crash_error)

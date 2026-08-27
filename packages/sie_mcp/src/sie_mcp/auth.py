@@ -1,7 +1,7 @@
-"""Connector-secret auth at the MCP edge (the Req 12 shim).
+"""Connector-secret authentication at the MCP edge.
 
 A per-user connector secret (Bearer) is validated here and mapped to a stable
-user identity, so per-user metering can attach later (Req 10, #1313). The cluster
+user identity, so per-user metering can attach later. The cluster
 credential the service uses downstream is held server-side and never travels
 through this edge.
 
@@ -18,7 +18,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from sie_mcp.config import MCPConfig
 
 # The OAuth bridge endpoints bootstrap auth for claude.ai connectors, so they sit
-# in front of the connector-secret gate (#1312). Metadata + DCR + authorize + token
+# in front of the connector-secret gate. Metadata + DCR + authorize + token
 # must all be reachable unauthenticated.
 _EXEMPT_PATHS = frozenset(
     {

@@ -109,7 +109,6 @@ _GRAMMAR_FOLLOWER_TIMEOUT_S = 30.0
 # use — for debugging schema-rejection problems or slow compiles in a
 # controlled environment. Not recommended for production traffic.
 #
-# See ``docs/adr/0002-sglang-owns-request-time-grammar.md``.
 _GRAMMAR_PREFLIGHT_DEBUG_ENV = "SIE_GRAMMAR_PREFLIGHT_DEBUG"
 
 
@@ -1346,6 +1345,7 @@ class StreamingProcessor:
     # -- Main entry point ----------------------------------------------------
 
     async def process(self, msg: Any, model_id: str) -> None:
+        received_at = time.perf_counter()
         try:
             wi: WorkItem = msgpack.unpackb(msg.data, raw=False)
         except Exception:  # noqa: BLE001
@@ -1404,7 +1404,7 @@ class StreamingProcessor:
                     "sie.adapter": "streaming",
                 },
             ):
-                await self._process_inner(msg, model_id, wi, reply_subject, request_id, attempt_id)
+                await self._process_inner(msg, model_id, wi, reply_subject, request_id, attempt_id, received_at)
         finally:
             self._completion_by_attempt.pop(attempt_id, None)
 
@@ -1416,6 +1416,7 @@ class StreamingProcessor:
         reply_subject: str,
         request_id: str,
         attempt_id: str,
+        received_at: float,
     ) -> None:
         """Process a generate work item with all trace context already attached.
 
@@ -1449,6 +1450,7 @@ class StreamingProcessor:
                 request_id=request_id,
                 attempt_id=attempt_id,
                 cancel_event=cancel_event,
+                received_at=received_at,
             )
         finally:
             self._unregister_cancel(request_id, attempt_id)
@@ -1463,6 +1465,7 @@ class StreamingProcessor:
         request_id: str,
         attempt_id: str,
         cancel_event: asyncio.Event,
+        received_at: float,
     ) -> None:
         """Body of :meth:`_process_inner`, run with the cancel handle live.
 
@@ -1749,8 +1752,7 @@ class StreamingProcessor:
         # SGLang's server-side grammar backend (the single grammar
         # authority on the request hot path). The worker-side Outlines
         # preflight is preserved behind ``SIE_GRAMMAR_PREFLIGHT_DEBUG=1``
-        # for diagnostic use only — see ``_grammar_preflight_debug_enabled``
-        # and ``docs/adr/0002-sglang-owns-request-time-grammar.md``.
+        # for diagnostic use only; see ``_grammar_preflight_debug_enabled``.
         #
         # One bounded request event always runs so operators see structured-
         # output traffic regardless of the debug flag.
@@ -1841,9 +1843,11 @@ class StreamingProcessor:
             await self._stream_generate(
                 msg=msg,
                 adapter=adapter,
+                model_id=model_id,
                 reply_subject=reply_subject,
                 request_id=request_id,
                 attempt_id=attempt_id,
+                received_at=received_at,
                 prompt=prompt_str,
                 max_new_tokens=params.max_new_tokens,
                 temperature=params.temperature,
@@ -1898,9 +1902,11 @@ class StreamingProcessor:
         *,
         msg: Any,
         adapter: GenerationAdapter,
+        model_id: str,
         reply_subject: str,
         request_id: str,
         attempt_id: str,
+        received_at: float,
         prompt: str,
         max_new_tokens: int,
         temperature: float,
@@ -2002,6 +2008,19 @@ class StreamingProcessor:
         # requests (and adapters that don't accept the kwarg) are unaffected.
         if images:
             gen_kwargs["images"] = images
+        # Worker-side phase boundary (#3136): everything between work receipt
+        # and this adapter dispatch — deserialization, validation, model load,
+        # chat-template render, context checks, and KV-admission wait — is the
+        # "worker wait" phase. The adapter's own stream timer picks up from
+        # here (engine grammar preparation + prefill as TTFT, then decode as
+        # TPOT), so the two histograms decompose the client-observed
+        # time-to-first-token by phase and by grammar mode.
+        if _metrics.worker_telemetry_enabled():
+            _metrics.worker_telemetry().worker_wait_observed(
+                model=model_id,
+                grammar="none" if grammar is None else grammar.kind,
+                duration_s=time.perf_counter() - received_at,
+            )
         chunks_iter = cast(
             "AsyncGenerator[GenerationChunk, None]",
             adapter.generate(**gen_kwargs),

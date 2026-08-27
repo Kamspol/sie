@@ -1,6 +1,6 @@
 {
   "name": "@superlinked/sie-langchain",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "SIE embeddings integration for LangChain.js",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -53,7 +53,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/superlinked/sie-internal.git",
+    "url": "https://github.com/superlinked/sie.git",
     "directory": "integrations/sie_ts_langchain"
   },
   "publishConfig": {

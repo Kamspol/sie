@@ -1,6 +1,6 @@
 {
   "name": "@superlinked/sie-sdk",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Official TypeScript SDK for SIE (Search Inference Engine)",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -28,10 +28,7 @@
       }
     }
   },
-  "files": [
-    "dist",
-    "README.md"
-  ],
+  "files": ["dist", "README.md"],
   "scripts": {
     "build": "tsup",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.type-tests.json",
@@ -47,20 +44,12 @@
   "engines": {
     "node": ">=22.0.0"
   },
-  "keywords": [
-    "embeddings",
-    "vector",
-    "search",
-    "inference",
-    "reranking",
-    "colbert",
-    "maxsim"
-  ],
+  "keywords": ["embeddings", "vector", "search", "inference", "reranking", "colbert", "maxsim"],
   "author": "SIE Team",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/superlinked/sie-internal.git",
+    "url": "https://github.com/superlinked/sie.git",
     "directory": "packages/sie_ts_sdk"
   },
   "publishConfig": {

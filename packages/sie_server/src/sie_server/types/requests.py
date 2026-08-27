@@ -2,6 +2,7 @@ from typing import Any
 
 import msgspec
 
+from sie_server.core.extract_cost import MAX_EXTRACT_LABELS
 from sie_server.core.score_cost import MAX_SCORE_ITEMS
 from sie_server.types.inputs import Item
 
@@ -53,6 +54,10 @@ class ExtractParams(msgspec.Struct):
     output_schema: dict[str, Any] | None = None
     instruction: str | None = None
     options: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.labels is not None and len(self.labels) > MAX_EXTRACT_LABELS:
+            raise msgspec.ValidationError(f"Field 'labels' must contain at most {MAX_EXTRACT_LABELS} labels")
 
 
 class ExtractRequest(msgspec.Struct):

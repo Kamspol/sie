@@ -35,7 +35,7 @@ OutputType = Literal["dense", "sparse", "multivector"]
 
 # Model state (for status messages).
 # ``failed`` is the terminal branch added for non-retryable load failures
-# (gated repos, missing dependencies, etc.). See sie-test#85 for context.
+# (gated repos, missing dependencies, etc.).
 ModelState = Literal["available", "loading", "loaded", "unloading", "failed"]
 
 
@@ -173,6 +173,34 @@ class RequestUsage(TypedDict, total=False):
     rate_book_version: str
 
 
+#: The metered dimensions of :class:`RequestUsage` — the units a consumer
+#: prices. Every member is a non-negative integer count.
+TERMINAL_UNIT_FIELDS: frozenset[str] = frozenset(
+    {"audio_ms", "images", "input_tokens", "output_tokens", "pages", "pairs"}
+)
+
+#: The settled-charge annotations of :class:`RequestUsage`. The gateway is
+#: their only writer; it adds them to the `usage` block of every settled
+#: response it can rewrite. They are NOT metered dimensions and must never be
+#: summed as one.
+SETTLED_CHARGE_FIELDS: frozenset[str] = frozenset({"credits_charged", "rate_book_version"})
+
+#: Every key the `usage` block is allowed to carry, as a single set.
+#:
+#: A consumer that meters this block should fail closed on a key OUTSIDE this
+#: union — an undeclared key is a renamed or unrecognised meter, and silently
+#: dropping one produces confident, wrong billing evidence. It must NOT fail
+#: closed on the settled-charge annotations, which are a legitimate producer
+#: extension of the same block: doing so nulled every terminal-unit reading on
+#: the managed path (issue #3063).
+#:
+#: The partition is pinned language-neutrally in
+#: `packages/wire-fixtures/request_usage.json`, which the gateway asserts
+#: against too, so a gateway that starts publishing a third field cannot reach
+#: production before this declaration follows it.
+DECLARED_USAGE_FIELDS: frozenset[str] = TERMINAL_UNIT_FIELDS | SETTLED_CHARGE_FIELDS
+
+
 class RequestMetadata(TypedDict, total=False):
     """Gateway metadata from the successful terminal response.
 
@@ -259,20 +287,108 @@ class ModelCapabilities(TypedDict, total=False):
     guard: bool
 
 
+class ProfileInfo(TypedDict, total=False):
+    """One entry of ``ModelInfo.profiles``.
+
+    Mirrors the server's ``sie_server.api.models.ProfileInfo`` and the
+    gateway's ``ProfileInfoWire``. ``is_default`` marks the profile served
+    when a request names the bare model id rather than ``model@profile``.
+    """
+
+    is_default: bool
+
+
+class ModelLoadError(TypedDict, total=False):
+    """Diagnostic detail for a recorded load failure.
+
+    Present as ``ModelInfo.last_error`` when the registry holds a sticky
+    failure for the model (normally alongside ``state == "failed"``);
+    ``None`` otherwise. Mirrors the server's
+    ``sie_server.api.models.ModelLoadError``.
+
+    ``permanent`` is the field to branch on: ``True`` means the load will
+    not auto-retry and an operator must intervene, so a client should
+    surface the failure rather than poll.
+    """
+
+    code: str  # Stable enum value ("GATED", "OOM", ...) for client routing
+    message: str
+    attempts: int
+    permanent: bool
+
+
+class PendingGenerationGroup(TypedDict, total=False):
+    """Queue-depth breakdown for one (model, pool) pair."""
+
+    model: str
+    display_model: str
+    pool: str
+    count: int
+    waiting_first_chunk: int
+    active_streams: int
+    republished: int
+    oldest_request_age_ms: int
+
+
+class PendingGeneration(TypedDict, total=False):
+    """In-flight generation work the gateway holds for a model.
+
+    Gateway-only: a single ``sie_server`` has no queue and omits the field.
+    This is a point-in-time telemetry snapshot, not model metadata — for
+    continuous monitoring prefer ``SIEClient.watch()`` over polling
+    ``/v1/models``.
+    """
+
+    total: int
+    groups: list[PendingGenerationGroup]
+
+
 class ModelInfo(TypedDict, total=False):
     """Information about a model returned by list_models().
 
     Note: Server returns flat structure with inputs/outputs at top level.
+
+    The declared key set is pinned by ``packages/wire-fixtures/model_info.json``
+    and enforced in ``tests/test_wire_contract.py``. The OpenAI-compat keys
+    ``id``/``object``/``created``/``owned_by`` that ``GET /v1/models/{model}``
+    merges in are deliberately excluded — see that fixture for why.
     """
 
     name: str
     loaded: bool
+    """Backwards-compatible boolean. Prefer ``state`` for the full lifecycle."""
+
+    state: ModelState
+    """Lifecycle state, including the terminal ``failed`` branch.
+
+    ``loaded`` cannot distinguish ``available`` from ``loading`` from
+    ``failed`` — all three report ``False``.
+    """
+
+    last_error: ModelLoadError | None
+    """Recorded load failure (when ``state == "failed"``), else ``None``."""
+
     inputs: list[str]  # ["text"], ["text", "image"], etc.
     outputs: list[str]  # ["dense"], ["dense", "sparse"], etc.
     dims: ModelDims
-    max_sequence_length: int
+    max_sequence_length: int | None
     revision: str | None
-    capabilities: ModelCapabilities
+    profiles: dict[str, ProfileInfo]
+    """Servable profiles keyed by name; address one as ``"model@profile"``."""
+
+    capabilities: ModelCapabilities | None
+    """``None`` for models that declare no ``generate`` task."""
+
+    pending_generation: PendingGeneration
+    """Gateway-only queue snapshot; absent when talking to a single server."""
+
+    aliases: list[str]
+    """Short task-tier names resolving to this model, e.g. ``["rerank-fast"]``.
+
+    Send one anywhere a model id is accepted. Always emitted and empty when the
+    model has none; the gateway's compiled-in routing defaults are not public
+    API and never appear here.
+    """
 
 
 class ScoreEntry(TypedDict):
@@ -1209,6 +1325,47 @@ class AppliedRate(TypedDict):
     rate_denominator: int
 
 
+class RecommendedChoice(TypedDict, total=False):
+    """One tier's pick for a task family, with the evidence behind it."""
+
+    intent: str
+    model: str
+    runtime_id: str
+    profile: str
+    alias: str | None
+    available: bool
+    quality_ref: str | None
+    performance_ref: str | None
+    measurement_status: str | None
+    evidence_guarded: bool
+    """Whether a committed target floor guards the cited number.
+
+    A cited measurement with no floor is a real number that nothing protects
+    from silently regressing. False does not mean unmeasured; it means
+    unguarded.
+    """
+
+
+class Recommendation(TypedDict, total=False):
+    """The answer for one task family (``POST /v1/recommend``)."""
+
+    task: str
+    label: str
+    basis: str
+    """``ranked`` | ``curated`` | ``no_evidence``.
+
+    ``ranked`` means two or more choices were measured on the same benchmark.
+    ``curated`` means evidence exists but no two choices share one, so the
+    order is the catalog's judgement rather than a measurement. ``no_evidence``
+    means the family cites no measurements at all. The three are distinct on
+    purpose: a recommendation whose basis cannot be checked is worth less than
+    no recommendation.
+    """
+    shared_benchmarks: list[str]
+    fast: RecommendedChoice
+    best: RecommendedChoice
+
+
 class CostEstimate(TypedDict):
     """A dispatch-free quote from ``POST /v1/estimate``.
 
@@ -1484,14 +1641,36 @@ class JobList(TypedDict, total=False):
     data: list[JobStatus]
 
 
-class JobResultItem(TypedDict, total=False):
-    """One decoded per-item result retrieved from a finished job's chunk refs."""
+class JobItemErrorDetail(TypedDict, total=False):
+    """Stable per-item job failure (mirrors :class:`ExtractItemErrorDetail`).
 
-    id: str | None
+    Decoded from the failed item's ``WorkResult`` in a chunk ref: ``code`` is
+    the worker's ``error_code`` and ``message`` its free-text ``error``. Either
+    may be absent, so both keys are optional.
+    """
+
+    code: str
+    message: str
+
+
+class JobResultItem(TypedDict, total=False):
+    """One decoded per-item result retrieved from a finished job's chunk refs.
+
+    A ``failed`` chunk still writes a result ref carrying every item's
+    ``WorkResult`` — successful siblings AND the failures — so ``success``
+    distinguishes them and ``error`` carries the failure reason when the item
+    did not succeed.
+    """
+
+    #: Per-item id echoed from the item's ``WorkResult`` (``id`` or the wire's
+    #: ``work_item_id``). Ids may be integers, so ``0`` is a valid id, not absent.
+    id: str | int | None
     success: bool | None
     units: Any
     dims: int | None
     dense: Any
+    #: Per-item failure reason, present only when the item did not succeed.
+    error: JobItemErrorDetail
 
 
 class JobResults(TypedDict, total=False):

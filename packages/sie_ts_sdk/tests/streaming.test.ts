@@ -273,6 +273,46 @@ describe("SIEClient.streamChatCompletions", () => {
       expect(streamErr.code).toBe("context_exceeded");
       expect(streamErr.errorType).toBe("context_length_exceeded");
       expect(streamErr.message).toBe("prompt too long");
+      // Pre-#3136 gateways omit request_id on chat error chunks; the SDK
+      // must tolerate its absence.
+      expect(streamErr.requestId).toBeUndefined();
+    }
+  });
+
+  it("surfaces the in-band gateway request id on chat error chunks (#3136)", async () => {
+    // The chat error chunk now carries the gateway request id as an additive
+    // top-level member (the `chatcmpl-*` id is not the correlation key gateway
+    // logs use, and streamed responses have no terminal headers).
+    const errorChunkBody = {
+      id: "chatcmpl-x",
+      object: "chat.completion.chunk" as const,
+      created: 1_700_000_000,
+      model: "m",
+      system_fingerprint: null,
+      choices: [{ index: 0, delta: {}, finish_reason: null, logprobs: null }],
+      error: {
+        message: "Generation aborted: first_chunk timeout",
+        type: "server_error",
+        param: null,
+        code: "first_chunk_timeout",
+      },
+      request_id: "req-chat-1",
+    };
+    mockFetch.mockResolvedValueOnce(sseResponse([JSON.stringify(errorChunkBody)]));
+
+    const client = new SIEClient("http://localhost:8080");
+    const gen = client.streamChatCompletions({
+      model: "m",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    try {
+      await gen.next();
+      throw new Error("expected SIEStreamError");
+    } catch (err) {
+      expect(err).toBeInstanceOf(SIEStreamError);
+      const streamErr = err as SIEStreamError;
+      expect(streamErr.code).toBe("first_chunk_timeout");
+      expect(streamErr.requestId).toBe("req-chat-1");
     }
   });
 
@@ -492,6 +532,65 @@ describe("SIEClient.streamGenerate", () => {
       expect(err).toBeInstanceOf(SIEStreamError);
       expect((err as SIEStreamError).code).toBe("cancelled");
       expect((err as SIEStreamError).message).toBe("client closed");
+      expect((err as SIEStreamError).requestId).toBe("req-1");
+    }
+  });
+
+  it("surfaces the empty_model_output terminal code and request id (#3136)", async () => {
+    // PR #3139: a stream that ends with no meaningful visible output carries
+    // error_code="empty_model_output" on the terminal chunk. The caller must
+    // be able to read the typed code AND the in-band gateway request id —
+    // streamed responses have no terminal headers to fall back on.
+    mockFetch.mockResolvedValueOnce(
+      sseResponse([
+        generateChunk(0, "", {
+          done: true,
+          finish_reason: "error",
+          usage: { prompt_tokens: 5, completion_tokens: 7, total_tokens: 12 },
+          error: {
+            code: "empty_model_output",
+            message: "model produced no visible output text",
+          },
+        }),
+      ]),
+    );
+
+    const client = new SIEClient("http://localhost:8080");
+    const gen = client.streamGenerate("m", "hi", { maxNewTokens: 8 });
+    try {
+      await gen.next();
+      throw new Error("expected SIEStreamError");
+    } catch (err) {
+      expect(err).toBeInstanceOf(SIEStreamError);
+      const streamErr = err as SIEStreamError;
+      expect(streamErr.code).toBe("empty_model_output");
+      expect(streamErr.message).toBe("model produced no visible output text");
+      expect(streamErr.requestId).toBe("req-1");
+    }
+  });
+
+  it("drops a malformed in-band request id instead of exposing it (#3136)", async () => {
+    // Same validation rule as the HTTP header path: non-ASCII or padded ids
+    // must never surface on SIEStreamError.requestId.
+    mockFetch.mockResolvedValueOnce(
+      sseResponse([
+        generateChunk(0, "", {
+          done: true,
+          finish_reason: "error",
+          request_id: " r\u00e9q-bad ",
+          error: { code: "empty_model_output", message: "m" },
+        }),
+      ]),
+    );
+
+    const client = new SIEClient("http://localhost:8080");
+    const gen = client.streamGenerate("m", "hi", { maxNewTokens: 8 });
+    try {
+      await gen.next();
+      throw new Error("expected SIEStreamError");
+    } catch (err) {
+      expect(err).toBeInstanceOf(SIEStreamError);
+      expect((err as SIEStreamError).requestId).toBeUndefined();
     }
   });
 

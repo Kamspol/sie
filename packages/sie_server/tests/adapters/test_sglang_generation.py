@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sie_server.adapters._generation_base import GenerationChunk, collect_generation, suppress_thinking_blocks
+from sie_server.adapters.sglang import _server
 from sie_server.adapters.sglang.cuda13 import SGLangStrictThinkingAdapter
 from sie_server.adapters.sglang.generation import (
     SGLangGenerationAdapter,
@@ -1054,6 +1055,100 @@ def test_unload_terminates_process(mock_killpg: MagicMock, mock_getpgid: MagicMo
     mock_killpg.assert_called()
     assert adapter._process is None
     assert adapter._server_url is None
+
+
+@patch("sie_server.adapters.sglang._server.os.getpgid")
+@patch("sie_server.adapters.sglang._server.os.killpg")
+def test_unload_releases_port_and_cleans_output_log(
+    mock_killpg: MagicMock,
+    mock_getpgid: MagicMock,
+    adapter,
+) -> None:
+    """Unload returns the reserved port to the pool and removes the temp log."""
+    mock_process = MagicMock()
+    mock_process.pid = 12345
+    mock_process.wait.return_value = None
+    mock_getpgid.return_value = 12345
+
+    adapter._process = mock_process
+    adapter._server_url = "http://localhost:30005"
+    adapter._device = "cuda:0"
+    adapter._port = 30005
+    adapter._output_file = _server.open_output_log(prefix="sie_test_sglang_")
+    log_path = Path(adapter._output_file.name)
+
+    with patch("sie_server.adapters.sglang._server.release_port") as mock_release:
+        adapter.unload()
+
+    mock_release.assert_called_once_with(30005)
+    assert adapter._port is None
+    assert adapter._output_file is None
+    assert not log_path.exists()
+
+
+@patch("sie_server.adapters.sglang._server.os.getpgid")
+@patch("sie_server.adapters.sglang._server.os.killpg")
+@patch("sie_server.adapters.sglang._server.wait_for_server", return_value=False)
+@patch("sie_server.adapters.sglang._server.subprocess.Popen")
+@patch("sie_server.adapters.sglang._server.find_free_port")
+def test_failed_startup_releases_port_and_cleans_output_log(
+    mock_find_port: MagicMock,
+    mock_popen: MagicMock,
+    mock_wait: MagicMock,
+    mock_killpg: MagicMock,
+    mock_getpgid: MagicMock,
+    adapter,
+) -> None:
+    """A startup-health failure must not leak the reserved port or the temp log."""
+    mock_find_port.return_value = 30006
+    mock_process = MagicMock()
+    mock_process.pid = 12345
+    mock_process.poll.return_value = None  # Process running but not healthy (timeout path)
+    mock_popen.return_value = mock_process
+    mock_getpgid.return_value = 12345
+
+    with (
+        patch("sie_server.adapters.sglang._server.release_port") as mock_release,
+        pytest.raises(RuntimeError, match="failed to start"),
+    ):
+        adapter.load("cuda:0")
+
+    mock_release.assert_called_once_with(30006)
+    assert adapter._port is None
+    assert adapter._server_url is None
+    assert adapter._output_file is None
+
+
+@patch("sie_server.adapters.sglang._server.subprocess.Popen")
+@patch("sie_server.adapters.sglang._server.find_free_port")
+def test_speculative_guard_abort_releases_port_and_cleans_output_log(
+    mock_find_port: MagicMock,
+    mock_popen: MagicMock,
+) -> None:
+    """The pre-launch extra_buffer validation abort must not leak the port or log.
+
+    The guard raises after the port was reserved and the temp log opened but
+    before the subprocess launches — a distinct abort seam from the
+    startup-health failure above.
+    """
+    mock_find_port.return_value = 30007
+    adapter = SGLangGenerationAdapter(
+        model_name_or_path="Qwen/Qwen3.5-4B",
+        served_model_name="Qwen/Qwen3.5-4B",
+        speculative={"enabled": True, "algorithm": "nextn"},
+    )
+
+    with (
+        patch("sie_server.adapters.sglang._server.release_port") as mock_release,
+        pytest.raises(RuntimeError, match="extra_buffer"),
+    ):
+        adapter.load("cuda:0")
+
+    mock_release.assert_called_once_with(30007)
+    assert adapter._port is None
+    assert adapter._server_url is None
+    assert adapter._output_file is None
+    mock_popen.assert_not_called()
 
 
 @patch("sie_server.adapters.sglang.generation.asyncio.new_event_loop")

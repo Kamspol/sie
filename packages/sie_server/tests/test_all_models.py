@@ -223,7 +223,7 @@ def test_google_embeddinggemma_300m_dense() -> None:
     # Architecture support: ``Gemma3TextModel`` requires transformers>=4.56.
     # Older versions raise ImportError/ValueError during ``AutoModel.from_pretrained``;
     # gate the test rather than letting numerical-equivalence drift mask the
-    # underlying problem (sie-test#85).
+    # underlying problem.
     pytest.importorskip("transformers", minversion="4.56.0")
     # Reference is the sentence-transformers pipeline output (incl. the Dense
     # projection head) for "test" encoded as a document, on CPU/fp32.

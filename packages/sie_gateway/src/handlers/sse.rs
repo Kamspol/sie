@@ -230,16 +230,12 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
                     "no_consumers",
                 );
                 Some(crate::handlers::proxy::PROVISIONING_RETRY_AFTER)
-            } else if lower.contains("backpressure") {
-                telemetry::record_rejected_request(
-                    state.demand_tracker.as_ref(),
-                    &physical_lane,
-                    "backpressure",
-                );
-                state.demand_tracker.record(&physical_lane);
-                Some("5")
             } else {
-                None
+                // Shared with the buffered and streaming paths rather than
+                // re-derived here: this arm used to match only "backpressure"
+                // and so missed the broker's own stream-full rejection, which
+                // means the same thing.
+                crate::handlers::proxy::record_publish_failure(state, &physical_lane, &lower)
             };
             return crate::handlers::proxy::build_streaming_publish_failed_for_sse(&e, retry_after);
         }
@@ -1272,6 +1268,12 @@ fn build_chat_chunk_event(
                     "code": err.code,
                 }),
             );
+            // Gateway request id, in-band on the ERROR chunk only (#3136):
+            // a streamed response has no terminal headers, and the
+            // ``chatcmpl-*`` id is not the correlation key server logs use.
+            // Additive top-level member — named to match the SIE-native
+            // generate error chunk — that OpenAI clients ignore.
+            obj.insert("request_id".to_string(), json!(chunk.request_id));
         }
     }
     body
@@ -1470,7 +1472,11 @@ async fn send_error_chunk(
                 "type": "server_error",
                 "param": Value::Null,
                 "code": code,
-            }
+            },
+            // Gateway request id, in-band on the ERROR chunk only (#3136) —
+            // additive, mirrors the generate-shape member below so SDK
+            // consumers can correlate stream failures with gateway logs.
+            "request_id": request_id,
         }),
         SseEndpoint::Generate => json!({
             "request_id": request_id,
@@ -2101,6 +2107,21 @@ mod tests {
         assert_eq!(v["error"]["type"], "context_length_exceeded");
         assert!(v["error"]["param"].is_null());
         assert_eq!(v["error"]["message"], "prompt too long");
+        // #3136: the ERROR chunk carries the gateway request id in-band
+        // (additive member; OpenAI clients ignore it) so SDK consumers can
+        // correlate stream failures with gateway logs.
+        assert_eq!(v["request_id"], "req-test");
+    }
+
+    /// #3136 scope guard: ``request_id`` rides ERROR chunks only — normal
+    /// deltas and clean terminals keep the exact pre-existing chat shape.
+    #[test]
+    fn test_sse_chat_non_error_chunks_omit_request_id() {
+        let delta = build_chat_chunk_event("chatcmpl-1", 0, "m", &_delta_chunk(0, "Hi"), true);
+        assert!(delta.get("request_id").is_none());
+        let terminal =
+            build_chat_chunk_event("chatcmpl-1", 0, "m", &_terminal_chunk("stop", None), false);
+        assert!(terminal.get("request_id").is_none());
     }
 
     // ── Generate (SIE-native) chunk shape ─────────────────────────
@@ -2188,6 +2209,9 @@ mod tests {
         assert!(v["choices"][0]["finish_reason"].is_null());
         assert_eq!(v["error"]["code"], "first_chunk_timeout");
         assert_eq!(v["error"]["type"], "server_error");
+        // #3136: gateway-synthesized chat error chunks carry the gateway
+        // request id in-band, mirroring the generate shape.
+        assert_eq!(v["request_id"], "req-1");
     }
 
     #[tokio::test]

@@ -19,7 +19,11 @@ from sie_server.config.model import (
     ProfileConfig,
     Tasks,
 )
-from sie_server.core.extract_cost import build_extract_prepared_items, extract_item_cost
+from sie_server.core.extract_cost import (
+    MAX_EXTRACT_LABELS,
+    build_extract_prepared_items,
+    extract_item_cost,
+)
 from sie_server.core.inference_output import ExtractItemError, ExtractOutput
 from sie_server.core.registry import ModelRegistry
 from sie_server.core.timing import RequestTiming
@@ -380,6 +384,39 @@ class TestExtractEndpoint:
             },
         )
         assert response.status_code == 400  # Custom validation error (not Pydantic)
+
+    def test_extract_over_cap_labels_rejected(self, client: TestClient) -> None:
+        """A labels list past the cap is a typed 400 naming the limit.
+
+        GLiNER-family adapters run one forward pass per label, so an unbounded
+        labels list is an uncapped compute vector — mirror the score/rerank
+        candidate cap with a named 400 rather than letting it through.
+        """
+        response = client.post(
+            "/v1/extract/test-extractor",
+            json={
+                "items": [{"text": "Apple Inc."}],
+                "params": {"labels": [f"label-{i}" for i in range(MAX_EXTRACT_LABELS + 1)]},
+            },
+            headers=JSON_HEADERS,
+        )
+        assert response.status_code == 400
+        data = response.json()
+        assert data["detail"]["code"] == "INVALID_INPUT"
+        assert str(MAX_EXTRACT_LABELS) in data["detail"]["message"]
+        assert "labels" in data["detail"]["message"]
+
+    def test_extract_at_cap_labels_accepted(self, client: TestClient) -> None:
+        """A labels list exactly at the cap is accepted."""
+        response = client.post(
+            "/v1/extract/test-extractor",
+            json={
+                "items": [{"text": "Apple Inc."}],
+                "params": {"labels": [f"label-{i}" for i in range(MAX_EXTRACT_LABELS)]},
+            },
+            headers=JSON_HEADERS,
+        )
+        assert response.status_code == 200
 
     def test_extract_non_dict_items_rejected(self, client: TestClient) -> None:
         """Non-dict items return 400, not 500."""

@@ -170,6 +170,45 @@ def test_openapi_audio_timestamp_contract() -> None:
     assert granularities["items"]["enum"] == ["word", "segment"]
 
 
+def test_openapi_documents_media_bytes_as_base64_strings() -> None:
+    """Every media `data` field advertises the one JSON encoding the API accepts.
+
+    On the JSON path msgspec base64-decodes `data` (matching the msgpack
+    path's native binary), so the schema has to say `contentEncoding: base64`.
+    Pydantic's default rendering of `bytes` is `format: binary`, which in
+    OpenAPI means raw octets -- a generated client that believed it would send
+    bytes that never decode.
+    """
+    result = runner.invoke(app, ["openapi"])
+    assert result.exit_code == 0, result.output
+    schemas = json.loads(result.output)["components"]["schemas"]
+    for name in ["ImageInputModel", "AudioInputModel", "VideoInputModel", "DocumentInputModel"]:
+        data = schemas[name]["properties"]["data"]
+        assert data["type"] == "string", f"{name}.data must be a string: {data}"
+        assert data["contentEncoding"] == "base64", f"{name}.data must declare base64 encoding: {data}"
+        assert "format" not in data, f"{name}.data must not claim `format` (binary means raw octets): {data}"
+
+
+def test_openapi_documents_positive_audio_sample_rate() -> None:
+    """`sample_rate` must advertise the positive bound the preprocessor enforces."""
+    result = runner.invoke(app, ["openapi"])
+    assert result.exit_code == 0, result.output
+    schemas = json.loads(result.output)["components"]["schemas"]
+    sample_rate = schemas["AudioInputModel"]["properties"]["sample_rate"]
+    integer_branch = next(branch for branch in sample_rate["anyOf"] if branch.get("type") == "integer")
+    assert integer_branch["exclusiveMinimum"] == 0, f"sample_rate must be positive: {sample_rate}"
+
+
+def test_openapi_item_accepts_all_media_inputs() -> None:
+    """The item schema exposes every media input the worker `Item` accepts."""
+    result = runner.invoke(app, ["openapi"])
+    assert result.exit_code == 0, result.output
+    schemas = json.loads(result.output)["components"]["schemas"]
+    properties = schemas["ItemModel"]["properties"]
+    for field in ["images", "audio", "video", "document"]:
+        assert field in properties, f"ItemModel must document `{field}`"
+
+
 def test_openapi_output_file(tmp_path: Path) -> None:
     """CLI writes spec to a file when --output is given."""
     out = tmp_path / "spec.json"

@@ -75,12 +75,19 @@ export class RequestError extends SIEError {
   readonly code: string | undefined;
   /** HTTP status code, when the failure came from a terminal response. */
   readonly statusCode: number | undefined;
+  /**
+   * Gateway request id (`x-sie-request-id` header) when the terminal
+   * response carried one. Mirrors the Python SDK's `RequestError.request.id`
+   * so failures stay correlatable with gateway logs (#3136).
+   */
+  readonly requestId: string | undefined;
 
-  constructor(message: string, code?: string, statusCode?: number) {
+  constructor(message: string, code?: string, statusCode?: number, requestId?: string) {
     super(message);
     this.name = "RequestError";
     this.code = code;
     this.statusCode = statusCode;
+    this.requestId = requestId;
   }
 }
 
@@ -98,12 +105,19 @@ export class ServerError extends SIEError {
   readonly code: string | undefined;
   /** HTTP status code (500-599) */
   readonly statusCode: number | undefined;
+  /**
+   * Gateway request id (`x-sie-request-id` header) when the terminal
+   * response carried one. Mirrors the Python SDK's `ServerError.request.id`
+   * so failures stay correlatable with gateway logs (#3136).
+   */
+  readonly requestId: string | undefined;
 
-  constructor(message: string, code?: string, statusCode?: number) {
+  constructor(message: string, code?: string, statusCode?: number, requestId?: string) {
     super(message);
     this.name = "ServerError";
     this.code = code;
     this.statusCode = statusCode;
+    this.requestId = requestId;
   }
 }
 
@@ -242,22 +256,30 @@ export class ResourceExhaustedError extends ServerError {
  * gateway emitted an error envelope partway through generation.
  */
 export class SIEStreamError extends SIEError {
-  /** SIE-native error code (e.g. `context_exceeded`, `cancelled`). */
+  /** SIE-native error code (e.g. `context_exceeded`, `empty_model_output`, `cancelled`). */
   readonly code: string | undefined;
   /** OpenAI-style error type (e.g. `context_length_exceeded`, `server_error`). */
   readonly errorType: string | undefined;
   /** Offending field name when known (chat shape only). */
   readonly param: string | null | undefined;
+  /**
+   * Gateway request id carried in-band by the error chunk (SIE-native
+   * generate shape only — streamed responses have no terminal headers).
+   * Lets callers correlate typed terminal errors like `empty_model_output`
+   * with gateway logs (#3136).
+   */
+  readonly requestId: string | undefined;
 
   constructor(
     message: string,
-    options?: { code?: string; errorType?: string; param?: string | null },
+    options?: { code?: string; errorType?: string; param?: string | null; requestId?: string },
   ) {
     super(message);
     this.name = "SIEStreamError";
     this.code = options?.code;
     this.errorType = options?.errorType;
     this.param = options?.param;
+    this.requestId = options?.requestId;
   }
 }
 
@@ -268,7 +290,7 @@ export class SIEStreamError extends SIEError {
  * response (no retry budget consumed) when the server returns HTTP
  * `502 MODEL_LOAD_FAILED`. The server uses this code for permanent-class
  * failures (gated repos, missing dependencies, unrecognised model
- * architectures) where retrying would waste time. See sie-test#85.
+ * architectures) where retrying would waste time.
  *
  * Permanent failures will not auto-clear; an operator must fix the
  * underlying cause (e.g. set `HF_TOKEN`, accept the model license on
@@ -331,6 +353,129 @@ export class InputTooLongError extends RequestError {
 }
 
 /**
+ * A successful (HTTP 200) batch response dropped or added items.
+ *
+ * The gateway's queue path returns mixed-success batches as `200` carrying
+ * only the successful items — a per-item failure is dropped from the body, not
+ * surfaced as an error envelope. Batch responses are positional (item `id` is
+ * optional), so a shortened body silently shifts every item after the dropped
+ * one: a zip-inputs-to-outputs consumer would store results against the wrong
+ * inputs. The SDK guards the 1:1 input-to-output contract on every batch
+ * response and throws this instead of returning a desynced array.
+ *
+ * Subclass of {@link ServerError} — the server violated the response-shape
+ * contract even though the HTTP status was 200 — so existing `ServerError`
+ * handlers keep working. `statusCode` is 200 for the same reason: the response
+ * was not an HTTP error. Catch this specifically to retry item-wise
+ * (single-item batches get per-item error visibility), using {@link missingIds}
+ * when the submitted items carried ids. Mirrors the Python SDK's
+ * `IncompleteBatchError`.
+ */
+export class IncompleteBatchError extends ServerError {
+  /** Number of items submitted in this HTTP request. */
+  readonly expected: number;
+
+  /** Number of items the response body carried. */
+  readonly received: number;
+
+  /** The model that was requested. */
+  readonly model: string | undefined;
+
+  /**
+   * Ids of submitted items absent from the response.
+   *
+   * Only populated when ids identify every position on both sides (every
+   * submitted item carried an `id` and every returned item echoed one);
+   * `undefined` otherwise, since the set difference could otherwise mislabel a
+   * present-but-unnamed item as missing.
+   */
+  readonly missingIds: string[] | undefined;
+
+  constructor(
+    message: string,
+    options: {
+      expected: number;
+      received: number;
+      code?: string;
+      model?: string;
+      missingIds?: string[];
+      requestId?: string;
+    },
+  ) {
+    super(message, options.code, 200, options.requestId);
+    this.name = "IncompleteBatchError";
+    this.expected = options.expected;
+    this.received = options.received;
+    this.model = options.model;
+    this.missingIds = options.missingIds;
+  }
+}
+
+/**
+ * A job reached a non-successful terminal state (`failed`/`suspended`/`cancelled`).
+ *
+ * Thrown by {@link SIEClient.jobs}`.wait` only when called with
+ * `raiseOnFailure: true`; the default remains back-compatible and returns the
+ * terminal status doc unchanged. The gateway's terminal reason rides `outcome`
+ * / `error_code` on the status doc, so this surfaces them and a caller can
+ * branch on the failure without re-reading the doc. Mirrors the Python SDK's
+ * `JobFailedError`.
+ */
+export class JobFailedError extends SIEError {
+  /** The job that failed. */
+  readonly jobId: string | undefined;
+
+  /** The terminal state (`failed`, `suspended`, or `cancelled`). */
+  readonly state: string | undefined;
+
+  /**
+   * The gateway's terminal outcome (e.g. `reexecution_required`), or
+   * `null`/`undefined` when the status doc carried none.
+   */
+  readonly outcome: string | null | undefined;
+
+  /**
+   * The gateway's terminal error code (e.g. `RESULT_HANDLE_EXPIRED`), or
+   * `null`/`undefined` when absent.
+   */
+  readonly errorCode: string | null | undefined;
+
+  constructor(
+    message: string,
+    options: {
+      jobId?: string;
+      state?: string;
+      outcome?: string | null;
+      errorCode?: string | null;
+    } = {},
+  ) {
+    super(message);
+    this.name = "JobFailedError";
+    this.jobId = options.jobId;
+    this.state = options.state;
+    this.outcome = options.outcome;
+    this.errorCode = options.errorCode;
+  }
+}
+
+/**
+ * A chunk ref's bytes could not be decoded as a msgpack `WorkResult` array.
+ *
+ * Distinct from a chunk that published no ref at all: the bytes exist but are
+ * garbage (not msgpack, or not a list). That is a DECODE fault, not evidence of
+ * failed publication or billing, so `jobs.results` confines it (one bad chunk
+ * cannot sink the whole call) and flags it separately, never conflating it with
+ * a genuinely-unpublished, already-billed chunk. Mirrors the Python SDK's
+ * `MalformedChunkError`.
+ */
+export class MalformedChunkError extends SIEError {
+  constructor(message: string) {
+    super(message);
+    this.name = "MalformedChunkError";
+  }
+}
+
+/**
  * The gateway cannot PRICE the request, so it will not run it either.
  *
  * Thrown by {@link SIEClient.estimate} when the dry run answers `503`: the
@@ -350,5 +495,107 @@ export class EstimateUnroutableError extends ServerError {
   constructor(message: string, code?: string) {
     super(message, code, 503);
     this.name = "EstimateUnroutableError";
+  }
+}
+
+/**
+ * Error when the gateway rate-limits the caller and retries are exhausted.
+ *
+ * Thrown when the gateway returns HTTP `429 TOO_MANY_REQUESTS` (code
+ * `RATE_LIMIT`, per-key or per-account, default-on) and the SDK's bounded,
+ * `Retry-After`-honoring retry budget (capped by the provision timeout) is
+ * spent. The SDK honors the server's `Retry-After` on each attempt before
+ * giving up.
+ *
+ * Subclass of {@link RequestError} so existing 4xx handlers keep working; new
+ * code can catch {@link RateLimitError} specifically to back off at a higher
+ * level, shed load, or route elsewhere. Mirrors the Python SDK's
+ * `RateLimitError`.
+ */
+export class RateLimitError extends RequestError {
+  /** Last `Retry-After` hint the server supplied, in milliseconds. */
+  readonly retryAfter: number | undefined;
+
+  constructor(
+    message: string,
+    options?: { retryAfter?: number; code?: string; requestId?: string },
+  ) {
+    super(message, options?.code ?? "RATE_LIMIT", 429, options?.requestId);
+    this.name = "RateLimitError";
+    this.retryAfter = options?.retryAfter;
+  }
+}
+
+/**
+ * Error when the account has insufficient credits to run the request.
+ *
+ * Thrown when the gateway returns HTTP `402 PAYMENT_REQUIRED` with code
+ * `INSUFFICIENT_CREDITS`. This is a TERMINAL billing failure — the SDK never
+ * retries it, because retrying a credit failure would be wrong.
+ *
+ * Subclass of {@link RequestError} so existing 4xx handlers keep working.
+ * Mirrors the Python SDK's `InsufficientCreditsError`.
+ */
+export class InsufficientCreditsError extends RequestError {
+  constructor(message: string, options?: { requestId?: string }) {
+    super(message, "INSUFFICIENT_CREDITS", 402, options?.requestId);
+    this.name = "InsufficientCreditsError";
+  }
+}
+
+/**
+ * Error when the API key's configured spend limit is exceeded.
+ *
+ * Thrown when the gateway returns HTTP `402 PAYMENT_REQUIRED` with code
+ * `KEY_SPEND_LIMIT_EXCEEDED`. This is a TERMINAL policy failure — the SDK
+ * never retries it. Distinct from {@link InsufficientCreditsError}: the
+ * account may have credits, but this key has hit its own spend cap.
+ *
+ * Subclass of {@link RequestError} so existing 4xx handlers keep working.
+ * Mirrors the Python SDK's `SpendLimitError`.
+ */
+export class SpendLimitError extends RequestError {
+  constructor(message: string, options?: { requestId?: string }) {
+    super(message, "KEY_SPEND_LIMIT_EXCEEDED", 402, options?.requestId);
+    this.name = "SpendLimitError";
+  }
+}
+
+/**
+ * Error when the account is not permitted to submit work.
+ *
+ * Thrown when the gateway returns HTTP `403 FORBIDDEN` with code
+ * `ACCOUNT_SUSPENDED` or `ACCOUNT_PENDING_REVIEW`. This is a TERMINAL
+ * account-state failure — the SDK never retries it, because the account must
+ * be activated/reinstated out of band before work is accepted. Branch on
+ * `code` to distinguish suspended vs pending review.
+ *
+ * Subclass of {@link RequestError} so existing 4xx handlers keep working.
+ * Mirrors the Python SDK's `AccountInactiveError`.
+ */
+export class AccountInactiveError extends RequestError {
+  constructor(message: string, code?: string, requestId?: string) {
+    super(message, code, 403, requestId);
+    this.name = "AccountInactiveError";
+  }
+}
+
+/**
+ * Error when the gateway cannot resolve the account's admission state.
+ *
+ * Thrown when the gateway returns HTTP `503` with code
+ * `ACCOUNT_STATE_UNAVAILABLE` — a fail-closed infrastructure signal (the
+ * control plane could not resolve account state), distinct from a customer
+ * suspension. Surfaced as a typed TERMINAL error rather than being retried on
+ * the SDK's admission ladder: a caller may re-issue the whole request, but the
+ * SDK does not silently loop on an unresolved account state.
+ *
+ * Subclass of {@link ServerError} so existing 5xx handlers keep working.
+ * Mirrors the Python SDK's `AccountStateUnavailableError`.
+ */
+export class AccountStateUnavailableError extends ServerError {
+  constructor(message: string, requestId?: string) {
+    super(message, "ACCOUNT_STATE_UNAVAILABLE", 503, requestId);
+    this.name = "AccountStateUnavailableError";
   }
 }

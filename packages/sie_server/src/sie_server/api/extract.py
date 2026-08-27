@@ -11,6 +11,7 @@ from sie_server.api.helpers import (
     RequestParser,
     ResponseBuilder,
     oom_retry_after_from_registry,
+    validated_total,
 )
 from sie_server.api.options import resolve_runtime_options
 from sie_server.api.serialization import MsgPackResponse
@@ -34,6 +35,7 @@ from sie_server.types.responses import (
     ExtractResponse,
     ExtractResult,
     Relation,
+    Usage,
 )
 
 if TYPE_CHECKING:
@@ -269,7 +271,7 @@ def _build_response(
                 "Terminal model-load failure (MODEL_LOAD_FAILED). "
                 "Carried in the ``detail`` envelope: ``{code, message, "
                 "error_class, permanent, attempts}``. No ``Retry-After`` "
-                "header — clients MUST NOT auto-retry. See sie-test#85."
+                "header — clients MUST NOT auto-retry."
             ),
         },
         503: {"description": "Model not loaded or service unavailable"},
@@ -403,6 +405,13 @@ async def extract(
 
         # Build response
         response = _build_response(model, items, extraction_results)
+
+        # Same worker counts the telemetry block below meters from, reported to
+        # the caller so `usage` and the bill can be reconciled. Absent counts
+        # leave `usage` off rather than substituting an estimate.
+        extract_tokens = validated_total(extract_output.input_token_counts, len(items))
+        if extract_tokens is not None:
+            response["usage"] = Usage(input_tokens=extract_tokens)
 
         if worker_telemetry_enabled():
             units: dict[str, int] = {}

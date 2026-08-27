@@ -3,12 +3,18 @@
  */
 
 import {
+  AccountInactiveError,
+  AccountStateUnavailableError,
   EstimateUnroutableError,
+  IncompleteBatchError,
   InputTooLongError,
+  InsufficientCreditsError,
   ModelLoadFailedError,
   ProvisioningError,
+  RateLimitError,
   RequestError,
   ServerError,
+  SpendLimitError,
 } from "../errors.js";
 import { unpackMessage } from "../msgpack.js";
 import type {
@@ -27,10 +33,18 @@ import type {
   WorkerInfo,
 } from "../types.js";
 import {
+  ACCOUNT_PENDING_REVIEW_ERROR_CODE,
+  ACCOUNT_STATE_UNAVAILABLE_ERROR_CODE,
+  ACCOUNT_SUSPENDED_ERROR_CODE,
   HTTP_CLIENT_ERROR_MAX,
   HTTP_CLIENT_ERROR_MIN,
+  HTTP_FORBIDDEN,
+  HTTP_PAYMENT_REQUIRED,
   HTTP_SERVER_ERROR_MAX,
   HTTP_SERVER_ERROR_MIN,
+  HTTP_TOO_MANY_REQUESTS,
+  INSUFFICIENT_CREDITS_ERROR_CODE,
+  KEY_SPEND_LIMIT_EXCEEDED_ERROR_CODE,
   MSGPACK_CONTENT_TYPE,
   PROVISIONING_ERROR_CODE,
 } from "./constants.js";
@@ -38,10 +52,40 @@ import {
 import { getRetryAfter as getRetryAfterFromHeader } from "./retry.js";
 
 const SIE_ERROR_CODE_HEADER = "X-SIE-Error-Code";
+const REQUEST_ID_HEADER = "x-sie-request-id";
 
 function normalizeErrorCode(code: string | undefined): string | undefined {
   if (code === "provisioning") return PROVISIONING_ERROR_CODE;
   return code;
+}
+
+/**
+ * Read the gateway request id from a terminal response, applying the same
+ * validation as `parseRequestMetadata` (non-empty visible ASCII, no
+ * surrounding whitespace, bounded length). Returns `undefined` when absent
+ * or malformed so errors never carry an attacker-shaped id (#3136).
+ */
+export function readRequestId(response: Response): string | undefined {
+  return validateRequestId(response.headers.get(REQUEST_ID_HEADER));
+}
+
+/**
+ * Validate one candidate request id (non-empty visible ASCII, no surrounding
+ * whitespace, bounded length). Shared by the header path above and the
+ * in-band stream error path so streamed ids obey the same rule and errors
+ * never carry an attacker-shaped id (#3136).
+ */
+export function validateRequestId(value: unknown): string | undefined {
+  if (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 256 &&
+    value === value.trim() &&
+    /^[\x20-\x7e]+$/.test(value)
+  ) {
+    return value;
+  }
+  return undefined;
 }
 
 /**
@@ -275,10 +319,38 @@ export async function handleError(response: Response, gpu?: string): Promise<nev
     }
   }
   code = response.headers.get(SIE_ERROR_CODE_HEADER) ?? normalizeErrorCode(code);
+  const requestId = readRequestId(response);
 
   if (status === 503 && code === PROVISIONING_ERROR_CODE) {
     const retryAfter = getRetryAfter(response);
     throw new ProvisioningError(message, gpu, retryAfter);
+  }
+
+  // Rate limit (pass-2 audit B1). Retried on the admission ladder in the
+  // buffered loops; a give-up there throws RateLimitError directly. This arm
+  // covers the terminal paths (streaming, listModels, estimate, …) so a 429 is
+  // always a typed RateLimitError rather than a generic RequestError.
+  if (status === HTTP_TOO_MANY_REQUESTS) {
+    throw new RateLimitError(message, { retryAfter: getRetryAfter(response), code, requestId });
+  }
+
+  // Terminal credit / account failures (pass-2 audit B3). 402/403 are NEVER
+  // retried — they have no arm on any retry ladder, so they surface here on the
+  // first response. Unrecognised 402/403 codes stay generic RequestError.
+  if (status === HTTP_PAYMENT_REQUIRED) {
+    if (code === INSUFFICIENT_CREDITS_ERROR_CODE)
+      throw new InsufficientCreditsError(message, { requestId });
+    if (code === KEY_SPEND_LIMIT_EXCEEDED_ERROR_CODE)
+      throw new SpendLimitError(message, { requestId });
+  }
+  if (
+    status === HTTP_FORBIDDEN &&
+    (code === ACCOUNT_SUSPENDED_ERROR_CODE || code === ACCOUNT_PENDING_REVIEW_ERROR_CODE)
+  ) {
+    throw new AccountInactiveError(message, code, requestId);
+  }
+  if (status === 503 && code === ACCOUNT_STATE_UNAVAILABLE_ERROR_CODE) {
+    throw new AccountStateUnavailableError(message, requestId);
   }
 
   if (status >= HTTP_CLIENT_ERROR_MIN && status <= HTTP_CLIENT_ERROR_MAX) {
@@ -287,14 +359,14 @@ export async function handleError(response: Response, gpu?: string): Promise<nev
       // short-circuit (``throwIfInputTooLong``) on the extract path.
       throw new InputTooLongError(message);
     }
-    throw new RequestError(message, code, status);
+    throw new RequestError(message, code, status, requestId);
   }
 
   if (status >= HTTP_SERVER_ERROR_MIN && status <= HTTP_SERVER_ERROR_MAX) {
-    throw new ServerError(message, code, status);
+    throw new ServerError(message, code, status, requestId);
   }
 
-  throw new ServerError(message, code, status);
+  throw new ServerError(message, code, status, requestId);
 }
 
 // Wire format types (what server sends)
@@ -432,6 +504,92 @@ export function parseEncodeResult(data: WireEncodeResult): EncodeResult {
  */
 export function parseEncodeResults(data: unknown[]): EncodeResult[] {
   return (data as WireEncodeResult[]).map(parseEncodeResult);
+}
+
+/**
+ * Best-effort ids of submitted items absent from a shortened response.
+ *
+ * Only computed when ids identify every position on both sides: every
+ * submitted item carries a string `id` and every returned item echoes one.
+ * Otherwise the set difference could mislabel a present-but-unnamed item as
+ * missing, so the diagnostic degrades to `undefined` (positional counts only).
+ *
+ * Runs only while building an error, so it degrades rather than throwing.
+ */
+function missingResultIds(
+  results: readonly unknown[],
+  submitted: readonly unknown[],
+): string[] | undefined {
+  const idOf = (value: unknown): string | undefined => {
+    if (typeof value !== "object" || value === null) {
+      return undefined;
+    }
+    const id = (value as { id?: unknown }).id;
+    return typeof id === "string" ? id : undefined;
+  };
+
+  const submittedIds = submitted.map(idOf);
+  if (submittedIds.some((id) => id === undefined)) {
+    return undefined;
+  }
+  const returnedIds = new Set<string>();
+  for (const result of results) {
+    const id = idOf(result);
+    if (id === undefined) {
+      return undefined;
+    }
+    returnedIds.add(id);
+  }
+  const missing = submittedIds.filter(
+    (id): id is string => id !== undefined && !returnedIds.has(id),
+  );
+  return missing.length > 0 ? missing : undefined;
+}
+
+/**
+ * Guard the positional batch contract: exactly one result per input item.
+ *
+ * Encode and extract are positional — both return `results[0]` for a
+ * single-item request, and batch callers reassemble results by index. The
+ * contract breaks on an HTTP 200 whose `items` list is *shorter* than the
+ * request: the gateway returns mixed-success batches as `200` carrying only
+ * the successful items (a per-item server-side failure — an input exceeding
+ * the model's `max_sequence_length`, say — is dropped from the body, not
+ * surfaced as an error envelope). Without this check the short list flows into
+ * positional access and silently misaligns every result after the drop.
+ *
+ * Mirrors the Python SDK's `validate_batch_result_count`, including its error
+ * codes, so both SDKs fail identically.
+ *
+ * @throws {IncompleteBatchError} If the counts differ.
+ */
+export function validateBatchResultCount(
+  results: readonly unknown[],
+  submitted: readonly unknown[],
+  model: string,
+  operation: "encode" | "extract",
+  requestId?: string,
+): void {
+  if (results.length === submitted.length) {
+    return;
+  }
+  const [label, noun, code] =
+    operation === "encode"
+      ? ["Encode", "embedding(s)", "ENCODE_RESULT_COUNT_MISMATCH"]
+      : ["Extract", "extraction result(s)", "EXTRACT_RESULT_COUNT_MISMATCH"];
+  const missingIds = missingResultIds(results, submitted);
+  let message = `${label} response desync for model ${JSON.stringify(model)}: server returned ${results.length} ${noun} for ${submitted.length} input item(s); expected exactly one per input. An input may have failed server-side (e.g. exceeding the model's max_sequence_length) and been dropped from the batch.`;
+  if (missingIds !== undefined) {
+    message += ` Missing item id(s): ${missingIds.join(", ")}.`;
+  }
+  throw new IncompleteBatchError(message, {
+    expected: submitted.length,
+    received: results.length,
+    code,
+    model,
+    missingIds,
+    requestId,
+  });
 }
 
 /**

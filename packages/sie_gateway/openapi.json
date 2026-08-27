@@ -41,6 +41,35 @@
         ],
         "type": "object"
       },
+      "AudioInput": {
+        "properties": {
+          "data": {
+            "contentEncoding": "base64",
+            "description": "Media bytes. Base64-encoded on the JSON path; native binary on the msgpack path.",
+            "type": "string"
+          },
+          "format": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sample_rate": {
+            "description": "Sample rate in Hz. Must be positive.",
+            "exclusiveMinimum": 0,
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "type": "object"
+      },
       "BundleConfigDocument": {
         "properties": {
           "adapters": {
@@ -1050,12 +1079,9 @@
       "DocumentInput": {
         "properties": {
           "data": {
-            "items": {
-              "format": "int32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "type": "array"
+            "contentEncoding": "base64",
+            "description": "Media bytes. Base64-encoded on the JSON path; native binary on the msgpack path.",
+            "type": "string"
           },
           "format": {
             "type": [
@@ -1144,6 +1170,16 @@
               },
               {
                 "$ref": "#/components/schemas/TimingInfo"
+              }
+            ]
+          },
+          "usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Usage"
               }
             ]
           }
@@ -1327,6 +1363,16 @@
           },
           "model": {
             "type": "string"
+          },
+          "usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Usage"
+              }
+            ]
           }
         },
         "required": [
@@ -1869,12 +1915,9 @@
       "ImageInput": {
         "properties": {
           "data": {
-            "items": {
-              "format": "int32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "type": "array"
+            "contentEncoding": "base64",
+            "description": "Media bytes. Base64-encoded on the JSON path; native binary on the msgpack path.",
+            "type": "string"
           },
           "format": {
             "type": [
@@ -1938,6 +1981,16 @@
       },
       "ItemInput": {
         "properties": {
+          "audio": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AudioInput"
+              }
+            ]
+          },
           "document": {
             "oneOf": [
               {
@@ -1968,6 +2021,16 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "video": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VideoInput"
+              }
             ]
           }
         },
@@ -2162,6 +2225,13 @@
       "ModelInfoWire": {
         "description": "Wire shape aligned with ``sie_server`` ``ModelInfo`` for ``GET /v1/models``.",
         "properties": {
+          "aliases": {
+            "description": "Short task-tier names that resolve to this model, for example\n``[\"rerank-fast\"]``. Send one anywhere a model id is accepted and it\nresolves to this entry, billed at this model's rate.\n\nAlways present, and empty when the model has none. Only names declared\nby the released catalog or by operator configuration appear here.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "capabilities": {
             "oneOf": [
               {
@@ -2240,7 +2310,8 @@
           "dims",
           "loaded",
           "state",
-          "profiles"
+          "profiles",
+          "aliases"
         ],
         "type": "object"
       },
@@ -2439,14 +2510,27 @@
         ],
         "type": "object"
       },
+      "OpenAIEmbeddingTokenSource": {
+        "enum": [
+          "worker",
+          "character_estimate"
+        ],
+        "type": "string"
+      },
       "OpenAIEmbeddingUsage": {
         "properties": {
           "prompt_tokens": {
+            "description": "Exact post-tokenization input tokens when `sie_token_source` is\n`worker`; a character-based approximation when it is\n`character_estimate`.",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
           },
+          "sie_token_source": {
+            "$ref": "#/components/schemas/OpenAIEmbeddingTokenSource",
+            "description": "SIE extension. `worker` when the counts above are the model's own\npost-tokenization measurement, `character_estimate` when the serving\npath reported no counts and the numbers are approximate."
+          },
           "total_tokens": {
+            "description": "Equal to `prompt_tokens`; embeddings produce no output tokens.",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
@@ -2454,7 +2538,8 @@
         },
         "required": [
           "prompt_tokens",
-          "total_tokens"
+          "total_tokens",
+          "sie_token_source"
         ],
         "type": "object"
       },
@@ -3655,6 +3740,47 @@
         ],
         "type": "object"
       },
+      "Usage": {
+        "description": "Authoritative worker-emitted usage. Post-tokenization counts, never a\ncharacter estimate. A reported `0` is a measurement (a request that read no\ntext); an absent block means the serving path could not count. Structurally\nidentical to `ScoreUsage`, which shipped this shape first.",
+        "properties": {
+          "images": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "input_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "input_tokens"
+        ],
+        "type": "object"
+      },
+      "VideoInput": {
+        "properties": {
+          "data": {
+            "contentEncoding": "base64",
+            "description": "Media bytes. Base64-encoded on the JSON path; native binary on the msgpack path.",
+            "type": "string"
+          },
+          "format": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "type": "object"
+      },
       "WorkerInfo": {
         "properties": {
           "bundle": {
@@ -3745,7 +3871,7 @@
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
     "title": "SIE Gateway",
-    "version": "0.7.1"
+    "version": "0.7.2"
   },
   "openapi": "3.1.0",
   "paths": {

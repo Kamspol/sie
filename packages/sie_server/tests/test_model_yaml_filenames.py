@@ -1,11 +1,10 @@
 """Regression tests for model YAML filenames in packages/sie_server/models/.
 
-sie_bench's `EvalRunner._get_local_model_info(model_name)` looks up a YAML by
-converting `model_name` to `model_name.replace("/", "__").replace(":", "__") + ".yaml"`.
+The model lookup contract maps a model name to
+`model_name.replace("/", "__").replace(":", "__") + ".yaml"`.
 On a case-sensitive filesystem (Linux CI), any case mismatch between the filename
-and `sie_id` makes the lookup return `{}`, which silently downgrades the
-dispatched MTEB wrapper to text-only and trips the modality precheck. See
-issue #1058.
+and `sie_id` makes the lookup return `{}`, so instruction-aware callers cannot
+load the model's modality metadata.
 """
 
 from __future__ import annotations
@@ -40,11 +39,9 @@ def test_instruction_template_has_placeholder(yaml_path: Path) -> None:
     """An ``Instruct:``-prefixed ``query_template`` must contain the ``{instruction}``
     placeholder.
 
-    Otherwise the eval harness's instruction gating
-    (``EvalRunner._model_uses_instruction``, added in #1432) treats the model as
-    non-instruction-following and silently drops the per-task MTEB prompt, so the
-    model is measured with a hardcoded generic instruction instead of each task's
-    instruction. This is the stella_en_*_v5 regression (#1340).
+    Otherwise instruction-aware evaluation callers treat the model as
+    non-instruction-following and silently drop the per-task prompt, so the model
+    is measured with a hardcoded generic instruction instead of each task's.
     """
     with yaml_path.open() as f:
         config = yaml.safe_load(f) or {}
@@ -62,6 +59,7 @@ def test_instruction_template_has_placeholder(yaml_path: Path) -> None:
             offenders.append(profile_name)
     assert not offenders, (
         f"{yaml_path.name}: profile(s) {offenders} hardcode an 'Instruct:' instruction "
-        f"without a '{{instruction}}' placeholder; the eval harness drops the per-task "
-        f"MTEB instruction (#1340). Use 'Instruct: {{instruction}}' + 'default_instruction'."
+        f"without a '{{instruction}}' placeholder; instruction-aware evaluation "
+        f"callers drop the per-task instruction. Use 'Instruct: {{instruction}}' + "
+        f"'default_instruction'."
     )

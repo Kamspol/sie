@@ -270,6 +270,122 @@ class EstimateUnroutableError(ServerError):
         super().__init__(message, code=code, status_code=503, request=request)
 
 
+class RateLimitError(RequestError):
+    """Error when the gateway rate-limits the caller and retries are exhausted.
+
+    Raised when the gateway returns HTTP ``429 TOO_MANY_REQUESTS`` (code
+    ``RATE_LIMIT``, per-key or per-account, default-on) and the SDK's
+    bounded, ``Retry-After``-honoring retry budget (capped by
+    ``provision_timeout_s``) is spent. The SDK honors the server's
+    ``Retry-After`` on each attempt before giving up.
+
+    Subclass of :class:`RequestError` so existing 4xx handlers keep working;
+    new code can catch :class:`RateLimitError` specifically to back off at a
+    higher level, shed load, or route elsewhere.
+
+    Attributes:
+        retry_after: The last ``Retry-After`` hint the server supplied
+            (seconds), if any.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = "RATE_LIMIT",
+        retry_after: float | None = None,
+        request: RequestMetadata | None = None,
+    ) -> None:
+        super().__init__(message, code=code, status_code=429, request=request)
+        self.retry_after = retry_after
+
+
+class InsufficientCreditsError(RequestError):
+    """Error when the account has insufficient credits to run the request.
+
+    Raised when the gateway returns HTTP ``402 PAYMENT_REQUIRED`` with code
+    ``INSUFFICIENT_CREDITS``. This is a TERMINAL billing failure — the SDK
+    never retries it, because retrying a credit failure would be wrong.
+
+    Subclass of :class:`RequestError` so existing 4xx handlers keep working;
+    new code can catch :class:`InsufficientCreditsError` specifically to
+    surface a top-up prompt or halt a batch.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request: RequestMetadata | None = None,
+    ) -> None:
+        super().__init__(message, code="INSUFFICIENT_CREDITS", status_code=402, request=request)
+
+
+class SpendLimitError(RequestError):
+    """Error when the API key's configured spend limit is exceeded.
+
+    Raised when the gateway returns HTTP ``402 PAYMENT_REQUIRED`` with code
+    ``KEY_SPEND_LIMIT_EXCEEDED``. This is a TERMINAL policy failure — the SDK
+    never retries it. Distinct from :class:`InsufficientCreditsError`: the
+    account may have credits, but this key has hit its own spend cap.
+
+    Subclass of :class:`RequestError` so existing 4xx handlers keep working.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request: RequestMetadata | None = None,
+    ) -> None:
+        super().__init__(message, code="KEY_SPEND_LIMIT_EXCEEDED", status_code=402, request=request)
+
+
+class AccountInactiveError(RequestError):
+    """Error when the account is not permitted to submit work.
+
+    Raised when the gateway returns HTTP ``403 FORBIDDEN`` with code
+    ``ACCOUNT_SUSPENDED`` or ``ACCOUNT_PENDING_REVIEW``. This is a TERMINAL
+    account-state failure — the SDK never retries it, because the account
+    must be activated/reinstated out of band before work is accepted.
+
+    Subclass of :class:`RequestError` so existing 4xx handlers keep working;
+    new code can catch :class:`AccountInactiveError` and branch on
+    :attr:`code` (``ACCOUNT_SUSPENDED`` vs ``ACCOUNT_PENDING_REVIEW``).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        request: RequestMetadata | None = None,
+    ) -> None:
+        super().__init__(message, code=code, status_code=403, request=request)
+
+
+class AccountStateUnavailableError(ServerError):
+    """Error when the gateway cannot resolve the account's admission state.
+
+    Raised when the gateway returns HTTP ``503`` with code
+    ``ACCOUNT_STATE_UNAVAILABLE`` — a fail-closed infrastructure signal (the
+    control plane could not resolve account state), distinct from a customer
+    suspension. Surfaced as a typed TERMINAL error rather than being retried
+    on the SDK's admission ladder: a caller may re-issue the whole request,
+    but the SDK does not silently loop on an unresolved account state.
+
+    Subclass of :class:`ServerError` so existing 5xx handlers keep working.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request: RequestMetadata | None = None,
+    ) -> None:
+        super().__init__(message, code="ACCOUNT_STATE_UNAVAILABLE", status_code=503, request=request)
+
+
 class ResourceExhaustedError(ServerError):
     """Error when the server has exhausted its OOM-recovery strategies.
 
@@ -298,3 +414,88 @@ class ResourceExhaustedError(ServerError):
         super().__init__(message, code="RESOURCE_EXHAUSTED", status_code=503, request=request)
         self.model = model
         self.retries = retries
+
+
+class IncompleteBatchError(ServerError):
+    """A successful (HTTP 200) batch response dropped or added items.
+
+    The gateway's queue path returns mixed-success batches as ``200`` carrying
+    only the successful items — a per-item failure is dropped from the body,
+    not surfaced as an error envelope. Batch responses are positional (item
+    ``id`` is optional), so a shortened body silently shifts every item after
+    the dropped one: a zip-inputs-to-outputs consumer would store results
+    against the wrong inputs. The SDK guards the 1:1 input↔output contract on
+    every batch response and raises this instead of returning a desynced list.
+
+    Subclass of :class:`ServerError` — the server violated the response-shape
+    contract even though the HTTP status was 200 — so existing ``ServerError``
+    handlers keep working (this refines the untyped guard from #1526).
+    ``status_code`` is ``None``: the response was not an HTTP error. Callers
+    can catch :class:`IncompleteBatchError` specifically and retry item-wise
+    (single-item batches get per-item error visibility) using
+    :attr:`missing_ids` when available.
+
+    Attributes:
+        expected: Number of items submitted in this HTTP request.
+        received: Number of items the response body carried.
+        model: The model that was requested.
+        missing_ids: Ids of submitted items absent from the response — only
+            when ids identify every item on both sides (every submitted item
+            carried an ``id`` and every returned item echoed one), ``None``
+            otherwise.
+        request_id: Gateway request id (``x-sie-request-id``) when the
+            response carried one; quote it when reporting the incident.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        expected: int,
+        received: int,
+        model: str | None = None,
+        missing_ids: list[str] | None = None,
+        request: RequestMetadata | None = None,
+    ) -> None:
+        super().__init__(message, code=code, request=request)
+        self.expected = expected
+        self.received = received
+        self.model = model
+        self.missing_ids = missing_ids
+        self.request_id: str | None = (request or {}).get("id")
+
+
+class JobFailedError(SIEError):
+    """A job reached a non-successful terminal state (``failed``/``suspended``/``cancelled``).
+
+    Raised by :meth:`SIEClient.jobs.wait` / :meth:`SIEAsyncClient.jobs.wait`
+    only when called with ``raise_on_failure=True``; the default remains
+    back-compatible and returns the terminal status doc unchanged. The
+    gateway's terminal reason rides ``outcome`` / ``error_code`` on the status
+    doc (see :class:`sie_sdk.types.JobStatus`); this surfaces them so a caller
+    can branch on the failure without re-reading the doc.
+
+    Attributes:
+        job_id: The job that failed.
+        state: The terminal state (``failed``, ``suspended``, or ``cancelled``).
+        outcome: The gateway's terminal outcome (e.g. ``reexecution_required``),
+            or ``None`` when the status doc carried none.
+        error_code: The gateway's terminal error code (e.g.
+            ``RESULT_HANDLE_EXPIRED``), or ``None`` when absent.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        job_id: str | None = None,
+        state: str | None = None,
+        outcome: str | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.job_id = job_id
+        self.state = state
+        self.outcome = outcome
+        self.error_code = error_code

@@ -13,6 +13,7 @@ Model loading workflow is delegated to ModelLoader.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -184,7 +185,7 @@ class ModelRegistry:
         """Initialize the registry.
 
         Args:
-            models_dir: Path to models directory (local path, s3://, gs://, abfs://, or abfss://).
+            models_dir: Path to models directory (local path, s3://, gs://, abfs(s)://, or oss://).
                        If None, registry starts empty and configs must be added manually.
             memory_config: Configuration for memory management. If None, uses defaults.
             drain_timeout_s: Timeout in seconds to wait for worker drain before unload.
@@ -338,6 +339,7 @@ class ModelRegistry:
             max_batch_wait_ms=engine_config.max_batch_wait_ms if engine_config else None,
             coalesce_ms=engine_config.coalesce_ms if engine_config else None,
             coalesce_ratio=engine_config.coalesce_ratio if engine_config else None,
+            idle_coalesce_ms=engine_config.idle_coalesce_ms if engine_config else None,
             max_queue_size=engine_config.max_concurrent_requests if engine_config else None,
             instrumentation=engine_config.instrumentation if engine_config else False,
             max_loras_per_model=engine_config.max_loras_per_model if engine_config else DEFAULT_MAX_LORAS,
@@ -1278,6 +1280,35 @@ class ModelRegistry:
                 cleared += 1
         return cleared
 
+    async def _run_adapter_unload(self, adapter: ModelAdapter, name: str) -> None:
+        """Run the blocking ``adapter.unload()`` on a worker thread.
+
+        Shielded, and awaited again if we are cancelled. Once teardown has
+        begun it must be allowed to finish: ``_do_unload``'s ``finally``
+        drops the model's MemoryManager entry and the load lock is released
+        as the exception unwinds, so returning early would expose a window
+        in which a concurrent load sizes itself against VRAM this adapter
+        has not released yet. A second cancellation is only reachable at
+        process exit, where the accounting no longer matters.
+
+        Adapters that need the event loop for teardown expose
+        ``aclose_client()``, which the caller has already driven to
+        completion above; ``unload()`` itself is a synchronous contract on
+        every adapter and is safe off the loop.
+        """
+        loop = asyncio.get_running_loop()
+        unload_future = loop.run_in_executor(None, adapter.unload)
+        try:
+            await asyncio.shield(unload_future)
+        except asyncio.CancelledError:
+            logger.warning(
+                "Unload of '%s' was cancelled mid-teardown; waiting for it to finish before releasing the load lock",
+                name,
+            )
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(unload_future)
+            raise
+
     async def _do_unload(self, name: str, *, reason: str = "other") -> None:
         """Unload a model safely (drains worker first).
 
@@ -1341,8 +1372,23 @@ class ModelRegistry:
                     except Exception:  # noqa: BLE001 - close is best-effort
                         logger.warning("aclose_client() failed during unload of '%s'", name, exc_info=True)
 
-                # Adapter.unload() handles gc.collect + empty_cache
-                loaded.adapter.unload()
+                # Adapter.unload() handles gc.collect + empty_cache, and for
+                # subprocess-backed adapters a SIGTERM/SIGKILL wait of up to
+                # 15s. All of it is blocking, and running it inline froze the
+                # event loop for the duration: every other coroutine —
+                # health probes, in-flight responses on models that are not
+                # being evicted, the metrics endpoint — stopped, not merely
+                # the load path the lock already serialises (design proposal
+                # ``settlement-and-queue-scalability.md``, B6 part one; same
+                # class as the #1600 scar above).
+                #
+                # The load lock stays held across this on purpose. The
+                # ``finally`` below drops this model's MemoryManager entry,
+                # and until ``unload()`` returns the VRAM is not actually
+                # free, so a load admitted against the freed accounting
+                # would size itself against memory the dying adapter still
+                # holds. A slow unload beats an OOM.
+                await self._run_adapter_unload(loaded.adapter, name)
             finally:
                 # Always run, even if adapter teardown above raised, so a
                 # failed unload can never leave a ghost behind (#1600).
@@ -2095,7 +2141,7 @@ class ModelRegistry:
             logger.debug("No models_dir, skipping hot reload")
             return
 
-        # Don't watch cloud URLs (s3://, gs://, abfs(s)://)
+        # Don't watch cloud URLs (s3://, gs://, abfs(s)://, oss://)
         if is_cloud_path(self._models_dir):
             logger.debug("Cloud models_dir, skipping hot reload (not supported)")
             return

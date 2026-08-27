@@ -34,24 +34,36 @@ SIE is an open-source inference engine that runs the models behind every agent t
 - OpenAI-compatible API for drop-in migration: `/v1/embeddings`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`
 - Pre-configured model catalog: Stella, SPLADE, Qwen3, GLiNER, SigLIP, and more; embedding and retrieval models benchmarked on MTEB
 - Serves multiple models simultaneously with on-demand loading and LRU eviction
-- Ships the full production stack: load-balancing gateway, KEDA autoscaling, Grafana dashboards, Terraform for GKE, EKS, and AKS
+- Ships Kubernetes and Helm deployment configs for the load-balancing gateway, KEDA autoscaling, and Grafana dashboards
 - Integrates with LangChain, LlamaIndex, Haystack, DSPy, CrewAI, Chroma, Qdrant, Weaviate, and LanceDB
 
 ## Development
 
-The repository root is a virtual Python workspace. From the repository root,
-install and verify every workspace member with the committed lock (the
-audio-prep member requires its documented native build prerequisites):
+Install [mise](https://mise.jdx.dev/getting-started.html), then bootstrap the
+versioned Python, Rust, Node.js, and Helm toolchains from the repository root:
 
 ```bash
-uv python install 3.12
-uv lock --check
-uv sync --frozen --all-packages
-uv run --frozen --project . --no-sync pytest -c pyproject.toml
+./tools/init.sh
 ```
 
-Package membership is explicit in the root `pyproject.toml`; a package joins
-the workspace only in the same change that adds its complete source.
+The common development checks and local server are available as mise tasks:
+
+```bash
+mise run test
+mise run lint
+mise run typecheck
+mise run serve
+mise run rust-check
+mise run rust-test
+mise run gateway-test
+mise run server-sidecar-test
+```
+
+The Python workspace uses the committed root lock. Package membership is
+explicit in `pyproject.toml`; a package joins the workspace only in the same
+change that adds its complete source. Native audio is always an opt-in build:
+install cmake, then run
+`mise exec -- uv sync --frozen --project . --all-packages --all-extras`.
 
 ## Tasks
 
@@ -66,8 +78,6 @@ One SIE cluster runs the inference behind a whole agent. Each task is a handful 
 | **Run the agent loop** | Plan steps and call tools with an open LLM, streaming included. | `qwen3.6-27b` |
 
 ## Quickstart
-
-Prefer a notebook? [`examples/quickstart.ipynb`](examples/quickstart.ipynb) runs this same flow, on your machine or a free Colab GPU.
 
 **1. Start the server**
 
@@ -173,10 +183,10 @@ For generation on Apple Silicon (MLX), the TypeScript walkthrough, and every con
 
 ### Production
 
-The same code works against a production cluster. SIE ships a load-balancing gateway, KEDA autoscaling (scale to zero), Grafana dashboards, and Terraform modules for [GKE](https://github.com/superlinked/terraform-google-sie), [EKS](https://github.com/superlinked/terraform-aws-sie), and [AKS](https://github.com/superlinked/terraform-azure-sie). Not just the server, the whole stack. All Apache 2.0.
+The same code works against a production cluster. SIE ships a load-balancing gateway and Kubernetes deployment surface, including Helm charts, KEDA autoscaling (scale to zero), and Grafana dashboards. Public Terraform modules are maintained separately for [Alibaba Cloud ACK](https://github.com/superlinked/terraform-alicloud-sie), [EKS](https://github.com/superlinked/terraform-aws-sie), [AKS](https://github.com/superlinked/terraform-azure-sie), and [GKE](https://github.com/superlinked/terraform-google-sie). Not just the server, the whole stack. All Apache 2.0.
 
 ```bash
-# pick one values overlay: values-gke.yaml / values-aws.yaml / values-aks.yaml
+# pick one values overlay: values-ack.yaml / values-aws.yaml / values-aks.yaml / values-gke.yaml
 # (pin a chart version for reproducible installs, e.g. --version 0.6.18)
 helm upgrade --install sie-cluster oci://ghcr.io/superlinked/charts/sie-cluster \
   --namespace sie --create-namespace \
@@ -197,7 +207,7 @@ See the [deployment guide](https://superlinked.com/docs/deployment/).
 
 [**Integrations**](https://superlinked.com/docs/integrations/): setup guides for all nine framework and vector-store integrations, in Python and TypeScript.
 
-[**Examples**](examples/): A quickstart notebook and an end-to-end project gallery.
+[**Examples**](examples/): An end-to-end project gallery.
 
 [**MCP edge**](packages/sie_mcp/): offload document work from Claude and other MCP clients to your cluster and save agent tokens.
 

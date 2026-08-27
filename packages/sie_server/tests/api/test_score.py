@@ -749,3 +749,58 @@ class TestScoreProfileResolution:
             headers=JSON_HEADERS,
         )
         assert response.status_code == 200
+
+
+class TestScoreNonFiniteGuard:
+    """Non-finite (NaN/inf) model output must fail closed on both wire formats.
+
+    Regression for pass-2 audit A2: a cross-encoder emitting NaN/inf scores
+    (observed on cross-encoder/ms-marco-MiniLM-L-6-v2 on CPU) crashed
+    json.dumps into a bare un-enveloped 500 on the JSON path, and returned
+    HTTP 200 with the NaN ranked as a valid score on the msgpack path (silent
+    corruption for any msgpack client). Both now fail closed with a typed,
+    enveloped 500 INFERENCE_ERROR naming the model.
+    """
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    @pytest.mark.parametrize("accept", ["application/json", "application/msgpack"])
+    def test_non_finite_scores_fail_closed(
+        self, client: TestClient, mock_adapter: MagicMock, bad: float, accept: str
+    ) -> None:
+        # One valid score, one non-finite: the bad value must abort the response.
+        mock_adapter.score.side_effect = None
+        mock_adapter.score.return_value = [0.9, bad]
+
+        response = client.post(
+            "/v1/score/test-reranker",
+            json={
+                "query": {"text": "Query"},
+                "items": [{"text": "Doc A"}, {"text": "Doc B"}],
+            },
+            headers={"Accept": accept},
+        )
+
+        # Never HTTP 200 with a NaN ranked as valid; never a bare 500 without
+        # an error envelope. Errors are always emitted as JSON detail envelopes
+        # regardless of the requested Accept.
+        assert response.status_code == 500
+        detail = response.json()["detail"]
+        assert detail["code"] == "INFERENCE_ERROR"
+        assert "test-reranker" in detail["message"]
+        assert "non-finite" in detail["message"]
+
+    def test_all_finite_scores_still_succeed(self, client: TestClient, mock_adapter: MagicMock) -> None:
+        """The guard does not reject ordinary finite scores (incl. negatives/zero)."""
+        mock_adapter.score.side_effect = None
+        mock_adapter.score.return_value = [-3.5, 0.0, 2.1]
+
+        response = client.post(
+            "/v1/score/test-reranker",
+            json={
+                "query": {"text": "Query"},
+                "items": [{"text": "A"}, {"text": "B"}, {"text": "C"}],
+            },
+            headers=JSON_HEADERS,
+        )
+        assert response.status_code == 200
+        assert len(response.json()["scores"]) == 3

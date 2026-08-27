@@ -59,8 +59,17 @@ deps:
   sentence-transformers: '>=5.0,<6'
   # bge_m3_flag
   FlagEmbedding: '>=1.3'
-  # grounding_dino
-  pillow: '>=11,<12'
+  # grounding_dino. EXACT, not a range. `uv run --with-requirements` resolves the
+  # overlay live from PyPI, and `--frozen`/`--no-sync` govern only the project
+  # env, so any unbounded range here is re-resolved on every eval. The old
+  # `>=11,<12` (94430893c) was accidentally stable because the 11.x line is
+  # closed, but it contradicted sie-server's own `pillow>=12.2.0` since the
+  # security bump (27fd2063d), so every default-bundle eval served the superseded
+  # major. A bare `>=12.2.0` would fix that while making the pin float, which
+  # trades a stale-but-stable closure for a moving one.
+  # Pinned to the version the project lock holds, so overlay and lock agree.
+  # Changing this re-measures 13 gating floors (naver/v-splade-quality, docling).
+  pillow: '==12.3.0'
   # grounding_dino
   requests: ''
   # gliner, gliner_bi

@@ -12,10 +12,10 @@ conditionally owned queue/adaptive-scheduler surfaces. Only authoritative lane
 lifecycle signals remain excluded until a deployed producer owns them;
 undeclared new instruments are not permitted.
 
-The current inventory is 117 application families: 115 may reach the remote
+The current inventory is 122 application families: 120 may reach the remote
 OTLP branch and two remain Prometheus-only controls. Nine additional,
 exact collector-self families form a separate operational allowlist. The
-Better Stack dashboard code therefore covers 124 remotely eligible families
+Better Stack dashboard code therefore covers 129 remotely eligible families
 without turning collector self-telemetry into a version-dependent wildcard.
 
 `sie.gateway.pool.pinned_model.loaded` is intentionally Prometheus-only. Its
@@ -276,11 +276,14 @@ For the sidecar's six declared queue operations, the budget is
 Every sidecar instrument nevertheless has an explicit SDK view derived from
 its full checked-in attribute domains. Batch size/cost omit `flush.reason`
 because it does not change their batch-shape semantics; fill ratio retains it.
-The resulting high-product ceilings are 14,392 fill-ratio series and 4,112
-generation-loading series, while all other sidecar ceilings are at or below
-1,799. These are upper bounds on retained SDK series, not expected steady-state
-usage or byte-size claims; the machine-checked formulas live in
-`contract.yaml`.
+`sie.worker.work_item.age` omits the catalog pair entirely and costs seven
+series: transport-queue age is a property of the queue rather than of the
+model on the far side of it, so the catalog factor would multiply the series
+count without adding an answer. The resulting high-product ceilings are 14,392
+fill-ratio series and 4,112 generation-loading series, while all other sidecar
+ceilings are at or below 1,799. These are upper bounds on retained SDK series,
+not expected steady-state usage or byte-size claims; the machine-checked
+formulas live in `contract.yaml`.
 
 ## KEDA is a control API
 
@@ -355,8 +358,7 @@ Helm uses `lookup` to render each existing Deployment or StatefulSet's live
 Helm resource patch from resetting the observed HPA-controlled replica count and leaves no
 permanent replica-pin data in values, annotations, or release history.
 
-The `0.6.20` boundary is one supervised maintenance-window upgrade, documented
-in the [deployment runbook](../deploy/upgrade-runbook.md).
+The `0.6.20` boundary requires one supervised maintenance-window upgrade.
 Stop external traffic and topology/config writes, keep the effective namespace,
 lane catalog, names, scale targets, Prometheus backend, and KEDA ownership
 unchanged, and run one normal

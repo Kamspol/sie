@@ -141,7 +141,6 @@ def test_candle_bundle_only_exposes_profile_variants() -> None:
     [
         ("lightonai/LightOnOCR-2-1B", "transformers5.yaml"),
         ("PaddlePaddle/PaddleOCR-VL-1.5", "default.yaml"),
-        ("PaddlePaddle/PaddleOCR-VL-1.6", "default.yaml"),
         ("zai-org/GLM-OCR", "transformers5.yaml"),
     ],
 )

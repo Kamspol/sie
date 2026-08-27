@@ -83,6 +83,8 @@ static OPENAPI_JSON: LazyLock<String> = LazyLock::new(|| {
         AllItemsFailedResponse,
         BundleRoutingConflictDetail,
         BundleConflictResponse,
+        AudioInput,
+        VideoInput,
         DocumentInput,
         DenseVector,
         EncodeParams,
@@ -115,6 +117,7 @@ static OPENAPI_JSON: LazyLock<String> = LazyLock::new(|| {
         OpenAIEmbeddingEncodingFormat,
         OpenAIEmbeddingInput,
         OpenAIEmbeddingRequest,
+        OpenAIEmbeddingTokenSource,
         OpenAIEmbeddingUsage,
         OpenAIEmbeddingVector,
         OpenAIEmbeddingsListResponse,
@@ -164,6 +167,7 @@ static OPENAPI_JSON: LazyLock<String> = LazyLock::new(|| {
         ScoreResponse,
         SparseVector,
         TimingInfo,
+        Usage,
         crate::types::pool::AssignedWorker,
         crate::types::worker::WorkerInfo
     )),
@@ -1778,8 +1782,23 @@ pub struct OpenAIEmbeddingDataEntry {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct OpenAIEmbeddingUsage {
+    /// Exact post-tokenization input tokens when `sie_token_source` is
+    /// `worker`; a character-based approximation when it is
+    /// `character_estimate`.
     pub prompt_tokens: u64,
+    /// Equal to `prompt_tokens`; embeddings produce no output tokens.
     pub total_tokens: u64,
+    /// SIE extension. `worker` when the counts above are the model's own
+    /// post-tokenization measurement, `character_estimate` when the serving
+    /// path reported no counts and the numbers are approximate.
+    pub sie_token_source: OpenAIEmbeddingTokenSource,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAIEmbeddingTokenSource {
+    Worker,
+    CharacterEstimate,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -2536,6 +2555,25 @@ pub struct ModelInfoWire {
     pub capabilities: Option<ModelCapabilitiesWire>,
     #[serde(default)]
     pub pending_generation: crate::queue::publisher::PendingGenerationSnapshot,
+    /// Short task-tier names that resolve to this model, for example
+    /// ``["rerank-fast"]``. Send one anywhere a model id is accepted and it
+    /// resolves to this entry, billed at this model's rate.
+    ///
+    /// Always present, and empty when the model has none. Only names declared
+    /// by the released catalog or by operator configuration appear here.
+    //
+    // Maintainer note, deliberately a non-doc comment: everything above this
+    // line is published verbatim as the field's description in the public
+    // OpenAPI document, so implementation rationale must not join it.
+    //
+    // Deliberately NOT `#[serde(default)]`: that would drop the field from the
+    // schema's `required` set, and a generated client would then type it
+    // optional and force a null check on something the handler always emits.
+    // The always-emit guarantee is the whole reason the empty list is sent
+    // rather than omitted, so the schema has to carry it. `ModelInfoWire` is a
+    // documentation type — nothing deserializes it — so requiring the field
+    // cannot break parsing of an older payload.
+    pub aliases: Vec<String>,
 }
 
 /// Capability summary surfaced on each entry of ``GET /v1/models``.
@@ -2709,8 +2747,50 @@ pub struct ResolveConfigResponse {
     pub profiles: Vec<String>,
 }
 
+// Native media bytes (`ImageInput` / `AudioInput` / `VideoInput` /
+// `DocumentInput` below) carry ONE spelling per ingress, and the schema has to
+// name the JSON one.
+//
+// A bare `Vec<u8>` renders as an ARRAY OF INTEGERS, which is not an encoding
+// this edge accepts: `decode_native_media_object_data` converts a base64
+// **string** into msgpack `bin` and leaves every other shape untouched, so an
+// array would reach the worker as an array and fail its typed `bytes` decode.
+// A client generated from that schema is broken before it sends a byte, which
+// defeats the point of publishing a schema at all.
+//
+// On the msgpack ingress the same field is native `bin` and needs no
+// transcoding. `content_encoding` describes the JSON spelling — the only one
+// an OpenAPI-generated client can produce.
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ImageInput {
+    /// Media bytes. Base64-encoded on the JSON path; native binary on the msgpack path.
+    #[schema(value_type = String, content_encoding = "base64")]
+    pub data: Vec<u8>,
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AudioInput {
+    /// Media bytes. Base64-encoded on the JSON path; native binary on the msgpack path.
+    #[schema(value_type = String, content_encoding = "base64")]
+    pub data: Vec<u8>,
+    #[serde(default)]
+    pub format: Option<String>,
+    // The audio preprocessor rejects a non-positive rate outright
+    // ("audio.sample_rate must be a positive integer or null"), so the bound
+    // belongs in the published contract rather than only in the error path.
+    /// Sample rate in Hz. Must be positive.
+    #[serde(default)]
+    #[schema(exclusive_minimum = 0)]
+    pub sample_rate: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct VideoInput {
+    /// Media bytes. Base64-encoded on the JSON path; native binary on the msgpack path.
+    #[schema(value_type = String, content_encoding = "base64")]
     pub data: Vec<u8>,
     #[serde(default)]
     pub format: Option<String>,
@@ -2718,6 +2798,8 @@ pub struct ImageInput {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct DocumentInput {
+    /// Media bytes. Base64-encoded on the JSON path; native binary on the msgpack path.
+    #[schema(value_type = String, content_encoding = "base64")]
     pub data: Vec<u8>,
     #[serde(default)]
     pub format: Option<String>,
@@ -2731,6 +2813,10 @@ pub struct ItemInput {
     pub text: Option<String>,
     #[serde(default)]
     pub images: Option<Vec<ImageInput>>,
+    #[serde(default)]
+    pub audio: Option<AudioInput>,
+    #[serde(default)]
+    pub video: Option<VideoInput>,
     #[serde(default)]
     pub document: Option<DocumentInput>,
     #[serde(default)]
@@ -2884,6 +2970,17 @@ pub struct ScoreUsage {
     pub images: Option<u64>,
 }
 
+/// Authoritative worker-emitted usage. Post-tokenization counts, never a
+/// character estimate. A reported `0` is a measurement (a request that read no
+/// text); an absent block means the serving path could not count. Structurally
+/// identical to `ScoreUsage`, which shipped this shape first.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct Usage {
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub images: Option<u64>,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RerankResponse {
     pub model: String,
@@ -2948,6 +3045,8 @@ pub struct EncodeResponse {
     pub items: Vec<EncodeResult>,
     #[serde(default)]
     pub timing: Option<TimingInfo>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -2996,6 +3095,8 @@ pub struct ExtractResult {
 pub struct ExtractResponse {
     pub model: String,
     pub items: Vec<ExtractResult>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -3031,6 +3132,51 @@ mod tests {
     fn openapi_document_has_gateway_metadata() {
         let doc = ApiDoc::openapi();
         assert_eq!(doc.info.title, "SIE Gateway");
+    }
+
+    /// Every native media `data` field must advertise the ONE JSON encoding
+    /// the ingress accepts: a base64 string.
+    ///
+    /// `handlers::proxy::decode_native_media_object_data` transcodes a base64
+    /// **string** into msgpack `bin` and passes every other shape through
+    /// untouched, so anything else this schema advertised — an array of
+    /// integers (the bare `Vec<u8>` rendering), or `format: binary` meaning
+    /// raw octets — would generate a client whose requests die at the
+    /// worker's typed `bytes` decode. The companion runtime test is
+    /// `handlers::proxy::tests::test_parse_queue_request_json_decodes_native_media_data_to_binary`;
+    /// this one holds the published contract to the same rule so the two
+    /// cannot drift apart.
+    #[test]
+    fn openapi_documents_media_bytes_as_base64_strings() {
+        let spec: serde_json::Value = serde_json::from_str(&OPENAPI_JSON).unwrap();
+        for schema in ["ImageInput", "AudioInput", "VideoInput", "DocumentInput"] {
+            let data = &spec["components"]["schemas"][schema]["properties"]["data"];
+            assert_eq!(
+                data["type"], "string",
+                "{schema}.data must be a string, not an array of integers"
+            );
+            assert_eq!(
+                data["contentEncoding"], "base64",
+                "{schema}.data must declare base64 content encoding"
+            );
+            assert!(
+                data.get("format").is_none(),
+                "{schema}.data must not claim `format` (binary means raw octets): {data}"
+            );
+        }
+    }
+
+    /// The audio preprocessor rejects a non-positive `sample_rate`, so the
+    /// schema has to say so rather than leaving a generated client to send a
+    /// zero and learn about the rule from a 400.
+    #[test]
+    fn openapi_documents_positive_audio_sample_rate() {
+        let spec: serde_json::Value = serde_json::from_str(&OPENAPI_JSON).unwrap();
+        let sample_rate = &spec["components"]["schemas"]["AudioInput"]["properties"]["sample_rate"];
+        assert_eq!(
+            sample_rate["exclusiveMinimum"], 0,
+            "AudioInput.sample_rate must advertise its positive bound: {sample_rate}"
+        );
     }
 
     #[test]

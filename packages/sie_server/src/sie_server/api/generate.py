@@ -9,7 +9,7 @@ transport differs.
 Why ship a direct route at all? Two reasons:
 
 1. End-to-end viability checking: a developer can run
-   ``mise run serve -m Qwen/Qwen3-4B-Instruct -b sglang`` and immediately
+   ``mise run serve -- -m Qwen/Qwen3-4B-Instruct -b sglang`` and immediately
    curl ``/v1/generate/...`` against the worker to confirm the
    adapter + registry + model config plumbing works against a real GPU,
    without needing to boot the Rust gateway and NATS first.
@@ -1160,14 +1160,22 @@ async def generate(
         # answer HTTP 200 with truncated output. Map the failure terminators
         # to non-2xx, keeping the OpenAI-shaped error body the route uses
         # elsewhere. (``stop`` / ``length`` are the normal success
-        # terminators and fall through to the 200 response.)
-        if result.finish_reason == "error":
-            logger.warning("generate produced terminal finish_reason=error for %s", model)
+        # terminators and fall through to the 200 response.) A typed
+        # terminal ``error_code`` (e.g. ``empty_model_output``, which keeps
+        # a ``stop``/``length`` finish_reason) is an error too, and its
+        # code/message are surfaced verbatim — mirroring the streaming
+        # path's terminal-error semantics (#3104/#3136).
+        if result.finish_reason == "error" or result.error_code is not None:
+            logger.warning(
+                "generate produced terminal error code=%s for %s",
+                result.error_code or "inference_error",
+                model,
+            )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail={
-                    "code": "inference_error",
-                    "message": "generation terminated with an upstream error",
+                    "code": result.error_code or "inference_error",
+                    "message": result.error_message or "generation terminated with an upstream error",
                 },
             )
         if result.finish_reason == "cancelled":

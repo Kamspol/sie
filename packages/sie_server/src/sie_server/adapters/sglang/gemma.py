@@ -10,7 +10,7 @@ class SGLangGemmaAdapter(SGLangGenerationAdapter):
     subclass exists is routing: bundle compatibility keys on the adapter
     *module* path, and the ``sglang`` bundle declares only
     ``sie_server.adapters.sglang.generation``. Giving Gemma 4 a distinct
-    module lets the ``gemma`` bundle (sglang 0.5.13 + transformers 5.8) own
+    module lets the ``sglang-cu130`` bundle (sglang 0.5.13 + transformers 5.8) own
     it without making every Qwen3.x model compatible with that bundle too —
     so the Qwen serving stack on the ``sglang`` bundle stays untouched.
     """

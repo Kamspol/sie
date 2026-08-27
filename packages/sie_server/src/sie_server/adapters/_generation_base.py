@@ -149,13 +149,18 @@ class GenerationResult:
     Used by callers that don't yet consume the chunk iterator — currently
     the local-dev ``/v1/generate`` HTTP route and unit tests for the
     blocking adapter shape. The async iterator is the canonical contract;
-    this aggregate is built from it.
+    this aggregate is built from it. ``error_code`` / ``error_message``
+    mirror the terminal chunk's typed error fields (e.g.
+    ``empty_model_output``) so buffered consumers can fail closed with the
+    same semantics as the streaming path (#3104/#3136).
     """
 
     text: str
     finish_reason: Literal["stop", "length", "error", "cancelled"]
     prompt_tokens: int
     completion_tokens: int
+    error_code: str | None = None
+    error_message: str | None = None
 
 
 class ThinkingBlockStripper:
@@ -247,6 +252,13 @@ def _strip_complete_thinking_blocks(
     return stripper.feed(text) + stripper.finish()
 
 
+def _candidates_have_visible_text(candidates: tuple[dict[str, Any], ...] | None) -> bool:
+    """Return whether any ``n > 1`` candidate aggregate carries visible text."""
+    if not candidates:
+        return False
+    return any(isinstance(text := candidate.get("text"), str) and text.strip() for candidate in candidates)
+
+
 async def suppress_thinking_blocks(
     chunks: AsyncIterator[GenerationChunk],
     *,
@@ -269,9 +281,20 @@ async def suppress_thinking_blocks(
 
     Closing the wrapper eagerly closes the upstream adapter iterator so client
     cancellation still reaches SGLang's ``/abort_request`` cleanup.
+
+    A stream that terminates without ever producing meaningful visible output
+    (no non-whitespace text on any choice or candidate, no tool calls) is
+    stamped with ``error_code="empty_model_output"`` on the terminal chunk —
+    e.g. when private reasoning consumed the entire generation budget. Without
+    the stamp such a request settles as a nominally successful but unusable
+    response that clients cannot distinguish from a real answer (#3104/#3136).
+    Cancelled and already-errored terminals are left untouched.
     """
     states: dict[int, ThinkingBlockStripper] = {}
     emitted_visible_text = False
+    emitted_meaningful_text = False
+    emitted_tool_call = False
+    hid_reasoning = False
     try:
         async for chunk in chunks:
             rewritten_candidates = chunk.candidates
@@ -289,6 +312,7 @@ async def suppress_thinking_blocks(
                         if visible != text:
                             item["text"] = visible
                             item["logprobs"] = None
+                            hid_reasoning = True
                     candidate_items.append(item)
                 rewritten_candidates = tuple(candidate_items)
 
@@ -304,6 +328,9 @@ async def suppress_thinking_blocks(
 
             is_first = bool(visible_delta) and not emitted_visible_text
             emitted_visible_text = emitted_visible_text or bool(visible_delta)
+            emitted_meaningful_text = emitted_meaningful_text or bool(visible_delta.strip())
+            emitted_tool_call = emitted_tool_call or chunk.tool_call_delta is not None
+            hid_reasoning = hid_reasoning or text_changed or was_inside
             rewritten = replace(
                 chunk,
                 text_delta=visible_delta,
@@ -311,6 +338,21 @@ async def suppress_thinking_blocks(
                 logprobs=None if text_changed or was_inside else chunk.logprobs,
                 candidates=rewritten_candidates,
             )
+
+            if (
+                rewritten.done
+                and not emitted_meaningful_text
+                and not emitted_tool_call
+                and rewritten.error_code is None
+                and rewritten.finish_reason in ("stop", "length")
+                and not _candidates_have_visible_text(rewritten.candidates)
+            ):
+                reason = " (private reasoning consumed the generation budget)" if hid_reasoning else ""
+                rewritten = replace(
+                    rewritten,
+                    error_code="empty_model_output",
+                    error_message=f"model produced no visible output text{reason}",
+                )
 
             # Reasoning-only engine deltas have no wire-visible information.
             # Keep terminals, per-choice finish markers, tool/error chunks, and
@@ -402,12 +444,17 @@ async def collect_generation(
     Convenience for the local-dev ``/v1/generate`` route and unit-test code
     paths that historically consumed the blocking shape. The terminal
     chunk's ``finish_reason`` / token counts are propagated; missing
-    counts default to 0.
+    counts default to 0. Terminal ``error_code`` / ``error_message``
+    (e.g. ``empty_model_output``, which keeps a ``stop``/``length``
+    finish_reason) are carried verbatim so buffered consumers can fail
+    closed instead of settling as a nominal success (#3104/#3136).
     """
     parts: list[str] = []
     finish_reason: FinishReason = "stop"
     prompt_tokens = 0
     completion_tokens = 0
+    error_code: str | None = None
+    error_message: str | None = None
     async for chunk in chunks:
         if chunk.text_delta:
             parts.append(chunk.text_delta)
@@ -417,12 +464,16 @@ async def collect_generation(
                 prompt_tokens = chunk.prompt_tokens
             if chunk.completion_tokens is not None:
                 completion_tokens = chunk.completion_tokens
+            error_code = chunk.error_code
+            error_message = chunk.error_message
             break
     return GenerationResult(
         text="".join(parts),
         finish_reason=cast("Any", finish_reason),
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
+        error_code=error_code,
+        error_message=error_message,
     )
 
 

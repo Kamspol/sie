@@ -16,6 +16,7 @@ Engine API to avoid event loop conflicts with uvicorn/uvloop.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import os
@@ -191,6 +192,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
 
         self._process: subprocess.Popen[bytes] | None = None
         self._server_url: str | None = None
+        self._port: int | None = None
         # Shared HTTP client + thread pool for concurrent POSTs to SGLang. Only
         # populated (in ``load``) when concurrency > 1; a single-post encode
         # keeps using module-level ``requests.post`` so the concurrency=1 A/B
@@ -239,6 +241,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
 
         device_index = _server.parse_device_index(device)
         port = _server.find_free_port()
+        self._port = port
         self._server_url = f"http://localhost:{port}"
 
         logger.info(
@@ -293,18 +296,29 @@ class SGLangEmbeddingAdapter(BaseAdapter):
                 list(self._lora_paths.keys()),
             )
 
-        self._output_file = _server.open_output_log()
-        self._process = _server.launch_sglang_server(cmd, device_index=device_index, output_file=self._output_file)
+        # The port (and, once opened, the log fd) belong to this adapter from
+        # the reservation above onward, so every raise below hands them back
+        # rather than leaking one slot of the 100-port span per attempt: a full
+        # /tmp in open_output_log, a failed exec, or a cancelled load included.
+        try:
+            self._output_file = _server.open_output_log()
+            self._process = _server.launch_sglang_server(cmd, device_index=device_index, output_file=self._output_file)
 
-        if not _server.wait_for_server(
-            self._server_url,
-            self._process,
-            output_file=self._output_file,
-            timeout_s=self._startup_timeout_s,
-        ):
-            _server.terminate_process(self._process)
-            self._process = None
-            raise _server.startup_failure_error(self._output_file)
+            if not _server.wait_for_server(
+                self._server_url,
+                self._process,
+                output_file=self._output_file,
+                timeout_s=self._startup_timeout_s,
+            ):
+                # Capture crash-vs-timeout before terminate makes poll() ambiguous.
+                crash_exit_code = self._process.poll()
+                _server.terminate_process(self._process)
+                self._process = None
+                # Build the error before the abort deletes the log it reads.
+                raise _server.startup_failure_error(self._output_file, crash_exit_code=crash_exit_code)
+        except BaseException:
+            self._abort_failed_load()
+            raise
 
         # Concurrent-POST fan-out: a keep-alive session with a connection pool
         # sized to the concurrency and a matching thread pool, so a sharded
@@ -329,6 +343,22 @@ class SGLangEmbeddingAdapter(BaseAdapter):
             self._embed_concurrency,
         )
 
+    def _abort_failed_load(self) -> None:
+        """Tear down a partially-started child + reset state after a failed load.
+
+        The registry does not call unload() on a failed load, so this mirrors
+        unload(): terminate the child, release the reserved port, drop the temp
+        log, and clear _server_url/_device so the adapter does not look "loaded".
+        Mirrors the generation siblings (SGLang + MLX).
+        """
+        _server.terminate_process(self._process)
+        self._process = None
+        _server.release_port(self._port)
+        self._port = None
+        self._server_url = None
+        self._device = None
+        self._cleanup_output_log()
+
     def unload(self) -> None:
         """Unload the model by stopping SGLang server subprocess."""
         if self._post_executor is not None:
@@ -342,9 +372,28 @@ class SGLangEmbeddingAdapter(BaseAdapter):
             _server.terminate_process(self._process)
             self._process = None
 
+        # Release only after the child is down so a concurrent load can't be
+        # handed a port the dying child still holds bound.
+        _server.release_port(self._port)
+        self._port = None
         self._server_url = None
         self._device = None
         self._dense_dim = self._configured_dense_dim
+        self._cleanup_output_log()
+
+    def _cleanup_output_log(self) -> None:
+        """Close + delete the subprocess stdout/stderr log (best-effort, idempotent).
+
+        Without this, one ``sglang_*.log`` leaks into /tmp per load — unbounded
+        under LRU-eviction / hot-reload churn — and the open fd is held for the
+        subprocess lifetime. Mirrors the MLX sibling's cleanup.
+        """
+        if self._output_file is not None:
+            with contextlib.suppress(OSError):
+                self._output_file.close()
+            with contextlib.suppress(OSError):
+                Path(self._output_file.name).unlink()
+            self._output_file = None
 
     def memory_footprint(self) -> int:
         """Return the GPU memory usage in bytes.

@@ -9,6 +9,7 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { DEFAULT_PROVISION_TIMEOUT } from "../src/internal/constants.js";
 import {
   getErrorCode,
   handleError,
@@ -18,6 +19,15 @@ import {
   parseGpuParam,
 } from "../src/internal/parsing.js";
 import { computeBackoffWithJitter, getRetryAfter } from "../src/internal/retry.js";
+
+describe("Default provision timeout", () => {
+  it("matches the Python SDK's DEFAULT_PROVISION_TIMEOUT_S (900s)", () => {
+    // Parity with packages/sie_sdk/src/sie_sdk/client/_shared.py —
+    // cold loads / scale-from-zero can take 5-15 minutes; a shorter TS
+    // budget made requests fail in TS that succeed in Python.
+    expect(DEFAULT_PROVISION_TIMEOUT).toBe(900_000);
+  });
+});
 
 describe("Retry logic - exponential backoff with jitter", () => {
   it("should return delay within expected range for first attempt", () => {
@@ -248,6 +258,24 @@ describe("handleError (gateway / FastAPI bodies)", () => {
       message: "Model 'x' not found",
       code: "MODEL_NOT_FOUND",
       statusCode: 404,
+    });
+  });
+
+  it("carries the x-sie-request-id header onto typed errors (#3136)", async () => {
+    const res = new Response(
+      JSON.stringify({
+        detail: { code: "empty_model_output", message: "model produced no visible output text" },
+      }),
+      {
+        status: 500,
+        headers: { "Content-Type": "application/json", "x-sie-request-id": "req-http-1" },
+      },
+    );
+    await expect(handleError(res)).rejects.toMatchObject({
+      name: "ServerError",
+      code: "empty_model_output",
+      statusCode: 500,
+      requestId: "req-http-1",
     });
   });
 

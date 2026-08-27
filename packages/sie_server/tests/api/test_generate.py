@@ -63,6 +63,10 @@ class _FakeGenAdapter(GenerationAdapter):
     # exercise the route's error/cancelled → non-200 mapping (BUG: a
     # terminal error/cancelled chunk must NOT become an HTTP 200).
     finish_reason: str = "stop"
+    # Typed terminal error fields; tests set these to exercise the
+    # route's verbatim-code fail-closed mapping (#3104/#3136).
+    error_code: str | None = None
+    error_message: str | None = None
 
     async def generate(
         self,
@@ -112,6 +116,8 @@ class _FakeGenAdapter(GenerationAdapter):
             finish_reason=self.finish_reason,  # type: ignore[arg-type]
             prompt_tokens=len(prompt.split()),
             completion_tokens=2,
+            error_code=self.error_code,
+            error_message=self.error_message,
         )
 
 
@@ -1233,6 +1239,46 @@ class TestGenerateEndpoint:
         )
         assert response.status_code == 500, response.text
         assert response.json()["detail"]["code"] == "inference_error"
+
+    def test_terminal_empty_model_output_returns_500_with_verbatim_code(
+        self, client: TestClient, fake_adapter: _FakeGenAdapter
+    ) -> None:
+        """#3104/#3136: an ``empty_model_output`` terminal keeps a
+        ``stop``/``length`` finish_reason, so the buffered route must key on
+        the typed ``error_code`` — not answer HTTP 200 with empty text — and
+        surface the code/message verbatim, exactly like the streaming shape.
+        """
+        fake_adapter.finish_reason = "length"
+        fake_adapter.error_code = "empty_model_output"
+        fake_adapter.error_message = "model produced no visible output text"
+        response = client.post(
+            "/v1/generate/Qwen__Qwen3-4B-Instruct",
+            json={"prompt": "Hi", "max_new_tokens": 8},
+        )
+        assert response.status_code == 500, response.text
+        detail = response.json()["detail"]
+        assert detail["code"] == "empty_model_output"
+        assert detail["message"] == "model produced no visible output text"
+        assert "retry-after" not in {k.lower() for k in response.headers}
+
+    def test_terminal_error_with_typed_code_is_not_flattened_to_inference_error(
+        self, client: TestClient, fake_adapter: _FakeGenAdapter
+    ) -> None:
+        """A parser-style ``finish_reason="error"`` terminal that carries its
+        own typed code must surface that code verbatim, not the hardcoded
+        ``inference_error`` fallback (#3136).
+        """
+        fake_adapter.finish_reason = "error"
+        fake_adapter.error_code = "tool_call_parse_error"
+        fake_adapter.error_message = "model emitted a malformed tool call"
+        response = client.post(
+            "/v1/generate/Qwen__Qwen3-4B-Instruct",
+            json={"prompt": "Hi", "max_new_tokens": 8},
+        )
+        assert response.status_code == 500, response.text
+        detail = response.json()["detail"]
+        assert detail["code"] == "tool_call_parse_error"
+        assert detail["message"] == "model emitted a malformed tool call"
 
     def test_terminal_cancelled_finish_reason_returns_503(
         self, client: TestClient, fake_adapter: _FakeGenAdapter

@@ -111,7 +111,7 @@ pub fn compat_request_body_limit(_path: &str) -> usize {
 /// An earlier revision of this constant set 64 MiB and claimed it was "anchored"
 /// to `queue::publisher::MAX_RESULT_CHUNK_RESERVED_BYTES_PER_REQUEST`. That was
 /// wrong twice over, and the corrected reasoning is recorded here so it is not
-/// re-derived the same way (#2617):
+/// re-derived the same way:
 ///
 /// 1. That constant bounds a RESERVATION, not a payload. `result_chunk_reservation_bytes`
 ///    computes `payload × 3 + 4 KiB` and checks the PRODUCT against the 64 MiB
@@ -126,18 +126,17 @@ pub fn compat_request_body_limit(_path: &str) -> usize {
 /// (`MAX_QUEUE_REQUEST_ITEMS` = 4096) a float reply is ~90 MB at 1024 dims and
 /// ~224 MB at 2560 dims (`Qwen/Qwen3-Embedding-4B`, shipped on this very surface
 /// in `beta-launch-v1.yaml`). The handler holds roughly four copies at once (the
-/// buffer, the parsed tree, the projected `data`, the re-serialised body), and
-/// the deployed gateway is a **1 GiB container running 4 requests concurrently**
-/// (`sie_cloud/deploy/gateway_app.py`, `GATEWAY_MEMORY_MIB=1024`,
-/// `GATEWAY_MAX_INPUTS=4`). Admitting the largest real reply would need several
-/// gigabytes. So this is a CHOSEN bound with a stated rationale, not a derived one.
+/// buffer, the parsed tree, the projected `data`, and the re-serialised body).
+/// Four ~224 MB copies total ~896 MB, or about 1 GB for one request; concurrent
+/// requests can therefore drive the process into several gigabytes. So this is
+/// a CHOSEN bound with a stated rationale, not a derived one.
 ///
 /// The choice is to hold today's effective bound exactly. 16 MiB is what the
 /// surface enforces in production right now, so it is provably non-breaking in
 /// BOTH directions: it refuses nothing that is served today, and it raises
-/// per-request heap on that 1 GiB container by nothing. Raising it would trade a
-/// clean, diagnosable 413 for an OOM kill that also destroys the three unrelated
-/// requests sharing the container — strictly worse than the refusal it removes.
+/// per-request heap by nothing. Raising it would trade a clean, diagnosable 413
+/// for an OOM kill that can also destroy unrelated concurrent requests —
+/// strictly worse than the refusal it removes.
 ///
 /// # What this deliberately does NOT fix
 ///
@@ -745,6 +744,10 @@ async fn queue_pool_for_request(
     manager.queue_pool_for_pool(&normalized).await
 }
 
+fn catalog_execution_hash_is_ready(bundle_config_hash: &str, uses_catalog_scope: bool) -> bool {
+    !uses_catalog_scope || !bundle_config_hash.is_empty()
+}
+
 async fn demand_profiles_for_pool(
     pool_manager: Option<&PoolManager>,
     pool_name: &str,
@@ -810,12 +813,19 @@ fn record_provisioning_response(surface: ProvisioningSurface, status: StatusCode
 /// Returns the `Retry-After` value the caller should surface (`None` for a
 /// generic publish failure). The `no consumers` case is handled by the
 /// caller — it needs a provisioning response / surface-specific retry.
-fn record_publish_failure(
+///
+/// A broker-side rejection at the stream's `max_messages` cap counts as
+/// backpressure too. With `DiscardPolicy::New` (see `ensure_stream`) a full
+/// work stream refuses the publish with JetStream's "maximum messages
+/// exceeded" instead of silently dropping the oldest queued item, and that
+/// rejection means the same thing as the gateway-local gate: the lane is
+/// saturated and is exactly the one to scale up.
+pub(crate) fn record_publish_failure(
     state: &AppState,
     physical_lane: &PhysicalLane,
     err_lower: &str,
 ) -> Option<&'static str> {
-    if err_lower.contains("backpressure") {
+    if err_lower.contains("backpressure") || err_lower.contains("maximum messages exceeded") {
         telemetry::record_rejected_request(
             state.demand_tracker.as_ref(),
             physical_lane,
@@ -1343,6 +1353,41 @@ pub async fn proxy_generate(state: State<Arc<AppState>>, req: Request) -> impl I
 /// every caller a read of the alias table — including targets in another org's
 /// reserved namespace. It also makes this 404 byte-identical to the #1841
 /// cross-org one, which is the whole point of answering "not found" there.
+/// The one native-surface `MODEL_NOT_FOUND` body.
+///
+/// Three native call sites answer "this model is not here": the #1841
+/// visibility gate, the populated-registry unknown-model arm of
+/// [`resolve_bundle_for_request`], and the #3441 pre-governed ordering check in
+/// [`resolve_routing`]. They must stay **byte-identical** — the no-oracle
+/// property (#2542) is that a hidden model, an absent model, and a model whose
+/// governed route was never compiled are one indistinguishable response — so
+/// they render through this one function instead of three copies that can drift.
+///
+/// `requested` is always the CALLER's string, never a resolved/governed id: a
+/// resolved id can be an alias target in another org's reserved namespace.
+fn unknown_model_response(endpoint: &str, requested: &str) -> Response {
+    endpoint_error_response(
+        endpoint,
+        StatusCode::NOT_FOUND,
+        err_code::MODEL_NOT_FOUND,
+        oai_type::MODEL_NOT_FOUND,
+        oai_code::MODEL_NOT_FOUND,
+        Some("model"),
+        format!("Model '{}' not found", requested),
+    )
+}
+
+/// Is this id absent from a registry that has models?
+///
+/// The exact condition the populated-registry 404 arm below fires on, named so
+/// the #3441 ordering check in [`resolve_routing`] can ask the same question
+/// ahead of governed lookup without restating it. An EMPTY registry is
+/// deliberately not "absent": that is the pre-bootstrap deployment path, which
+/// falls back to the caller's bundle override rather than 404ing.
+fn absent_from_populated_registry(registry: &ModelRegistry, model_name: &str) -> bool {
+    !registry.model_exists(model_name) && registry.has_any_models()
+}
+
 fn resolve_bundle_for_request(
     registry: &ModelRegistry,
     model_name: &str,
@@ -1393,15 +1438,7 @@ fn resolve_bundle_for_request(
             }
         }
     } else if registry.has_any_models() {
-        return Err(Box::new(endpoint_error_response(
-            endpoint,
-            StatusCode::NOT_FOUND,
-            err_code::MODEL_NOT_FOUND,
-            oai_type::MODEL_NOT_FOUND,
-            oai_code::MODEL_NOT_FOUND,
-            Some("model"),
-            format!("Model '{}' not found", requested),
-        )));
+        return Err(Box::new(unknown_model_response(endpoint, requested)));
     } else if bundle_override.is_empty() {
         "default".to_string()
     } else {
@@ -1809,15 +1846,7 @@ async fn resolve_routing(
         .as_ref()
         .is_some_and(|p| !p.visible(&model_name, ext))
     {
-        return Err(Box::new(endpoint_error_response(
-            endpoint,
-            StatusCode::NOT_FOUND,
-            err_code::MODEL_NOT_FOUND,
-            oai_type::MODEL_NOT_FOUND,
-            oai_code::MODEL_NOT_FOUND,
-            Some("model"),
-            format!("Model '{}' not found", model),
-        )));
+        return Err(Box::new(unknown_model_response(endpoint, &model)));
     }
     // #2542 deployment serving policy on the RESOLVED id: the authoritative
     // "we do not serve this model here" verdict (the managed service's §6.5
@@ -1898,6 +1927,32 @@ async fn resolve_routing(
     let mut dispatch_model = model_name.clone();
     if generation_intent == Some(GenerationRequestIntent::Grammar) {
         route_grammar_to_profile(&state.model_registry, &mut dispatch_model);
+    }
+    // #3441 ordering: a model this data plane does not have is answered by the
+    // populated-registry `MODEL_NOT_FOUND` 404 BEFORE the governed lookup runs.
+    //
+    // Governed lookup is keyed on `(customer_model, intent)`, so an unknown id is
+    // simply a policy miss, and a miss fails closed as a 503 — the correct verdict
+    // for *deployment drift* (a catalog model whose route was not compiled), but
+    // the wrong one for a model that does not resolve here at all. §7.5 of the
+    // managed-service design separates the two: unresolvable → terminal 404,
+    // routable-but-broken → retryable 503. Without this check a typo'd or retired
+    // model id (prod-US, 2026-08-14: `Qwen__Qwen3-4B-Instruct-2507`) told the
+    // caller to retry forever against a model that will never exist.
+    //
+    // Only the native generate path needs it: the OpenAI body-model routes reach
+    // `resolve_model_and_bundle`'s identical 404 before `resolve_generation_route`
+    // performs the same governed lookup. Scoped to `generation_intent` because
+    // governed lookup is the only step that can precede the 404 — for every other
+    // native endpoint `resolve_bundle_for_request` below is still the first
+    // verdict, and reordering it there would change nothing.
+    //
+    // Sealed custom models (#1841) already returned above; they are legitimately
+    // absent from the catalog registry and must not be caught here.
+    if generation_intent.is_some()
+        && absent_from_populated_registry(&state.model_registry, &model_name)
+    {
+        return Err(Box::new(unknown_model_response(endpoint, &model)));
     }
     let governed_route = if let Some(intent) = generation_intent {
         match governed_generation_route(state, &model_name, &dispatch_model, intent) {
@@ -2241,10 +2296,20 @@ async fn proxy_request_inner(
         let requested_pool = normalize_pool_name(&pool_name);
         return build_pool_not_found_response_for_surface(&requested_pool, provisioning_surface);
     };
-    let (bundle_config_hash, model_revision) =
-        state
-            .model_registry
-            .bundle_execution_evidence(&bundle, &hash_pool, &dispatch_model);
+    let (bundle_config_hash, model_revision, uses_catalog_scope) = state
+        .model_registry
+        .bundle_execution_evidence(&bundle, &hash_pool, &dispatch_model);
+    if !catalog_execution_hash_is_ready(&bundle_config_hash, uses_catalog_scope) {
+        return endpoint_error_response(
+            endpoint,
+            StatusCode::SERVICE_UNAVAILABLE,
+            err_code::QUEUE_UNAVAILABLE,
+            oai_type::SERVER_ERROR,
+            oai_code::TRANSPORT_FAILURE,
+            None,
+            "Model execution evidence is unavailable while configuration converges",
+        );
+    }
 
     // Resolve the effective pool in one shot. `resolve_effective_pool`
     // folds the demand-tracking probe ("was there an exact
@@ -4119,6 +4184,11 @@ fn build_streaming_error_response(err: &StreamingDriverErr) -> Response {
                 "cancelled" => oai_code::CANCELLED,
                 "rate_limit_exceeded" => oai_code::RATE_LIMIT_EXCEEDED,
                 COLD_START_RATE_LIMITED_ERROR_CODE => COLD_START_RATE_LIMITED_ERROR_CODE,
+                // Terminal empty-output stamp (#3136): forwarded verbatim so
+                // buffered consumers see the same typed code the SSE path
+                // already streams. Same 500 / ``server_error`` / no-retry
+                // convention as the generic ``inference_error`` fallback.
+                oai_code::EMPTY_MODEL_OUTPUT => oai_code::EMPTY_MODEL_OUTPUT,
                 _ => "inference_error",
             };
             let mut body = json_openai_error(message.clone(), err_type, None, stable_code);
@@ -6558,10 +6628,21 @@ async fn resolve_generation_route(
             ProvisioningSurface::OpenAiCompat,
         ));
     };
-    let (bundle_config_hash, model_revision) =
-        state
-            .model_registry
-            .bundle_execution_evidence(&bundle, &hash_pool, dispatch_model);
+    let (bundle_config_hash, model_revision, uses_catalog_scope) = state
+        .model_registry
+        .bundle_execution_evidence(&bundle, &hash_pool, dispatch_model);
+    if !catalog_execution_hash_is_ready(&bundle_config_hash, uses_catalog_scope) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_openai_error(
+                "Model execution evidence is unavailable while configuration converges",
+                oai_type::SERVER_ERROR,
+                None,
+                oai_code::TRANSPORT_FAILURE,
+            )),
+        )
+            .into_response());
+    }
     // #1841: pin the sealed engine marker (see the top-of-fn note); a bundle-less
     // "sealed" bundle has no BundleInfo, so the else-branch would yield DEFAULT_ENGINE.
     let engine = match &sealed {
@@ -6959,7 +7040,7 @@ async fn proxy_chat_inner(
         // Vision capability gate. ``image_url`` content parts were decoded
         // into ``ChatMessage.images`` capability-agnostically (the model
         // wasn't resolved yet); reject here unless the model YAML declares
-        // ``inputs.image: true``. Mirrors the tools/grammar gates.
+        // ``inputs.image: true``. Mirrors the grammar validation gates.
         let has_images = params
             .messages
             .iter()
@@ -9431,7 +9512,17 @@ fn result_decode_error_value(r: &publisher::WorkResult, message: String) -> serd
     })
 }
 
-fn aggregate_score_usage(successful: &[&publisher::WorkResult]) -> Option<Value> {
+/// The `usage` block for an items-shaped queue response, summed from the
+/// workers' own authoritative [`publisher::UnitCounts`].
+///
+/// Serves `score` and `encode` alike: the two envelopes report the same shape
+/// from the same numbers, so a caller reading `usage` on either endpoint reads
+/// the post-tokenization count the worker measured — never a character
+/// estimate. `None` when ANY successful result lacks the dimension: a partial
+/// sum is not a measurement of the request, and omitting is the only honest
+/// rendering of "this path could not count". A unit of `0` is a measurement and
+/// is reported as such.
+fn aggregate_result_usage(successful: &[&publisher::WorkResult]) -> Option<Value> {
     if successful.is_empty() {
         return None;
     }
@@ -9474,8 +9565,12 @@ fn build_queue_success_body(
         "items"
     };
 
-    let usage = if endpoint == "score" {
-        aggregate_score_usage(successful)
+    // `encode` joins `score` here so the queue ingress reports the same
+    // authoritative counts the direct ingress puts on `EncodeResponse.usage`,
+    // and so the `/v1/embeddings` compatibility layer has a real number to
+    // render on both paths instead of a character estimate.
+    let usage = if endpoint == "score" || endpoint == "encode" {
+        aggregate_result_usage(successful)
     } else {
         None
     };
@@ -12094,6 +12189,47 @@ fn estimate_embedding_tokens(texts: &[String]) -> u64 {
     u64::max(1, (total / 4) as u64)
 }
 
+/// `usage.sie_token_source` — whether the emitted `/v1/embeddings` token count
+/// is the worker's exact post-tokenization number or the request-time
+/// character approximation. Reported because the two cannot be told apart from
+/// the numbers alone, and only one of them reconciles with a token bill.
+const USAGE_SOURCE_WORKER: &str = "worker";
+const USAGE_SOURCE_ESTIMATE: &str = "character_estimate";
+
+/// The authoritative token count the inner `/v1/encode` reply reported, if any.
+///
+/// Both encode ingresses now carry it: the direct one puts the worker's
+/// `input_token_counts` on `EncodeResponse.usage`, and the queue one aggregates
+/// the same numbers out of the workers' `UnitCounts`
+/// ([`aggregate_result_usage`]). `None` means neither could count, never that
+/// the count was zero — a measured `0` (a request that read no text) arrives
+/// here as `Some(0)` and is reported as `0`.
+fn encode_usage_input_tokens(encode_response: &Value) -> Option<u64> {
+    encode_response.get("usage")?.get("input_tokens")?.as_u64()
+}
+
+/// The `usage` block `/v1/embeddings` reports, from the encode reply the
+/// request actually produced.
+///
+/// The worker's exact count wins. When the encode reply carried none, the
+/// request-time character estimate is emitted rather than dropping `usage`
+/// altogether — a successful embedding must not turn into an error over a
+/// reporting field, and the `openai` client cannot parse a response without
+/// `usage` at all — but it is LABELLED `character_estimate`, so a caller
+/// reconciling `usage` against a token bill can see which of the two numbers
+/// they hold instead of silently trusting `chars / 4`.
+fn embeddings_usage(encode_response: &Value, estimated_tokens: u64) -> Value {
+    let (prompt_tokens, token_source) = match encode_usage_input_tokens(encode_response) {
+        Some(tokens) => (tokens, USAGE_SOURCE_WORKER),
+        None => (estimated_tokens, USAGE_SOURCE_ESTIMATE),
+    };
+    json!({
+        "prompt_tokens": prompt_tokens,
+        "total_tokens": prompt_tokens,
+        "sie_token_source": token_source,
+    })
+}
+
 /// The native `/v1/encode/{model}` body ONE `/v1/embeddings` request rewrites
 /// itself into before the in-process re-dispatch.
 ///
@@ -12512,12 +12648,12 @@ pub async fn proxy_openai_embeddings(State(state): State<Arc<AppState>>, req: Re
             );
         }
     };
-    let token_est = token_count;
+    let usage = embeddings_usage(&enc, token_count);
     let out = json!({
         "object": "list",
         "data": data,
         "model": model_str,
-        "usage": {"prompt_tokens": token_est, "total_tokens": token_est},
+        "usage": usage,
     });
     let mut out_resp = (StatusCode::OK, Json(out)).into_response();
     for (k, v) in enc_headers.iter() {
@@ -13039,8 +13175,7 @@ pub async fn proxy_moderations() -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
         Json(json_openai_error(
-            "the /v1/moderations endpoint is not implemented; no moderation model is configured. \
-             See product/research: Tier 0 abuse/content-safety work.",
+            "the /v1/moderations endpoint is not implemented; no moderation model is configured.",
             oai_type::SERVER_ERROR,
             None,
             "not_implemented",
@@ -13711,6 +13846,13 @@ mod tests {
     }
 
     #[test]
+    fn test_catalog_execution_hash_is_fail_closed_for_every_known_model() {
+        assert!(!catalog_execution_hash_is_ready("", true));
+        assert!(catalog_execution_hash_is_ready(&"a".repeat(64), true));
+        assert!(catalog_execution_hash_is_ready("", false));
+    }
+
+    #[test]
     fn test_execution_identity_header_requires_valid_unanimous_worker_proof() {
         let identity = "c".repeat(64);
         let matching: publisher::WorkResult = serde_json::from_value(json!({
@@ -13966,12 +14108,18 @@ mod tests {
             multi_router: false,
             request_timeout: 30.0,
             max_stream_pending: 1024,
+            max_lane_in_flight_items:
+                crate::queue::lane_admission::DEFAULT_MAX_LANE_IN_FLIGHT_ITEMS,
+            lane_backpressure_enforce: false,
             stream_max_age_s: 300,
+            stream_storage: crate::config::StreamStorage::Memory,
+            stream_num_replicas: 1,
             configured_gpus: vec!["l4".to_string()],
             gpu_profile_map,
             configured_physical_lanes: configured_physical_lanes.clone(),
             static_queue_pools: Vec::new(),
             model_aliases: std::collections::HashMap::new(),
+            published_model_aliases: Default::default(),
             bundles_dir: bundles_dir.path().to_string_lossy().to_string(),
             models_dir: models_dir.path().to_string_lossy().to_string(),
             config_service_url: None,
@@ -14098,14 +14246,31 @@ mod tests {
         (Arc::new(state), policy)
     }
 
-    struct EmptyGenerationRoutePolicy;
+    /// A policy that is installed but compiles no route at all, and records every
+    /// id it was asked about. The recording is what makes the #3441 ordering
+    /// observable: an unknown model must 404 without the policy ever being
+    /// consulted, and "was consulted" is not visible in the status code alone.
+    #[derive(Default)]
+    struct EmptyGenerationRoutePolicy {
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl EmptyGenerationRoutePolicy {
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().expect("asked lock").clone()
+        }
+    }
 
     impl crate::server::GenerationRoutePolicy for EmptyGenerationRoutePolicy {
         fn resolve(
             &self,
-            _customer_model: &str,
+            customer_model: &str,
             _intent: GenerationRequestIntent,
         ) -> Option<GovernedGenerationRoute> {
+            self.asked
+                .lock()
+                .expect("asked lock")
+                .push(customer_model.to_string());
             None
         }
     }
@@ -14391,7 +14556,7 @@ mod tests {
             }),
         );
 
-        let (bundle_hash, _) = state
+        let (bundle_hash, _, _) = state
             .model_registry
             .bundle_execution_evidence("default", "default", "org/g");
         let mut worker_profiles = profiles;
@@ -14684,7 +14849,7 @@ mod tests {
         pool_manager.create_default_pool().await;
         let mut state = admission_test_state(pool_manager);
         state.model_registry = Arc::new(grammar_routed_registry());
-        install_generation_policy(&mut state, Arc::new(EmptyGenerationRoutePolicy));
+        install_generation_policy(&mut state, Arc::new(EmptyGenerationRoutePolicy::default()));
         let state = Arc::new(state);
 
         let native = proxy_request(
@@ -14813,6 +14978,210 @@ mod tests {
             Ok(_) => panic!("incompatible compiled bundle must fail closed"),
             Err(response) => assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE),
         }
+    }
+
+    /// A governed managed deployment whose registry holds exactly one generation
+    /// model (`org/g`, with its `:no-spec` grammar variant) and whose installed
+    /// policy compiles no route at all — so every governed lookup that runs is a
+    /// miss, and a miss is a 503. Also carries an operator alias onto a model the
+    /// data plane does not have, so the alias spelling can be exercised too.
+    async fn governed_deployment_with_no_compiled_routes(
+    ) -> (Arc<AppState>, Arc<EmptyGenerationRoutePolicy>) {
+        let pool_manager = Arc::new(PoolManager::new(vec!["l4".to_string()]));
+        pool_manager.create_default_pool().await;
+        let mut state = admission_test_state(pool_manager);
+        state.model_registry = Arc::new(grammar_routed_registry());
+        let mut config = (*state.config).clone();
+        config
+            .model_aliases
+            .insert("retired".to_string(), "vendor/missing".to_string());
+        state.config = Arc::new(config);
+        let policy = Arc::new(EmptyGenerationRoutePolicy::default());
+        install_generation_policy(&mut state, policy.clone());
+        (Arc::new(state), policy)
+    }
+
+    fn openai_error(body: &serde_json::Value, path: &str) -> (String, String, String) {
+        let error = &body["error"];
+        for field in ["type", "code", "param"] {
+            assert!(
+                error[field].is_string(),
+                "{path}: OpenAI error envelope is missing `{field}`: {body}"
+            );
+        }
+        (
+            error["type"].as_str().expect("type").to_string(),
+            error["code"].as_str().expect("code").to_string(),
+            error["param"].as_str().expect("param").to_string(),
+        )
+    }
+
+    /// #3441 ordering lock on the NATIVE PUBLIC ROUTE: a model that does not
+    /// resolve in this data plane is answered `404 MODEL_NOT_FOUND` before the
+    /// governed `(customer_model, intent)` lookup can report its miss as a 503.
+    ///
+    /// Driven through `proxy_request`, not `governed_generation_route`: the
+    /// helper-level test proves a miss fails closed, which is precisely the
+    /// verdict that used to leak onto this route, so it cannot observe the
+    /// ordering. `policy.asked()` is the ordering evidence — the status code alone
+    /// cannot distinguish "404 first" from "asked, missed, then 404 anyway".
+    ///
+    /// The spellings cover the ways one absent id can reach the route: the SDK
+    /// `__` form (the prod-US 2026-08-14 report), percent-encoded and literal
+    /// slashes, case folding, a `:profile` suffix, an explicit `bundle:/` pin, and
+    /// an operator alias whose target is absent. Each runs with and without a
+    /// grammar block, because grammar is the other intent the governed key carries.
+    #[tokio::test]
+    async fn native_generate_unknown_model_404s_before_the_governed_lookup() {
+        let (state, policy) = governed_deployment_with_no_compiled_routes().await;
+        let bodies = [
+            serde_json::json!({"prompt": "hello", "max_new_tokens": 4}),
+            serde_json::json!({
+                "prompt": "hello",
+                "max_new_tokens": 4,
+                "grammar": {"json_schema": {"type": "object"}}
+            }),
+        ];
+
+        for path in [
+            "/v1/generate/Qwen__Qwen3-4B-Instruct-2507",
+            "/v1/generate/vendor%2Fmissing",
+            "/v1/generate/vendor/missing",
+            "/v1/generate/VENDOR__MISSING",
+            "/v1/generate/vendor%2Fmissing%3Ano-spec",
+            "/v1/generate/default%3A%2Fvendor%2Fmissing",
+            "/v1/generate/retired",
+        ] {
+            for body in &bodies {
+                let response = proxy_request(
+                    State(Arc::clone(&state)),
+                    json_request(path, body.clone()),
+                    "generate",
+                )
+                .await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "{path} must be terminally not-found, not a retryable 503"
+                );
+                let body = to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .expect("body");
+                let body: serde_json::Value = serde_json::from_slice(&body).expect("error JSON");
+                assert_eq!(
+                    openai_error(&body, path),
+                    (
+                        "model_not_found".to_string(),
+                        "model_not_found".to_string(),
+                        "model".to_string()
+                    ),
+                    "{path}"
+                );
+            }
+        }
+        assert!(
+            policy.asked().is_empty(),
+            "governed lookup ran for models this deployment does not have: {:?}",
+            policy.asked()
+        );
+
+        // The control, and the half of the contract this fix must NOT widen: a
+        // model the registry DOES have, whose governed route was never compiled,
+        // is deployment drift. It still fails closed as 503 — and the policy is
+        // consulted, which is what proves the 404 above is about absence and not
+        // about the governed step having been skipped wholesale.
+        let known = proxy_request(
+            State(Arc::clone(&state)),
+            json_request(
+                "/v1/generate/org%2Fg",
+                serde_json::json!({"prompt": "hello", "max_new_tokens": 4}),
+            ),
+            "generate",
+        )
+        .await;
+        assert_eq!(known.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(policy.asked(), vec!["org/g".to_string()]);
+    }
+
+    /// #2542 no-oracle rendering, carried onto the #3441 path: the governed
+    /// deployment's unknown-model 404 must be **byte-identical** to the one the
+    /// same registry gives with no policy installed. If the governed surface grew
+    /// its own wording, the response would tell a caller whether this deployment
+    /// governs generation at all.
+    #[tokio::test]
+    async fn governed_unknown_model_404_is_byte_identical_to_the_ungoverned_one() {
+        let path = "/v1/generate/Qwen__Qwen3-4B-Instruct-2507";
+        let body = serde_json::json!({"prompt": "hello", "max_new_tokens": 4});
+
+        let (governed_state, _policy) = governed_deployment_with_no_compiled_routes().await;
+        let governed = proxy_request(
+            State(governed_state),
+            json_request(path, body.clone()),
+            "generate",
+        )
+        .await;
+        assert_eq!(governed.status(), StatusCode::NOT_FOUND);
+
+        let (ungoverned_state, _) = governed_deployment_with_no_compiled_routes().await;
+        let mut ungoverned_state =
+            Arc::try_unwrap(ungoverned_state).unwrap_or_else(|_| panic!("unique test state"));
+        ungoverned_state.model_access_policy = None;
+        let ungoverned = proxy_request(
+            State(Arc::new(ungoverned_state)),
+            json_request(path, body),
+            "generate",
+        )
+        .await;
+        assert_eq!(ungoverned.status(), StatusCode::NOT_FOUND);
+
+        let governed = to_bytes(governed.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let ungoverned = to_bytes(ungoverned.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        assert_eq!(
+            String::from_utf8(governed.to_vec()).expect("utf8"),
+            String::from_utf8(ungoverned.to_vec()).expect("utf8"),
+            "governed and ungoverned not-found must be one response"
+        );
+    }
+
+    /// The OpenAI body-model route was already correct (`resolve_model_and_bundle`
+    /// runs before `resolve_generation_route`); this pins that the shared
+    /// `unknown_model_response` refactor kept it that way, on the same deployment
+    /// that exercises the native path above.
+    #[tokio::test]
+    async fn openai_body_model_keeps_model_not_found_under_a_governed_policy() {
+        let (state, policy) = governed_deployment_with_no_compiled_routes().await;
+        let chat = proxy_chat(
+            State(Arc::clone(&state)),
+            json_request(
+                "/v1/chat/completions",
+                serde_json::json!({
+                    "model": "Qwen__Qwen3-4B-Instruct-2507",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 4
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(chat.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(chat.into_body(), 64 * 1024).await.expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("error JSON");
+        assert_eq!(
+            openai_error(&body, "/v1/chat/completions"),
+            (
+                "model_not_found".to_string(),
+                "model_not_found".to_string(),
+                "model".to_string()
+            )
+        );
+        assert!(
+            policy.asked().is_empty(),
+            "governed lookup ran for an unknown OpenAI body model: {:?}",
+            policy.asked()
+        );
     }
 
     /// A #1841 test policy: reports `visible` per the flag and marks any
@@ -15421,6 +15790,21 @@ mod tests {
         assert!(
             state.demand_tracker.active_lanes().contains(&lane),
             "backpressure must record pending demand for KEDA"
+        );
+        state.demand_tracker.clear(&lane);
+
+        // A full work stream rejects the publish at the broker under
+        // `DiscardPolicy::New`; that is backpressure by another name, so it
+        // must earn the same Retry-After and KEDA demand signal.
+        let retry_full = record_publish_failure(
+            &state,
+            &lane,
+            "failed to publish: maximum messages exceeded",
+        );
+        assert_eq!(retry_full, Some(BACKPRESSURE_RETRY_AFTER));
+        assert!(
+            state.demand_tracker.active_lanes().contains(&lane),
+            "a stream-full rejection must record pending demand for KEDA"
         );
         state.demand_tracker.clear(&lane);
 
@@ -21009,8 +21393,7 @@ mod tests {
 
     /// ``n=1`` (the only currently-implemented value) parses and round-
     /// trips onto :class:`ChatRequestParams.n`. The wire shape is in
-    /// place; the chat-handler-side fan-out is the missing piece —
-    /// see ``product/research/generation-primitive-status.md`` §4.12 (n>1 deferred).
+    /// place; gateway-side fan-out for larger values remains deferred.
     #[test]
     fn test_chat_params_from_json_n_equals_one_ok() {
         let mut body = _chat_body_min("m");
@@ -22782,6 +23165,39 @@ mod tests {
         assert_eq!(v["error"]["code"], COLD_START_RATE_LIMITED_ERROR_CODE);
     }
 
+    /// The worker's typed ``empty_model_output`` terminal (#3136) must reach
+    /// buffered consumers verbatim — not flattened to the generic
+    /// ``inference_error`` fallback — with the same 500 / ``server_error`` /
+    /// no-Retry-After convention buffered inference errors already use
+    /// (terminal, not a capacity state).
+    #[tokio::test]
+    async fn test_streaming_empty_model_output_code_preserved_on_buffered_path() {
+        let err = StreamingDriverErr::WorkerError {
+            code: oai_code::EMPTY_MODEL_OUTPUT.to_string(),
+            message: "model produced no visible output text".to_string(),
+            request_id: "req-empty-1".to_string(),
+            attempt_id: "att-empty-1".to_string(),
+        };
+        let resp = build_streaming_error_response(&err);
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Terminal code: never a retry hint.
+        assert!(resp.headers().get("retry-after").is_none());
+        assert_eq!(
+            resp.headers().get("x-sie-request-id").unwrap(),
+            "req-empty-1"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], oai_type::SERVER_ERROR);
+        assert_eq!(v["error"]["code"], oai_code::EMPTY_MODEL_OUTPUT);
+        assert_eq!(v["error"]["attempt_id"], "att-empty-1");
+        // The retry classifier must keep treating it as terminal.
+        assert_eq!(worker_error_retry_after(oai_code::EMPTY_MODEL_OUTPUT), None);
+    }
+
     async fn assert_streaming_worker_error_is_retryable(
         code: &'static str,
         retry_after: &'static str,
@@ -22974,8 +23390,8 @@ mod tests {
         }
     }
 
-    fn successful_score_result(
-        scores: Value,
+    fn successful_item_result(
+        payload: Value,
         units: Option<publisher::UnitCounts>,
     ) -> publisher::WorkResult {
         publisher::WorkResult {
@@ -22983,7 +23399,7 @@ mod tests {
             request_id: "request".to_string(),
             item_index: 0,
             success: true,
-            result_msgpack: rmp_serde::to_vec_named(&scores).unwrap(),
+            result_msgpack: rmp_serde::to_vec_named(&payload).unwrap(),
             error: None,
             error_code: None,
             inference_ms: None,
@@ -23002,7 +23418,7 @@ mod tests {
 
     #[test]
     fn test_score_success_body_includes_authoritative_usage_json_and_msgpack() {
-        let result = successful_score_result(
+        let result = successful_item_result(
             json!([{"item_id": "0", "score": 0.75, "rank": 0}]),
             Some(publisher::UnitCounts {
                 input_tokens: Some(19),
@@ -23027,9 +23443,121 @@ mod tests {
         }
     }
 
+    /// The queue ingress reports the worker's own token count on `encode`, so
+    /// the two encode ingresses agree and `/v1/embeddings` has an exact number
+    /// to render on the managed path too.
+    #[test]
+    fn test_encode_success_body_includes_authoritative_usage_json_and_msgpack() {
+        let result = successful_item_result(
+            json!({"id": "0", "dense": {"dims": 2, "dtype": "float32", "values": [0.1, 0.2]}}),
+            Some(publisher::UnitCounts {
+                input_tokens: Some(19),
+                pages: None,
+                images: Some(2),
+                audio_ms: None,
+                pairs: None,
+                gpu_second: None,
+                output_tokens: None,
+            }),
+        );
+        for use_msgpack in [false, true] {
+            let body = build_queue_success_body("encode", "embedder", &[&result], use_msgpack);
+            let response: Value = if use_msgpack {
+                rmp_serde::from_slice(&body).unwrap()
+            } else {
+                serde_json::from_slice(&body).unwrap()
+            };
+            assert_eq!(response["usage"]["input_tokens"], 19);
+            assert_eq!(response["usage"]["images"], 2);
+            assert_eq!(response["items"][0]["id"], "0");
+        }
+    }
+
+    /// A worker that authoritatively read no text reports `0`, not a missing
+    /// dimension: zero is a measurement, and the caller is entitled to read it.
+    #[test]
+    fn test_encode_success_body_reports_an_authoritative_zero() {
+        let result = successful_item_result(
+            json!({"id": "0"}),
+            Some(publisher::UnitCounts {
+                input_tokens: Some(0),
+                pages: None,
+                images: Some(3),
+                audio_ms: None,
+                pairs: None,
+                gpu_second: None,
+                output_tokens: None,
+            }),
+        );
+        let body = build_queue_success_body("encode", "embedder", &[&result], false);
+        let response: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["usage"]["input_tokens"], 0);
+        assert_eq!(response["usage"]["images"], 3);
+    }
+
+    /// No units, no `usage`. Omission is the only honest rendering of "this
+    /// path could not count" — the alternative is an invented number.
+    #[test]
+    fn test_encode_success_body_omits_usage_without_worker_units() {
+        let result = successful_item_result(json!({"id": "0"}), None);
+        let body = build_queue_success_body("encode", "embedder", &[&result], false);
+        let response: Value = serde_json::from_slice(&body).unwrap();
+        assert!(response.get("usage").is_none());
+        assert_eq!(response["items"][0]["id"], "0");
+    }
+
+    /// `/v1/embeddings` reports the worker's count, NOT `chars / 4`.
+    ///
+    /// The estimate for this input is 12 (48 characters); the worker measured
+    /// 7. The endpoint that carries the most traffic must not be the one whose
+    /// `usage` disagrees with the bill.
+    #[test]
+    fn test_embeddings_usage_prefers_the_worker_count_over_the_estimate() {
+        let texts = vec!["x".repeat(48)];
+        let estimate = estimate_embedding_tokens(&texts);
+        assert_eq!(estimate, 12, "guard: the estimate is chars / 4");
+
+        let usage = embeddings_usage(&json!({"usage": {"input_tokens": 7}}), estimate);
+        assert_eq!(usage["prompt_tokens"], 7);
+        assert_eq!(usage["total_tokens"], 7);
+        assert_eq!(usage["sie_token_source"], "worker");
+    }
+
+    /// An authoritative zero survives the compat layer as `0` and stays
+    /// labelled exact — it must not fall through to the estimate, which can
+    /// never be zero (it floors at 1).
+    #[test]
+    fn test_embeddings_usage_reports_an_authoritative_zero() {
+        let usage = embeddings_usage(&json!({"usage": {"input_tokens": 0}}), 12);
+        assert_eq!(usage["prompt_tokens"], 0);
+        assert_eq!(usage["total_tokens"], 0);
+        assert_eq!(usage["sie_token_source"], "worker");
+    }
+
+    /// With no authoritative count the estimate is still emitted — dropping
+    /// `usage` would break every OpenAI client on a successful embedding — but
+    /// it says so.
+    #[test]
+    fn test_embeddings_usage_labels_the_character_estimate_fallback() {
+        for encode_response in [
+            json!({"items": []}),
+            json!({"usage": {}}),
+            json!({"usage": {"input_tokens": "seven"}}),
+            json!({"usage": null}),
+        ] {
+            let usage = embeddings_usage(&encode_response, 12);
+            assert_eq!(usage["prompt_tokens"], 12);
+            assert_eq!(usage["total_tokens"], 12);
+            assert_eq!(
+                usage["sie_token_source"], "character_estimate",
+                "an estimate presented as exact is the defect being fixed: {encode_response}",
+            );
+        }
+    }
+
     #[test]
     fn test_score_success_body_omits_unavailable_usage_fields() {
-        let result = successful_score_result(
+        let result = successful_item_result(
             json!([{"item_id": "0", "score": 0.75, "rank": 0}]),
             Some(publisher::UnitCounts {
                 input_tokens: Some(19),
@@ -23049,7 +23577,7 @@ mod tests {
 
     #[test]
     fn test_score_usage_aggregation_rejects_partial_worker_counts() {
-        let complete = successful_score_result(
+        let complete = successful_item_result(
             json!([]),
             Some(publisher::UnitCounts {
                 input_tokens: Some(19),
@@ -23061,7 +23589,7 @@ mod tests {
                 output_tokens: None,
             }),
         );
-        let missing_tokens = successful_score_result(
+        let missing_tokens = successful_item_result(
             json!([]),
             Some(publisher::UnitCounts {
                 input_tokens: None,
@@ -23073,12 +23601,12 @@ mod tests {
                 output_tokens: None,
             }),
         );
-        assert!(aggregate_score_usage(&[&complete, &missing_tokens]).is_none());
+        assert!(aggregate_result_usage(&[&complete, &missing_tokens]).is_none());
     }
 
     #[test]
     fn test_score_usage_aggregation_rejects_overflow() {
-        let maximum = successful_score_result(
+        let maximum = successful_item_result(
             json!([]),
             Some(publisher::UnitCounts {
                 input_tokens: Some(u64::MAX),
@@ -23090,7 +23618,7 @@ mod tests {
                 output_tokens: None,
             }),
         );
-        let one = successful_score_result(
+        let one = successful_item_result(
             json!([]),
             Some(publisher::UnitCounts {
                 input_tokens: Some(1),
@@ -23102,7 +23630,7 @@ mod tests {
                 output_tokens: None,
             }),
         );
-        assert!(aggregate_score_usage(&[&maximum, &one]).is_none());
+        assert!(aggregate_result_usage(&[&maximum, &one]).is_none());
     }
 
     #[test]
@@ -23643,7 +24171,7 @@ mod tests {
         for (marker, end, marked_constructor) in [
             (
                 "// From here the worker has already run and reported its units, so EVERY",
-                "let token_est = token_count;",
+                "let usage = embeddings_usage(&enc, token_count);",
                 "return compat_translation_fault(",
             ),
             (

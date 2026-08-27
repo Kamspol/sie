@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +17,8 @@ import httpx
 import msgpack
 import numpy as np
 import pytest
+from sie_sdk import SIEAsyncClient, SIEClient
+from sie_sdk.client._shared import url_origin_for_logging
 
 
 @pytest.fixture(autouse=True)
@@ -27,6 +30,17 @@ def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
         return None
 
     monkeypatch.setattr("sie_sdk.client.async_.asyncio.sleep", _noop_async_sleep)
+
+
+def _logged_origin(message: str) -> str:
+    """Extract the origin the retry WARNING reports.
+
+    The message is ``"... contacting <origin>, retrying in ..."``; returning
+    the exact token lets tests assert equality against the expected origin
+    instead of a URL substring-membership check (``"<url>" in message``),
+    which trips CodeQL's ``py/incomplete-url-substring-sanitization`` rule.
+    """
+    return message.split(" contacting ", 1)[1].split(",", 1)[0]
 
 
 def _mock_response_200() -> MagicMock:
@@ -566,6 +580,122 @@ class TestSyncTransportErrorRetryScoreExtract:
 
             assert mock_client.return_value.post.call_count == 1
             client.close()
+
+    @pytest.mark.usefixtures("_no_sleep")
+    def test_connect_retry_logging_first_warning_then_info(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The FIRST connect-retry surfaces at WARNING (naming the target URL
+        and the total wait budget) so a user at the default log level can see
+        the SDK is retrying instead of silently blocking for up to the whole
+        provision budget; subsequent retries stay at INFO (OOM convention).
+
+        Declares ``_no_sleep`` via ``usefixtures`` so the retry sleeps are
+        patched explicitly (the fixture is also module-autouse).
+        """
+        exc = httpx.ConnectError("Connection refused")
+        with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+            mock_client.return_value.post = MagicMock(side_effect=[exc, exc, _mock_response_200()])
+            client = SIEClient("http://localhost:8080")
+
+            with caplog.at_level(logging.INFO, logger="sie_sdk.client._shared"):
+                client.encode(
+                    "bge-m3",
+                    {"text": "hello"},
+                    wait_for_capacity=True,
+                    provision_timeout_s=10.0,
+                )
+
+            warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert len(warnings) == 1
+            message = warnings[0].getMessage()
+            assert _logged_origin(message) == "http://localhost:8080"
+            assert "timeout: 10.0s" in message
+            infos = [r for r in caplog.records if r.levelno == logging.INFO and "Connect error" in r.getMessage()]
+            assert len(infos) == 1
+            client.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("_no_sleep")
+    async def test_async_connect_retry_logging_first_warning_then_info(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Async mirror of the first-connect-retry WARNING convention.
+
+        Declares ``_no_sleep`` via ``usefixtures`` so the retry sleeps are
+        patched explicitly (the fixture is also module-autouse).
+        """
+        exc = TestAsyncTransportErrorRetry._make_connector_error()
+        client = SIEAsyncClient("http://localhost:8080")
+        client._post = AsyncMock(side_effect=[exc, exc, _async_response_200()])  # type: ignore
+
+        with caplog.at_level(logging.INFO, logger="sie_sdk.client._shared"):
+            await client.encode(
+                "bge-m3",
+                {"text": "hello"},
+                wait_for_capacity=True,
+                provision_timeout_s=10.0,
+            )
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert _logged_origin(message) == "http://localhost:8080"
+        assert "timeout: 10.0s" in message
+        infos = [r for r in caplog.records if r.levelno == logging.INFO and "Connect error" in r.getMessage()]
+        assert len(infos) == 1
+        await client.close()
+
+    # A base_url carrying credentials in userinfo AND a token query param —
+    # the log must leak neither. Only the scheme://host:port origin is logged.
+    _CREDENTIALED_BASE_URL = "https://user:s3cr3t-token@gateway.example.test:8443/v1?access_token=querysecret"
+
+    @pytest.mark.usefixtures("_no_sleep")
+    def test_connect_retry_warning_logs_origin_only(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A base_url carrying credentials/tokens must NOT leak them into logs.
+
+        The retry WARNING logs only the
+        ``scheme://host:port`` origin — no userinfo, no path, no query.
+        """
+        # The helper strips userinfo, path, and query — only the origin remains.
+        expected_origin = url_origin_for_logging(self._CREDENTIALED_BASE_URL)
+        assert expected_origin == "https://gateway.example.test:8443"
+
+        exc = httpx.ConnectError("Connection refused")
+        with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+            mock_client.return_value.post = MagicMock(side_effect=[exc, _mock_response_200()])
+            client = SIEClient(self._CREDENTIALED_BASE_URL)
+
+            with caplog.at_level(logging.INFO, logger="sie_sdk.client._shared"):
+                client.encode("bge-m3", {"text": "hello"}, wait_for_capacity=True, provision_timeout_s=10.0)
+
+            blob = "\n".join(r.getMessage() for r in caplog.records)
+            assert "s3cr3t-token" not in blob
+            assert "querysecret" not in blob
+            assert "user:" not in blob
+            assert "access_token" not in blob
+            warning = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+            assert _logged_origin(warning) == expected_origin
+            client.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("_no_sleep")
+    async def test_async_connect_retry_warning_logs_origin_only(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Async mirror: embedded credentials and query tokens must not reach the log."""
+        expected_origin = url_origin_for_logging(self._CREDENTIALED_BASE_URL)
+        assert expected_origin == "https://gateway.example.test:8443"
+
+        exc = TestAsyncTransportErrorRetry._make_connector_error()
+        client = SIEAsyncClient(self._CREDENTIALED_BASE_URL)
+        client._post = AsyncMock(side_effect=[exc, _async_response_200()])  # type: ignore
+
+        with caplog.at_level(logging.INFO, logger="sie_sdk.client._shared"):
+            await client.encode("bge-m3", {"text": "hello"}, wait_for_capacity=True, provision_timeout_s=10.0)
+
+        blob = "\n".join(r.getMessage() for r in caplog.records)
+        assert "s3cr3t-token" not in blob
+        assert "querysecret" not in blob
+        assert "user:" not in blob
+        assert "access_token" not in blob
+        warning = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+        assert _logged_origin(warning) == expected_origin
+        await client.close()
 
     def test_extract_fails_fast_on_permanent_connect_error(self) -> None:
         import ssl

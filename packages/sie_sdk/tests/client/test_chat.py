@@ -125,6 +125,32 @@ def test_chat_completions_parses_and_sends_json_shape() -> None:
         client.close()
 
 
+def test_chat_completions_consumes_modal_continuation_without_reposting() -> None:
+    payload = {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "m",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }
+    redirect = MagicMock(
+        status_code=303,
+        headers={"Location": "/v1/chat/completions?__modal_attempt_token=opaque"},
+        content=b"",
+    )
+    with patch("sie_sdk.client.sync.httpx.Client") as mc:
+        mc.return_value.post.return_value = redirect
+        mc.return_value.get.return_value = _ok_json(payload)
+        client = SIEClient("https://gateway.example.test")
+        out = client.chat_completions("m", [{"role": "user", "content": "hi"}])
+        client.close()
+
+    assert out["choices"][0]["message"]["content"] == "Hi"
+    assert mc.return_value.post.call_count == 1
+    assert mc.return_value.get.call_args.args[0] == "/v1/chat/completions?__modal_attempt_token=opaque"
+
+
 def test_stream_chat_completions_yields_chunks_and_sets_stream_flag() -> None:
     lines = _sse(_chat_chunk("He"), _chat_chunk("llo", finish="stop"))
     with patch("sie_sdk.client.sync.httpx.Client") as mc:
@@ -239,6 +265,121 @@ def test_stream_raises_server_error_on_error_chunk() -> None:
         with pytest.raises(ServerError) as ei:
             list(client.stream_generate("m", "hi", max_new_tokens=8))
         assert ei.value.code == "inference_error"
+        assert ei.value.request == {"id": "r"}
+        client.close()
+
+
+def test_stream_generate_surfaces_empty_model_output_code_and_request_id() -> None:
+    """#3136: the typed ``empty_model_output`` terminal (PR #3139) must reach
+    the caller as a distinguishable code plus the in-band gateway request id —
+    streamed responses carry no terminal headers, so the chunk is the only
+    source.
+    """
+    err = {
+        "request_id": "req-empty-1",
+        "seq": 0,
+        "text_delta": "",
+        "done": True,
+        "finish_reason": "error",
+        "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12},
+        "error": {"code": "empty_model_output", "message": "model produced no visible output text"},
+    }
+    with patch("sie_sdk.client.sync.httpx.Client") as mc:
+        mc.return_value.stream.return_value = _FakeStream(lines=_sse(err))
+        client = SIEClient("http://localhost:8080")
+        with pytest.raises(ServerError) as ei:
+            list(client.stream_generate("m", "hi", max_new_tokens=8))
+        assert ei.value.code == "empty_model_output"
+        assert ei.value.request == {"id": "req-empty-1"}
+        client.close()
+
+
+def test_stream_generate_drops_malformed_request_id() -> None:
+    """A non-ASCII / padded in-band id must be dropped before it reaches the
+    synthetic HTTP headers — HTTPX raises ``UnicodeEncodeError`` on non-ASCII
+    header values, which would bypass the typed-error path entirely (#3136).
+    """
+    err = {
+        "request_id": " r\u00e9q-bad ",
+        "seq": 0,
+        "text_delta": "",
+        "done": True,
+        "finish_reason": "error",
+        "error": {"code": "empty_model_output", "message": "model produced no visible output text"},
+    }
+    with patch("sie_sdk.client.sync.httpx.Client") as mc:
+        mc.return_value.stream.return_value = _FakeStream(lines=_sse(err))
+        client = SIEClient("http://localhost:8080")
+        with pytest.raises(ServerError) as ei:
+            list(client.stream_generate("m", "hi", max_new_tokens=8))
+        assert ei.value.code == "empty_model_output"
+        assert ei.value.request is None
+        client.close()
+
+
+def test_stream_generate_error_after_output_retains_request_id() -> None:
+    delta = {"request_id": "req-mid-1", "seq": 0, "text_delta": "Hi", "done": False}
+    err = {
+        "request_id": "req-mid-1",
+        "seq": 1,
+        "text_delta": "",
+        "done": True,
+        "finish_reason": "error",
+        "error": {"code": "inference_error", "message": "boom"},
+    }
+    with patch("sie_sdk.client.sync.httpx.Client") as mc:
+        mc.return_value.stream.return_value = _FakeStream(lines=_sse(delta, err))
+        client = SIEClient("http://localhost:8080")
+        with pytest.raises(ServerError) as ei:
+            list(client.stream_generate("m", "hi", max_new_tokens=8))
+        assert ei.value.code == "inference_error"
+        assert ei.value.request == {"id": "req-mid-1"}
+        client.close()
+
+
+def _chat_error_chunk(code: str, message: str, request_id: str) -> dict[str, Any]:
+    """Chat-shape stream error chunk as the gateway emits it (#3136): the
+    OpenAI envelope plus a top-level ``error`` block and the additive
+    ``request_id`` member (the ``chatcmpl-*`` id is not the correlation key
+    gateway logs use).
+    """
+    return {
+        "id": "chatcmpl-1",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "m",
+        "system_fingerprint": None,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": None, "logprobs": None}],
+        "error": {"message": message, "type": "server_error", "param": None, "code": code},
+        "request_id": request_id,
+    }
+
+
+def test_stream_chat_error_chunk_surfaces_request_id() -> None:
+    """#3136: a chat-shape stream error before any output must surface the
+    in-band gateway request id — streamed responses carry no terminal headers,
+    so the chunk is the only source.
+    """
+    err = _chat_error_chunk("first_chunk_timeout", "Generation aborted: first_chunk timeout", "req-chat-1")
+    with patch("sie_sdk.client.sync.httpx.Client") as mc:
+        mc.return_value.stream.return_value = _FakeStream(lines=_sse(err))
+        client = SIEClient("http://localhost:8080")
+        with pytest.raises(ServerError) as ei:
+            list(client.stream_chat_completions("m", [{"role": "user", "content": "hi"}]))
+        assert ei.value.code == "first_chunk_timeout"
+        assert ei.value.request == {"id": "req-chat-1"}
+        client.close()
+
+
+def test_stream_chat_error_after_output_retains_request_id() -> None:
+    err = _chat_error_chunk("inference_error", "boom", "req-chat-2")
+    with patch("sie_sdk.client.sync.httpx.Client") as mc:
+        mc.return_value.stream.return_value = _FakeStream(lines=_sse(_chat_chunk("Hi"), err))
+        client = SIEClient("http://localhost:8080")
+        with pytest.raises(ServerError) as ei:
+            list(client.stream_chat_completions("m", [{"role": "user", "content": "hi"}]))
+        assert ei.value.code == "inference_error"
+        assert ei.value.request == {"id": "req-chat-2"}
         client.close()
 
 

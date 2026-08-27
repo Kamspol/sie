@@ -10,11 +10,10 @@ depend on.
 Three invariants hold here:
 
 - **Bounded.** :data:`MAX_SAMPLED_FRAMES` caps the frames one item can ever
-  yield. The managed gateway reserves ``images`` for a video item from that
-  same constant (``VIDEO_MAX_SAMPLED_FRAMES`` in
-  ``packages/sie_cloud/gateway/src/dispatcher.rs``), and settlement rejects a
-  worker count above its reservation ceiling — so this budget is a billing
-  contract, deliberately NOT environment-tunable.
+  yield. The cluster admission layer mirrors the same constant when reserving
+  ``images`` for a video item, and settlement rejects a worker count above its
+  reservation ceiling — so this budget is a billing contract, deliberately
+  NOT environment-tunable.
 - **Fail-closed.** Every decode failure raises :class:`VideoDecodeError`
   (an :class:`~sie_server.types.inputs.InvalidInputError`, surfaced as
   ``INVALID_INPUT`` / HTTP 400 on both the HTTP and queue paths). A missing or
@@ -34,7 +33,7 @@ co-scheduled request. The residual costs are one seek per sampled frame
 containers that report no usable metadata, the one grab-only counting pass
 under :data:`_MAX_SCANNED_FRAMES`.
 
-TODO(#2433): move extraction off the inference executor entirely — decode in
+TODO: move extraction off the inference executor entirely — decode in
 per-item preprocessing (``EncodePipeline._prepare_batch``) and hand the frames
 to the adapter through ``PreparedItem.payload``, so the GPU thread only ever
 sees decoded frames. That needs a prepared-item payload the video-capable
@@ -58,9 +57,9 @@ from sie_server.types.inputs import InvalidInputError, media_bytes
 logger = logging.getLogger(__name__)
 
 # Billing contract — see the module docstring. Raising this without raising the
-# gateway's `VIDEO_MAX_SAMPLED_FRAMES` would let a settled frame count exceed
-# its reservation ceiling and turn a successful encode into a billing fault, so
-# it is a constant rather than an environment knob.
+# admission layer's mirrored budget would let a settled frame count exceed its
+# reservation ceiling and turn a successful encode into a billing fault, so it
+# is a constant rather than an environment knob.
 MAX_SAMPLED_FRAMES: Final[int] = 32
 
 
@@ -68,7 +67,7 @@ MAX_SAMPLED_FRAMES: Final[int] = 32
 # Generous by design — a minute of 1080p H.264 sits far below the byte cap.
 #
 # Unlike MAX_SAMPLED_FRAMES these ARE env knobs, but only LOWERING the byte cap
-# is meaningful behind the managed gateway: it mirrors this default as the
+# is meaningful behind a metered gateway: it mirrors this default as the
 # compile-time `METERED_VIDEO_INPUT_BYTE_CAP` and rejects an over-cap payload
 # pre-reservation, so raising SIE_MAX_VIDEO_BYTES past 256 MiB changes nothing
 # there and only widens what self-hosted deployments accept. The duration cap

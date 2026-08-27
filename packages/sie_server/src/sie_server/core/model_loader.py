@@ -136,6 +136,7 @@ class ModelLoader:
         max_batch_wait_ms: float | None = None,
         coalesce_ms: float | None = None,
         coalesce_ratio: float | None = None,
+        idle_coalesce_ms: float | None = None,
         max_queue_size: int | None = None,
         instrumentation: bool = False,
         max_loras_per_model: int = DEFAULT_MAX_LORAS,
@@ -162,6 +163,7 @@ class ModelLoader:
         self._max_batch_wait_ms = max_batch_wait_ms
         self._coalesce_ms = coalesce_ms
         self._coalesce_ratio = coalesce_ratio
+        self._idle_coalesce_ms = idle_coalesce_ms
         self._max_queue_size = max_queue_size
         self._instrumentation = instrumentation
         self._max_loras_per_model = max_loras_per_model
@@ -610,6 +612,9 @@ class ModelLoader:
             max_batch_requests=self._max_batch_requests or WorkerConfig().max_batch_requests,
             max_batch_wait_ms=self._max_batch_wait_ms or WorkerConfig().max_batch_wait_ms,
             coalesce_ms=self._coalesce_ms if self._coalesce_ms is not None else WorkerConfig().coalesce_ms,
+            idle_coalesce_ms=(
+                self._idle_coalesce_ms if self._idle_coalesce_ms is not None else WorkerConfig().idle_coalesce_ms
+            ),
             coalesce_ratio=self._coalesce_ratio if self._coalesce_ratio is not None else WorkerConfig().coalesce_ratio,
             max_queue_size=self._max_queue_size or WorkerConfig().max_queue_size,
             instrumentation=self._instrumentation,
@@ -830,6 +835,13 @@ def _raise_if_adapter_startup_timeout(name: str, started: float, exc: RuntimeErr
     from its subprocess health poll. Pattern-match on the message; narrow enough
     to not bucket genuine runtime failures as timeouts. Other adapters that grow
     their own startup timeouts should follow the same convention.
+
+    A child process that CRASHED during startup deliberately does not match:
+    the adapters raise the distinct "... process exited during startup" message
+    for that case, which stays a plain load failure. On the genuine-timeout
+    path ``timeout_s=elapsed`` below is an approximation that only holds
+    because the health poll ran the budget out (run 32945082497 showed the
+    old crash-as-timeout labeling reporting a 16.5s crash as configured=16s).
     """
     msg = str(exc).lower()
     if "failed to start within timeout" not in msg and "startup timeout" not in msg:

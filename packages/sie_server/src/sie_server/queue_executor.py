@@ -8,9 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
-import msgpack
 import msgspec
 import yaml
+from sie_sdk._msgpack import packb as pack_msgpack
 
 from sie_server.api.ws import compute_bundle_config_hash_cached
 from sie_server.config.model import ModelConfig
@@ -24,6 +24,7 @@ from sie_server.core.score_cost import build_score_prepared_items_timed
 from sie_server.core.timing import RequestTiming
 from sie_server.core.worker.handlers.extract import ExtractHandler
 from sie_server.core.worker.model_worker import PreformedExtractRequest, PreformedScoreRequest
+from sie_server.core.worker.types import WorkerDrainedError
 from sie_server.ipc_types import (
     ApplyModelConfigRequest,
     ApplyModelConfigResponse,
@@ -857,7 +858,7 @@ class QueueExecutor:
 
     @staticmethod
     def _options_key(options: dict[str, Any] | None) -> bytes:
-        return msgpack.packb(options, use_bin_type=True) if options else b""
+        return pack_msgpack(options, use_bin_type=True) if options else b""
 
     @staticmethod
     def _batch_profile(items: list[Any]) -> str:
@@ -926,7 +927,7 @@ class QueueExecutor:
             # rejects it just like the HTTP ingress. Only an absent value
             # receives the public dense default.
             output_types = tuple(bi.output_types) if bi.output_types is not None else ("dense",)
-            options_key = msgpack.packb(bi.options, use_bin_type=True) if bi.options else b""
+            options_key = pack_msgpack(bi.options, use_bin_type=True) if bi.options else b""
             key = (
                 output_types,
                 bi.instruction,
@@ -1146,7 +1147,7 @@ class QueueExecutor:
                         item_id = server_items[idx].id
                         if item_id is not None:
                             output = {"id": item_id, **output}
-                        result_msgpack = msgpack.packb(output, use_bin_type=True)
+                        result_msgpack = pack_msgpack(output, use_bin_type=True)
                     outcomes[bi.work_item_id] = ItemOutcome(
                         work_item_id=bi.work_item_id,
                         request_id=bi.request_id,
@@ -1943,7 +1944,7 @@ def _extract_success_outcome(
         # error instead of publishing an object the client reads as success.
         return _error_outcome(bi, _INFERENCE_ERROR_CODE, "adapter returned no extraction results")
     item_id = server_item.id if server_item.id is not None else f"item-{bi.item_index}"
-    result_msgpack = msgpack.packb({**extraction_results[0], "id": item_id}, use_bin_type=True)
+    result_msgpack = pack_msgpack({**extraction_results[0], "id": item_id}, use_bin_type=True)
 
     return ItemOutcome(
         work_item_id=bi.work_item_id,
@@ -1991,6 +1992,14 @@ def _inference_exception_outcome(
 ) -> ItemOutcome:
     if is_oom_error(exc):
         return _oom_nak_outcome(bi)
+    if isinstance(exc, WorkerDrainedError):
+        # The model was evicted before this item ran. Same answer as the
+        # "model evicted mid-batch" checks above: NAK so the work is
+        # redelivered, rather than publishing a terminal ``inference_error``
+        # for work that never started. The sidecar's preformed path does not
+        # park items in a batcher today, so this arm is a contract guard
+        # against a future caller that submits through the queueing path.
+        return _nak_outcome(bi)
     if isinstance(exc, (InvalidInputError, msgspec.ValidationError)):
         # A typed-decode failure (decode_item) or a media contract violation;
         # both surface as INVALID_INPUT (HTTP 400), matching the HTTP path.

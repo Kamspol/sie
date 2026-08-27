@@ -101,7 +101,7 @@ describe("SIEClient.generate", () => {
     const [url, init] = mockFetch.mock.calls[0];
     expect(url).toBe("http://localhost:8080/v1/generate/m");
     expect(init.method).toBe("POST");
-    expect(init.redirect).toBe("error");
+    expect(init.redirect).toBe("manual");
     expect(init.headers["Content-Type"]).toBe("application/json");
     expect(init.headers.Accept).toBe("application/json");
     const body = JSON.parse(init.body);
@@ -359,19 +359,64 @@ describe("SIEClient.generate retry semantics (B1c)", () => {
     expect(mockFetch).toHaveBeenCalledOnce();
   });
 
-  it("refuses redirects as a terminal single-shot transport error", async () => {
-    const client = new SIEClient("http://localhost:8080", {
+  it.each([
+    "https://redirect.example/private-token?__modal_attempt_token=opaque",
+    "https://gateway.example.test.attacker.example/result?__modal_attempt_token=opaque",
+    "http://gateway.example.test/result?__modal_attempt_token=opaque",
+    "https://user@gateway.example.test/result?__modal_attempt_token=opaque",
+    "/result",
+    "/result?__modal_attempt_token=one&__modal_attempt_token=two",
+    "/result?__modal_attempt_token=opaque#fragment",
+  ])("refuses an unsafe continuation without following or reposting: %s", async (location) => {
+    const client = new SIEClient("https://gateway.example.test", {
       timeout: 30_000,
       provisionTimeout: 60_000,
     });
-    mockFetch.mockRejectedValueOnce(new TypeError("fetch failed"));
+    mockFetch.mockResolvedValueOnce(
+      new Response(null, {
+        status: 303,
+        headers: { Location: location },
+      }),
+    );
 
     await expect(
       client.generate("m", "hi", { maxNewTokens: 8, waitForCapacity: true }),
-    ).rejects.toBeInstanceOf(SIEConnectionError);
+    ).rejects.toBeInstanceOf(ServerError);
 
     expect(mockFetch).toHaveBeenCalledOnce();
-    expect(mockFetch.mock.calls[0]?.[1].redirect).toBe("error");
+    expect(mockFetch.mock.calls[0]?.[1].redirect).toBe("manual");
+  });
+
+  it("consumes a same-origin Modal continuation by GET without reposting", async () => {
+    mockFetch
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 303,
+          headers: { Location: "/v1/generate/m?__modal_attempt_token=opaque" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          model: "m",
+          text: "ok",
+          finish_reason: "stop",
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          attempt_id: "a",
+        }),
+      );
+
+    const client = new SIEClient("https://gateway.example.test", { apiKey: "secret" });
+    const result = await client.generate("m", "hi", { maxNewTokens: 8 });
+
+    expect(result.text).toBe("ok");
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch.mock.calls[0]?.[1].method).toBe("POST");
+    expect(mockFetch.mock.calls[1]?.[0]).toBe(
+      "https://gateway.example.test/v1/generate/m?__modal_attempt_token=opaque",
+    );
+    expect(mockFetch.mock.calls[1]?.[1].method).toBe("GET");
+    expect(mockFetch.mock.calls[1]?.[1].headers.Authorization).toBe("Bearer secret");
+    expect(mockFetch.mock.calls[1]?.[1].redirect).toBe("manual");
   });
 
   it("does NOT retry a mid-flight TypeError when waitForCapacity is false", async () => {

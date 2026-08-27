@@ -1572,23 +1572,39 @@ impl ModelRegistry {
     /// Return the routing hash and immutable model revision from one registry
     /// snapshot. Keeping these values in one read is required for response
     /// provenance: a config delta must not pair hash A with revision B.
+    ///
+    /// The supplied pool is the physical/admission fallback for an unknown
+    /// (for example sealed) model. A catalog model always scopes its hash to
+    /// the pool declared by that model, independently of the physical queue
+    /// selected for dispatch. This keeps dedicated physical lanes from
+    /// accidentally turning config-hash enforcement into an empty wildcard.
+    /// The scope bit reports whether the hash is governed by a known catalog
+    /// model. Proxy paths use it to reject a missing known hash instead of
+    /// treating it as the legacy unknown/sealed wildcard.
     pub fn bundle_execution_evidence(
         &self,
         bundle_id: &str,
         pool_name: &str,
         model: &str,
-    ) -> (String, Option<String>) {
+    ) -> (String, Option<String>, bool) {
         let snap = self.snapshot.load();
+        let canonical = Self::canonical_model_name(&snap, model);
+        let uses_catalog_scope = canonical.is_some();
+        let pool_name = canonical
+            .as_ref()
+            .and_then(|canonical| snap.models.get(canonical))
+            .map(Self::entry_pool_name)
+            .unwrap_or(pool_name);
         let pool_name = Self::normalize_pool_name(pool_name);
         let bundle_config_hash = snap
             .bundle_pool_config_hashes
             .get(&(bundle_id.to_string(), pool_name))
             .cloned()
             .unwrap_or_default();
-        let revision = Self::canonical_model_name(&snap, model)
+        let revision = canonical
             .and_then(|canonical| snap.models.get(&canonical))
             .and_then(Self::immutable_model_revision);
-        (bundle_config_hash, revision)
+        (bundle_config_hash, revision, uses_catalog_scope)
     }
 
     /// Resolve one connector encode identity from a single registry snapshot.
@@ -4988,7 +5004,7 @@ profiles:
         )
         .unwrap();
         let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
-        let (first, first_revision) =
+        let (first, first_revision, _) =
             registry.bundle_execution_evidence("default", "default", "org/revisioned");
         assert_eq!(
             first_revision.as_deref(),
@@ -5020,7 +5036,7 @@ profiles:
             registry.get_model_revision("org/revisioned").as_deref(),
             Some("89abcdef0123456789abcdef0123456789abcdef")
         );
-        let (second, second_revision) =
+        let (second, second_revision, _) =
             registry.bundle_execution_evidence("default", "default", "org/revisioned");
         assert_ne!(first, second);
         assert_eq!(
@@ -5112,6 +5128,25 @@ profiles:
             registry.compute_bundle_config_hash_for_pool("default", "customer-a"),
             tenant_hash
         );
+
+        let (tenant_execution_hash, _, uses_catalog_scope) = registry.bundle_execution_evidence(
+            "default",
+            "dedicated-physical-queue",
+            "tenant/model",
+        );
+        assert_eq!(tenant_execution_hash, tenant_hash);
+        assert!(!tenant_execution_hash.is_empty());
+        assert!(uses_catalog_scope);
+
+        let (default_execution_hash, _, uses_catalog_scope) =
+            registry.bundle_execution_evidence("default", "qwen4b-benchmark", "default/model");
+        assert_eq!(default_execution_hash, default_hash);
+        assert!(uses_catalog_scope);
+
+        let (unknown_execution_hash, _, uses_catalog_scope) =
+            registry.bundle_execution_evidence("default", "qwen4b-benchmark", "org/sealed-unknown");
+        assert!(unknown_execution_hash.is_empty());
+        assert!(!uses_catalog_scope);
     }
 
     #[test]

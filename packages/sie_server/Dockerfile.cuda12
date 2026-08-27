@@ -165,7 +165,7 @@ RUN .venv/bin/python -m sie_server.cli resolve-deps \
 #
 # Per-bundle CUDA wheel index. SGLang's sgl-kernel/flashinfer wheels live on the
 # docs.sglang.ai cu129 index (not PyPI), so the SGLang-family bundles add it.
-# The gemma bundle (sglang 0.5.13 / torch 2.11 / cu130, CUDA 13) is built by the
+# The sglang-cu130 bundle (sglang 0.5.13 / torch 2.11 / cu130, CUDA 13) is built by the
 # separate ``cuda13`` platform — see Dockerfile.cuda13 — not here.
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cache/uv \
@@ -216,9 +216,9 @@ ENV CUDA_HOME=/usr/local/cuda \
     LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
 FROM runtime-sglang AS runtime-sglang-embedding
 FROM runtime-sglang AS runtime-sglang-vision-extract
-# NOTE: the gemma bundle (CUDA 13 / sglang 0.5.13 / torch 2.11 cu130) is built by
+# NOTE: the sglang-cu130 bundle (CUDA 13 / sglang 0.5.13 / torch 2.11 cu130) is built by
 # the separate ``cuda13`` platform — packages/sie_server/Dockerfile.cuda13 — so
-# this CUDA-12 image never produces a (mislabelled) CUDA-13 ``cuda12-gemma``
+# this CUDA-12 image never produces a (mislabelled) CUDA-13 ``cuda12-sglang-cu130``
 # image. See #1415.
 
 FROM runtime-${BUNDLE} AS runtime
@@ -294,7 +294,8 @@ COPY --link --from=base --chown=1000:1000 /app/bundles /app/bundles
 # A `.pth` file in the shared venv puts /app/bundle-libs at sys.path[0] at startup.
 COPY --link --from=builder --chown=1000:1000 /app/bundle-libs /app/bundle-libs
 
-RUN mkdir -p /app/evals /app/.cache/huggingface && chown -R sie:sie /app/evals /app/.cache
+RUN mkdir -p /app/evals /app/.cache/huggingface /app/.cache/sie-kernels \
+    && chown -R sie:sie /app/evals /app/.cache
 
 # Declare the BUNDLE arg only here, where it is first used (LABEL + ENV),
 # so every RUN/COPY layer above is bundle-agnostic in its cache key and the
@@ -309,6 +310,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     HF_HOME=/app/.cache/huggingface \
+    SIE_SGLANG_KERNEL_CACHE_ROOT=/app/.cache/sie-kernels \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     SIE_BUNDLE="${BUNDLE}"

@@ -11,9 +11,10 @@ import json
 from collections.abc import AsyncIterator, Callable
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
+import numpy as np
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -22,6 +23,9 @@ from sie_server.adapters.mlx.generation import MLXGenerationAdapter
 from sie_server.adapters.sglang.generation import SGLangGenerationAdapter
 from sie_server.api import openai_local
 from sie_server.api.openai_local import _validate_mlx_seed, router
+from sie_server.core.inference_output import ScoreOutput
+from sie_server.core.timing import RequestTiming
+from sie_server.core.worker import WorkerResult
 
 _GEMMA_OPEN = "<" + "|channel" + ">" + "thought\n"
 _GEMMA_CLOSE = "<" + "channel|" + ">"
@@ -156,13 +160,13 @@ def test_chat_requires_object_body() -> None:
 def test_chat_requires_model() -> None:
     r = _client().post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 400
-    assert r.json()["detail"]["param"] == "model"
+    assert r.json()["error"]["param"] == "model"
 
 
 def test_chat_requires_nonempty_messages() -> None:
     r = _client().post("/v1/chat/completions", json={"model": "m", "messages": []})
     assert r.status_code == 400
-    assert r.json()["detail"]["param"] == "messages"
+    assert r.json()["error"]["param"] == "messages"
 
 
 @pytest.mark.parametrize(
@@ -185,7 +189,7 @@ def test_chat_rejects_malformed_message_structure_before_model_load(
     response = client.post("/v1/chat/completions", json={"model": "Qwen/Qwen3.5-4B", "messages": messages})
 
     assert response.status_code == 400
-    assert response.json()["detail"]["param"] == param
+    assert response.json()["error"]["param"] == param
     registry.get_config.assert_not_called()
     registry.get.assert_not_called()
 
@@ -199,14 +203,14 @@ def test_chat_rejects_non_generation_model_before_load() -> None:
         "/v1/chat/completions", json={"model": "embed-model", "messages": [{"role": "user", "content": "hi"}]}
     )
     assert r.status_code == 400
-    assert "generation" in r.json()["detail"]["message"].lower()
+    assert "generation" in r.json()["error"]["message"].lower()
 
 
 def test_chat_rejects_non_bool_stream() -> None:
     msgs = [{"role": "user", "content": "hi"}]
     r = _client().post("/v1/chat/completions", json={"model": "m", "messages": msgs, "stream": "false"})
     assert r.status_code == 400
-    assert r.json()["detail"]["param"] == "stream"
+    assert r.json()["error"]["param"] == "stream"
 
 
 def test_chat_rejects_invalid_max_tokens() -> None:
@@ -214,7 +218,7 @@ def test_chat_rejects_invalid_max_tokens() -> None:
     for bad in (0, -5, "100", True):
         r = _client().post("/v1/chat/completions", json={"model": "m", "messages": msgs, "max_tokens": bad})
         assert r.status_code == 400, bad
-        assert r.json()["detail"]["param"] == "max_tokens"
+        assert r.json()["error"]["param"] == "max_tokens"
 
 
 @pytest.mark.parametrize(
@@ -231,10 +235,11 @@ def test_chat_rejects_invalid_seed(bad: object, message: str) -> None:
     msgs = [{"role": "user", "content": "hi"}]
     r = _client().post("/v1/chat/completions", json={"model": "m", "messages": msgs, "seed": bad})
     assert r.status_code == 400, bad
-    assert r.json()["detail"] == {
+    assert r.json()["error"] == {
         "code": "INVALID_INPUT",
         "message": message,
         "param": "seed",
+        "type": "invalid_request_error",
     }
 
 
@@ -369,10 +374,11 @@ def test_mlx_chat_rejects_child_process_controls_before_model_load(
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"] == {
+    assert response.json()["error"] == {
         "code": "unsupported_field",
         "message": "field 'draft_model' is not supported",
         "param": "draft_model",
+        "type": "invalid_request_error",
     }
     registry.is_loaded.assert_not_called()
     registry.get.assert_not_called()
@@ -407,8 +413,8 @@ def test_chat_rejects_unbounded_template_kwargs_before_model_load(
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"]["code"] == code
-    assert response.json()["detail"]["param"] == "chat_template_kwargs"
+    assert response.json()["error"]["code"] == code
+    assert response.json()["error"]["param"] == "chat_template_kwargs"
     registry.is_loaded.assert_not_called()
     registry.get.assert_not_called()
 
@@ -805,10 +811,11 @@ def test_cuda_chat_rejects_engine_control_and_output_above_model_cap(
         json={"model": "Qwen/Qwen3.5-4B", "messages": messages, "routed_dp_rank": 2},
     )
     assert response.status_code == 400
-    assert response.json()["detail"] == {
+    assert response.json()["error"] == {
         "code": "unsupported_field",
         "message": "field 'routed_dp_rank' is not supported",
         "param": "routed_dp_rank",
+        "type": "invalid_request_error",
     }
 
     response = client.post(
@@ -816,7 +823,7 @@ def test_cuda_chat_rejects_engine_control_and_output_above_model_cap(
         json={"model": "Qwen/Qwen3.5-4B", "messages": messages, "max_completion_tokens": 33},
     )
     assert response.status_code == 400
-    assert response.json()["detail"]["param"] == "max_completion_tokens"
+    assert response.json()["error"]["param"] == "max_completion_tokens"
 
 
 def test_mlx_chat_rejects_output_above_model_cap(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -837,7 +844,7 @@ def test_mlx_chat_rejects_output_above_model_cap(monkeypatch: pytest.MonkeyPatch
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"]["param"] == "max_completion_tokens"
+    assert response.json()["error"]["param"] == "max_completion_tokens"
 
 
 def test_cuda_chat_rejects_remote_media_before_model_load(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -865,7 +872,7 @@ def test_cuda_chat_rejects_remote_media_before_model_load(monkeypatch: pytest.Mo
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"]["param"] == "messages[0].content[1].image_url"
+    assert response.json()["error"]["param"] == "messages[0].content[1].image_url"
     registry.get.assert_not_called()
 
 
@@ -924,13 +931,13 @@ def test_cuda_chat_preserves_visible_logprobs_when_reasoning_is_null(
 def test_rerank_requires_model() -> None:
     r = _client().post("/v1/rerank", json={"query": "q", "documents": ["a"]})
     assert r.status_code == 400
-    assert r.json()["detail"]["param"] == "model"
+    assert r.json()["error"]["param"] == "model"
 
 
 def test_rerank_requires_query() -> None:
     r = _client().post("/v1/rerank", json={"model": "m", "documents": ["a"]})
     assert r.status_code == 400
-    assert r.json()["detail"]["param"] == "query"
+    assert r.json()["error"]["param"] == "query"
 
 
 def test_rerank_rejects_blank_model_and_query() -> None:
@@ -940,37 +947,185 @@ def test_rerank_rejects_blank_model_and_query() -> None:
     ]:
         r = _client().post("/v1/rerank", json=body)
         assert r.status_code == 400
-        assert r.json()["detail"]["param"] == param
+        assert r.json()["error"]["param"] == param
 
 
 def test_rerank_requires_nonempty_string_documents() -> None:
     for docs in ([], "not-a-list", [1, 2], ["ok", 3], ["   "]):
         r = _client().post("/v1/rerank", json={"model": "m", "query": "q", "documents": docs})
         assert r.status_code == 400, docs
-        assert r.json()["detail"]["param"] == "documents"
+        assert r.json()["error"]["param"] == "documents"
 
 
 def test_rerank_top_n_must_be_positive_int() -> None:
     for bad in (0, -1, "3", True):
         r = _client().post("/v1/rerank", json={"model": "m", "query": "q", "documents": ["a"], "top_n": bad})
         assert r.status_code == 400, bad
-        assert r.json()["detail"]["param"] == "top_n"
+        assert r.json()["error"]["param"] == "top_n"
 
 
 def test_rerank_rejects_too_many_documents() -> None:
     docs = ["d"] * (openai_local._MAX_RERANK_DOCS + 1)
     r = _client().post("/v1/rerank", json={"model": "m", "query": "q", "documents": docs})
     assert r.status_code == 400
-    assert r.json()["detail"]["param"] == "documents"
+    assert r.json()["error"]["param"] == "documents"
 
 
 def test_rerank_rejects_non_bool_return_documents() -> None:
     r = _client().post("/v1/rerank", json={"model": "m", "query": "q", "documents": ["a"], "return_documents": "true"})
     assert r.status_code == 400
-    assert r.json()["detail"]["param"] == "return_documents"
+    assert r.json()["error"]["param"] == "return_documents"
 
 
 def test_rerank_rejects_unknown_fields() -> None:
     r = _client().post("/v1/rerank", json={"model": "m", "query": "q", "documents": ["a"], "priority": 1})
     assert r.status_code == 400
-    assert r.json()["detail"]["param"] == "priority"
+    assert r.json()["error"]["param"] == "priority"
+
+
+# -- top-level OpenAI error envelope (no {"detail": ...} wrapper) -------------
+
+
+def test_chat_unknown_model_returns_top_level_openai_error() -> None:
+    client = _client()
+    client.app.state.registry.has_model.return_value = False
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "missing-model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 404
+    body = r.json()
+    assert "detail" not in body
+    error = body["error"]
+    assert error["code"] == "MODEL_NOT_FOUND"
+    assert error["type"] == "invalid_request_error"
+    assert "message" in error
+
+
+def test_chat_invalid_input_returns_top_level_openai_error() -> None:
+    r = _client().post("/v1/chat/completions", json={"model": "m", "messages": []})
+    assert r.status_code == 400
+    body = r.json()
+    assert "detail" not in body
+    error = body["error"]
+    assert error["param"] == "messages"
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "INVALID_INPUT"
+    assert "message" in error
+
+
+def test_chat_unloading_model_returns_top_level_openai_server_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, registry = _cuda_chat_client(
+        monkeypatch,
+        lambda _request: pytest.fail("unloading model must not reach upstream"),
+    )
+    registry.is_unloading.return_value = True
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "Qwen/Qwen3.5-4B", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 503
+    body = r.json()
+    assert "detail" not in body
+    error = body["error"]
+    assert error["code"] == "MODEL_NOT_LOADED"
+    assert error["type"] == "server_error"
+    assert "message" in error
+
+
+def _rerank_client() -> tuple[TestClient, MagicMock]:
+    """Rerank client whose registry passes all model-state checks."""
+    profile = SimpleNamespace(runtime={}, loadtime={})
+    config = SimpleNamespace(
+        tasks=SimpleNamespace(generate=None, score=SimpleNamespace()),
+        resolve_profile=MagicMock(return_value=profile),
+    )
+    registry = MagicMock()
+    registry.device = "cpu"
+    registry.has_model.return_value = True
+    registry.get_config.return_value = config
+    registry.is_failed.return_value = False
+    registry.is_unloading.return_value = False
+    registry.is_loading.return_value = False
+    registry.is_loaded.return_value = True
+    client = _client()
+    client.app.state.registry = registry
+    return client, registry
+
+
+def test_rerank_unknown_model_returns_top_level_openai_error() -> None:
+    client = _client()
+    client.app.state.registry.has_model.return_value = False
+    r = client.post("/v1/rerank", json={"model": "missing-model", "query": "q", "documents": ["a"]})
+    assert r.status_code == 404
+    body = r.json()
+    assert "detail" not in body
+    error = body["error"]
+    assert error["code"] == "MODEL_NOT_FOUND"
+    assert error["type"] == "invalid_request_error"
+    assert "message" in error
+
+
+def test_rerank_invalid_input_returns_top_level_openai_error() -> None:
+    r = _client().post("/v1/rerank", json={"model": "m", "query": "q", "documents": []})
+    assert r.status_code == 400
+    body = r.json()
+    assert "detail" not in body
+    error = body["error"]
+    assert error["param"] == "documents"
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "INVALID_INPUT"
+    assert "message" in error
+
+
+def test_rerank_inference_error_returns_top_level_openai_500() -> None:
+    client, registry = _rerank_client()
+
+    async def _boom() -> None:
+        raise RuntimeError("boom")
+
+    worker = MagicMock()
+    worker.submit_score = AsyncMock(return_value=_boom())
+    registry.start_worker = AsyncMock(return_value=worker)
+
+    r = client.post("/v1/rerank", json={"model": "m", "query": "q", "documents": ["a"]})
+    assert r.status_code == 500
+    body = r.json()
+    assert "detail" not in body
+    error = body["error"]
+    assert error["code"] == "inference_error"
+    assert error["type"] == "server_error"
+    assert error["message"] == "boom"
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_rerank_non_finite_scores_return_top_level_openai_500(bad: float) -> None:
+    """NaN/inf model scores fail closed as an enveloped 500 naming the model.
+
+    Regression for pass-2 audit A2: on this JSON-only surface a NaN score
+    crashed json.dumps ("Out of range float values are not JSON compliant")
+    into a bare, un-enveloped 500 with no OpenAI error object.
+    """
+    client, registry = _rerank_client()
+
+    async def _result() -> WorkerResult:
+        return WorkerResult(
+            output=ScoreOutput(scores=np.array([0.9, bad], dtype=np.float32)),
+            timing=RequestTiming(),
+        )
+
+    worker = MagicMock()
+    worker.submit_score = AsyncMock(return_value=_result())
+    registry.start_worker = AsyncMock(return_value=worker)
+
+    r = client.post("/v1/rerank", json={"model": "m", "query": "q", "documents": ["a", "b"]})
+    assert r.status_code == 500
+    body = r.json()
+    assert "detail" not in body  # enveloped OpenAI error, not FastAPI's {"detail": ...}
+    error = body["error"]
+    assert error["code"] == "INFERENCE_ERROR"
+    assert error["type"] == "server_error"
+    assert "m" in error["message"]
+    assert "non-finite" in error["message"]

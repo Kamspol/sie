@@ -1,4 +1,4 @@
-"""MCP-backed document offload jobs adapted from the PR #1336 sie_tools skills."""
+"""MCP-backed document offload jobs."""
 
 from __future__ import annotations
 
@@ -110,7 +110,7 @@ async def summarize_document(
     gpu: str | None = None,
     max_output_tokens: int = SUMMARY_REDUCE_MAX_TOKENS,
 ) -> dict[str, Any]:
-    """Summarize content on the SIE cluster using the PR #1336 map-reduce flow."""
+    """Summarize content on the SIE cluster using a bounded map-reduce flow."""
     if not content.strip():
         raise OffloadError("content contains no text to summarize")
 

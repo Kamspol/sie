@@ -1,13 +1,13 @@
 # syntax=docker/dockerfile:1
-# SIE Server - CUDA 13 Image (Gemma 4 / cu130 bundles)
+# SIE Server - CUDA 13 Image (SGLang cu130 bundles)
 # Build from repo root:
-#   docker build -f packages/sie_server/Dockerfile.cuda13 --build-arg BUNDLE=gemma -t sie-server:cuda13-gemma .
+#   docker build -f packages/sie_server/Dockerfile.cuda13 --build-arg BUNDLE=sglang-cu130 -t sie-server:cuda13-sglang-cu130 .
 #
-# WHY A SEPARATE PLATFORM: the gemma bundle needs sglang 0.5.13, which pins
+# WHY A SEPARATE PLATFORM: the sglang-cu130 bundle needs sglang 0.5.13, which pins
 # torch==2.11.0 (cu130) + transformers 5.8.x and JIT-compiles cu130 kernels
 # (flashinfer / tvm_ffi) through nvcc on first decode — so it requires a CUDA 13
 # devel runtime. Keeping it here (platform ``cuda13``) instead of inside
-# Dockerfile.cuda12 means a ``cuda13-gemma`` image is honestly labelled CUDA 13,
+# Dockerfile.cuda12 means a ``cuda13-sglang-cu130`` image is honestly labelled CUDA 13,
 # not a CUDA-13 image hiding under a ``cuda12-*`` tag (see #1415).
 #
 # STRUCTURE: mirrors Dockerfile.cuda12's deps→base→builder→runtime stages so the
@@ -18,18 +18,18 @@
 # cu130 bundle), so there is no per-bundle runtime indirection.
 #
 # DUAL-TORCH CARRY: the shared base venv still installs torch 2.9 (cu129) from
-# pyproject, and the gemma bundle overlays torch 2.11 (cu130) into bundle-libs
+# pyproject, and the sglang-cu130 bundle overlays torch 2.11 (cu130) into bundle-libs
 # (~+3 GB). Slimming torch out of sie-server core to drop the carry is a tracked
 # follow-up (#1415).
 
-ARG BUNDLE=gemma
+ARG BUNDLE=sglang-cu130
 ARG UV_VERSION=0.9.28
 
-# Build the internal Rust extension from checked-in source; it is not published
+# Build the native Rust extension from checked-in source; it is not published
 # to PyPI.
 FROM ghcr.io/pyo3/maturin:v1.13.3 AS audio-prep-builder
 WORKDIR /io
-# The crate is a Cargo workspace member (#2339): its pins live in the root
+# The crate is a Cargo workspace member: its pins live in the root
 # Cargo.lock, and loading the workspace needs every member's manifest+sources.
 COPY Cargo.toml Cargo.lock ./
 COPY packages/sie_audio_prep/ packages/sie_audio_prep/
@@ -119,7 +119,7 @@ RUN .venv/bin/python -c "import sie_audio_prep, torch; print(torch.__version__)"
 
 # Register bundle-libs on sys.path via a .pth executed by site.py at startup.
 # sys.path.insert(0, ...) puts bundle-libs at position 0 so bundle-specific
-# versions SHADOW the shared venv (the gemma cu130 torch/transformers/sglang
+# versions SHADOW the shared venv (the cu130 torch/transformers/sglang
 # overlay). Content is identical for every bundle, so writing it here keeps the
 # shared venv layer byte-identical.
 RUN echo "import sys; sys.path.insert(0, '/app/bundle-libs')" \
@@ -155,16 +155,16 @@ RUN .venv/bin/python -m sie_server.cli resolve-deps \
     && cat /tmp/bundle-requirements.txt
 
 # cu130 bundle deps go into a separate site-packages tree (``bundle-libs``,
-# prepended to sys.path via the .pth above). The gemma bundle needs torch 2.11
+# prepended to sys.path via the .pth above). The sglang-cu130 bundle needs torch 2.11
 # from the cu130 PyTorch index, where the only ``2.11.0`` is the ``+cu130``
 # local-version wheel; pip's multi-index resolution does not reliably prefer it
 # over PyPI's default-CUDA build, so cuda13 bundles resolve with ``uv`` and
 # ``--index-strategy unsafe-best-match`` against the cu130 PyTorch + sglang
 # indexes (so torch 2.11 + sgl-kernel/flashinfer land for cu130). This uv +
-# cu130-index resolution was validated by a manual Modal GPU session (sglang
-# 0.5.13 / torch 2.11 / cu130 in a fresh venv).
+# cu130-index resolution was validated with sglang 0.5.13, torch 2.11, and a
+# cu130 runtime in a fresh GPU environment.
 #
-# COVERAGE NOTE: the cuda13 image CI smoke (.github/workflows/gemma-image.yml)
+# COVERAGE NOTE: the cuda13 image CI smoke (.github/workflows/sglang-cu130-image.yml)
 # builds this image and asserts on CPU that the bundle-libs cu130 overlay
 # SHADOWS the base venv (import torch -> 2.11+cu130, transformers 5.x). It does
 # NOT exercise GPU init: the cu12 base venv + cu130 bundle-libs both expose the
@@ -268,7 +268,8 @@ COPY --link --from=base --chown=1000:1000 /app/bundles /app/bundles
 # Bundle-specific extras — last layer so shared layers above stay cached.
 COPY --link --from=builder --chown=1000:1000 /app/bundle-libs /app/bundle-libs
 
-RUN mkdir -p /app/evals /app/.cache/huggingface && chown -R sie:sie /app/evals /app/.cache
+RUN mkdir -p /app/evals /app/.cache/huggingface /app/.cache/sie-kernels \
+    && chown -R sie:sie /app/evals /app/.cache
 
 # Declare BUNDLE only here (LABEL + ENV) so layers above are bundle-agnostic.
 ARG BUNDLE
@@ -281,6 +282,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     HF_HOME=/app/.cache/huggingface \
+    SIE_SGLANG_KERNEL_CACHE_ROOT=/app/.cache/sie-kernels \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     SIE_BUNDLE="${BUNDLE}"

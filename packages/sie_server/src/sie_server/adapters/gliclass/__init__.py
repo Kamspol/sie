@@ -146,7 +146,7 @@ class GLiClassAdapter(BaseAdapter):
         # cap inputs at the model's position-embedding limit. Without this the
         # library defaults to 1024, which exceeds the 512-token capacity of the
         # current GLiClass models and causes argmax-on-empty-tensor crashes for
-        # long inputs (see sie-test#88, sie-test#89).
+        # long inputs.
         pipeline_kwargs: dict[str, Any] = {
             "model": model,
             "tokenizer": self._tokenizer,
@@ -303,7 +303,7 @@ class GLiClassAdapter(BaseAdapter):
             # signatures as InputTooLongError (validation) instead of leaking as
             # 500 INFERENCE_ERROR. Match must be specific to avoid swallowing
             # unrelated errors. Catalog of caught signatures:
-            #   - RuntimeError "argmax(): ... numel() == 0"  (sie-test#89 / #848)
+            #   - RuntimeError "argmax(): ... numel() == 0"
             #     torch.argmax on an empty tensor inside the classification head.
             #   - IndexError  "index N is out of bounds for dimension D with size N"
             #     (index == size: off-by-one / exhausted dimension). Covers both the

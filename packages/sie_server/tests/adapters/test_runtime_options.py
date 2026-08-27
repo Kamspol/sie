@@ -956,7 +956,7 @@ class TestExtractRuntimeOptions:
     def test_gliclass_load_bounds_tokenizer_max_length(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """``load()`` clamps ``tokenizer.model_max_length`` to ``max_seq_length``.
 
-        Regression for sie-test#88 / sie-test#89: long inputs crashed inside the
+        Regression for long-input handling: inputs crashed inside the
         gliclass pipeline because the library default ``max_length=1024``
         exceeds the 512-token position-embedding capacity of these models.
         """
@@ -1020,7 +1020,7 @@ class TestExtractRuntimeOptions:
         """The infamous ``argmax(): ... numel() == 0`` crash is surfaced as
         ValueError (validation), not RuntimeError (500 INFERENCE_ERROR).
 
-        Regression for sie-test#88 / sie-test#89.
+        Regression for long-input handling.
         """
         from unittest.mock import MagicMock
 
@@ -1121,7 +1121,7 @@ class TestExtractRuntimeOptions:
         """A 6 KB Lorem-ipsum-style input flows through the adapter without crashing
         when the pipeline is properly bounded by max_seq_length.
 
-        Regression for sie-test#89: 54x repeated ``Lorem ipsum dolor sit amet,
+        Long-input regression: 54x repeated ``Lorem ipsum dolor sit amet,
         consectetur adipiscing elit. `` with a single label ``Electronics``.
         """
         from unittest.mock import MagicMock

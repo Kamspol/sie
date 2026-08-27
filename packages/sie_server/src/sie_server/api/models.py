@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel
 
+from sie_server.core.model_suggestions import suggestion_suffix
 from sie_server.types.responses import ErrorCode
 
 if TYPE_CHECKING:
@@ -234,7 +235,7 @@ async def get_model(model: str, http_request: Request) -> ModelInfo:
             status_code=status.HTTP_404_NOT_FOUND,
             detail={
                 "code": ErrorCode.MODEL_NOT_FOUND.value,
-                "message": f"Model '{model}' not found",
+                "message": f"Model '{model}' not found{suggestion_suffix(model, registry.model_names)}",
             },
         )
 

@@ -16,15 +16,100 @@ from sie_sdk.types import Item
 
 client = SIEClient("http://localhost:8080")
 
-# Encode text
+# Encode text. Results are TypedDicts — access fields by key.
 result = client.encode("BAAI/bge-m3", Item(text="Hello world"))
-print(result.dense)  # [0.1, 0.2, ...]
+print(result["dense"].shape)  # (1024,)
 
-# Score pairs
-scores = client.score("cross-encoder", [
-    (Item(text="query"), Item(text="document"))
-])
+# Score items against a query with a reranker model.
+# Scores come back sorted by relevance (rank 0 = most relevant).
+scores = client.score(
+    "BAAI/bge-reranker-v2-m3",
+    query=Item(text="What is machine learning?"),
+    items=[
+        Item(id="doc-1", text="Machine learning is a subfield of AI."),
+        Item(id="doc-2", text="Python is a programming language."),
+    ],
+)
+for entry in scores["scores"]:
+    print(entry["item_id"], entry["score"])
 ```
+
+## Connecting to a managed SIE platform
+
+The examples above target a local server. For a managed SIE gateway,
+pass the gateway URL as `base_url` and your API key (sent as a Bearer
+token):
+
+```python
+from sie_sdk import SIEClient
+
+client = SIEClient(
+    "https://your-gateway.example.com",
+    api_key="YOUR_API_KEY",
+)
+```
+
+## Object storage and model caches
+
+Install the `storage` extra to use `s3://`, `gs://`, `abfs(s)://`, or native
+Alibaba `oss://` model/cache paths:
+
+```bash
+pip install 'sie-sdk[storage]'
+```
+
+Alibaba OSS always uses region-scoped Signature V4. Set `SIE_OSS_REGION` to
+the bucket's region (for example, `eu-central-1`). Set
+`SIE_OSS_USE_INTERNAL_ENDPOINT=true` only inside the matching Alibaba Cloud
+network; the SDK derives the HTTPS endpoint and does not accept endpoint URLs
+from storage paths.
+
+On ACK, RRSA supplies `ALIBABA_CLOUD_ROLE_ARN`,
+`ALIBABA_CLOUD_OIDC_PROVIDER_ARN`, and `ALIBABA_CLOUD_OIDC_TOKEN_FILE`. The SDK
+requires all three together and refreshes short-lived credentials through the
+Alibaba Credentials client. Local operators can use that client's standard
+credential sources instead. Never place credentials, queries, or fragments in
+an `oss://` URL.
+
+`oss://` is supported for model discovery, cache population, and object copies.
+It is deliberately not a mutable `sie-config` epoch store because OSS
+PutObject cannot provide the required non-empty ETag compare-and-swap contract;
+use local/PVC, S3, GCS, or Azure storage for that store.
+
+## Error handling
+
+Server-reported errors are raised as typed exceptions from
+`sie_sdk.client.errors`; all inherit from `SIEError`, and errors that
+carry a server response expose `.code` and `.status_code`. Invalid
+client-side arguments (for example, a bad `base_url_headers` value)
+raise ordinary Python exceptions such as `ValueError`.
+
+Several `503` codes are transient and retried automatically (see the
+next section for the `RESOURCE_EXHAUSTED` budget):
+
+- `PROVISIONING` — the cluster is scaling capacity from zero. Retry is
+  governed by `wait_for_capacity`: retried under `provision_timeout_s`
+  when `True` (the default); surfaces immediately as
+  `ProvisioningError` when `False`.
+- `MODEL_LOADING` — the worker accepted the request and is cold-loading
+  the target model. Retried until `provision_timeout_s`; raises
+  `ModelLoadingError` if the budget is exhausted.
+- `LORA_LOADING` — the requested LoRA adapter is still loading. Retried
+  a bounded number of times; raises `LoraLoadingError` when the retry
+  budget is exhausted.
+- `RESOURCE_EXHAUSTED` — the server ran out of GPU memory and exhausted
+  its internal recovery. Retried with bounded backoff; raises
+  `ResourceExhaustedError` when retries run out. Pass
+  `max_oom_retries=0` to disable these retries and fail fast.
+
+One generation-specific error is terminal and never retried:
+
+- `empty_model_output` — the generation finished nominally but produced
+  no visible output text (for example, private reasoning consumed the
+  whole token budget). Tokens were genuinely consumed, so the request
+  is not re-run. Surfaces as `ServerError` with
+  `code == "empty_model_output"`; on streaming calls it is raised
+  mid-stream with the gateway request id attached for correlation.
 
 ## Handling resource exhaustion
 

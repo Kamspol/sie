@@ -17,8 +17,7 @@ small and predictable; both are supported by the xgrammar backend.
 
 GPU-VERIFY: the patterns here are correct by construction and unit-tested
 for shape, but have NOT been run end-to-end against xgrammar + Qwen3.5 on
-GPU. One verification pass (see ``deploy/demo-gcp/PRODUCTION_READINESS.md``
-§1) should confirm the backend accepts the pattern and the model
+GPU. One verification pass should confirm the backend accepts the pattern and the model
 terminates cleanly before relying on forced ``tool_choice`` in
 production. The failure mode if a pattern is rejected is a clean
 ``grammar_compile_failed`` terminal chunk, not a crash.

@@ -22,7 +22,7 @@ def build_app() -> Starlette:
     app.router.routes.append(Route("/healthz", _healthz, methods=["GET"]))
     if config.oauth_enabled:
         # The OAuth bridge lets claude.ai connectors authenticate via the connector
-        # secret (#1312); the gate below exempts these bootstrap endpoints.
+        # secret; the gate below exempts these bootstrap endpoints.
         app.router.routes.extend(build_oauth_routes(config))
     app.add_middleware(ConnectorSecretAuthMiddleware, config=config)
     return app

@@ -27,7 +27,7 @@ All packages share a **single version number**, managed by [release-please](http
 | `sie-server`, `sie-gateway` Docker images | ghcr.io | 0.1.6 |
 | `superlinked/sie/google`, `superlinked/sie/aws` Terraform modules | Terraform Registry | 0.1.6 |
 
-`sie-server`, `sie-gateway`, `sie-admin`, and `sie-bench` are internal packages distributed via Docker images or used in development only — they are not published to PyPI.
+`sie-server` and `sie-gateway` are distributed as Docker images rather than PyPI packages.
 
 **Why mono-version:** Simplifies compatibility reasoning. Users deploy matching versions of SDK, server, gateway, and Helm chart. The version skew detection (see below) depends on this guarantee.
 
@@ -118,11 +118,11 @@ Same criteria as the Python SDK, applied to `SIEClient` and its types in `@super
 ### Environment Variables (not breaking)
 
 - Adding a new environment variable with a default that preserves existing behavior
-- Test-harness variables (`SIE_FAKE_MEMORY_BUDGET`, `SIE_FAKE_FAULTS` — the Fake Engine, see `docs/fake-models.md`) are development/CI tooling, not part of the compatibility surface; they may change without deprecation
+- Test-harness variables (`SIE_FAKE_MEMORY_BUDGET`, `SIE_FAKE_FAULTS`) are development tooling, not part of the compatibility surface; they may change without deprecation
 
 ### CLI (breaking)
 
-- Removing or renaming a CLI command or flag (e.g., `sie-server serve`, `sie-gateway`, `sie-admin cache`)
+- Removing or renaming a CLI command or flag (e.g., `sie-server serve` or the `sie-gateway` binary)
 
 ### Terraform Modules (breaking)
 

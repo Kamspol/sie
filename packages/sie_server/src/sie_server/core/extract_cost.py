@@ -32,13 +32,19 @@ adopt it without coordinating on a calibration table.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from sie_server.core.prepared import ExtractPreparedItem
 from sie_server.types.inputs import is_document_input
 
 if TYPE_CHECKING:
     from sie_server.types.inputs import Item
+
+# Upper bound on the number of entity labels a single extract request may carry.
+# GLiNER-family adapters run one forward pass per label, so an unbounded label
+# list is an uncapped compute vector on a public endpoint. Mirrors the score /
+# rerank candidate cap (``MAX_SCORE_ITEMS``) in magnitude and named-400 shape.
+MAX_EXTRACT_LABELS: Final[int] = 1000
 
 
 def extract_item_cost(

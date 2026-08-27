@@ -9,12 +9,12 @@
 # The published image is ghcr.io/superlinked/sie-server-sidecar; the runtime
 # binary inside the image is /sie-server-sidecar.
 #
-# The build runs at the Cargo workspace root (#2339): the root
+# The build runs at the Cargo workspace root: the root
 # Cargo.toml/Cargo.lock plus every member's manifest+sources must be present
 # for cargo to load the workspace, and the binary is selected with
 # `-p sie-server-sidecar`.
 #
-# The only Cargo feature today is `cloud-storage` (S3/GCS payload modes),
+# The only Cargo feature today is `cloud-storage` (S3/GCS/Azure/OSS payload modes),
 # which is the default for `ARG FEATURES` below. CI can override with
 # `--build-arg FEATURES=` if you want a leaner build with no remote
 # payload support.
@@ -131,4 +131,4 @@ ENTRYPOINT ["/sie-server-sidecar"]
 
 LABEL org.opencontainers.image.title="sie-server-sidecar" \
       org.opencontainers.image.description="SIE server sidecar - NATS JetStream consumer + Python IPC forwarder." \
-      org.opencontainers.image.source="https://github.com/superlinked/sie-internal"
+      org.opencontainers.image.source="https://github.com/superlinked/sie"

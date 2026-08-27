@@ -12,6 +12,8 @@ lifecycle of a single SGLang HTTP server child process.
 
 from __future__ import annotations
 
+import hashlib
+import importlib.metadata
 import logging
 import math
 import os
@@ -19,6 +21,7 @@ import random
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -54,13 +57,113 @@ STARTUP_TIMEOUT_ENV_VARS = (
     "SIE_SERVER_STARTUP_TIMEOUT_S",
 )
 LIVENESS_BUDGET_ENV_VAR = "SIE_WORKER_LIVENESS_BUDGET_S"
+KERNEL_CACHE_ROOT_ENV_VAR = "SIE_SGLANG_KERNEL_CACHE_ROOT"
 STARTUP_TIMEOUT_S = DEFAULT_STARTUP_TIMEOUT_S
 HEALTH_CHECK_INTERVAL_S = 2.0
 BASE_PORT = 30000  # Starting port for SGLang servers
 
 ERR_SERVER_STARTUP = "SGLang server failed to start within timeout"
+ERR_SERVER_CRASH = "SGLang server process exited during startup"
 STARTUP_LOG_TAIL_CHARS = 5000
 LOAD_HEADROOM_BYTES = 1024**3
+
+_KERNEL_CACHE_LAYOUT_VERSION = "v1"
+_JIT_ABI_PACKAGES = (
+    "apache-tvm-ffi",
+    "cuda-python",
+    "flashinfer-cubin",
+    "flashinfer-python",
+    "nvidia-cuda-nvrtc-cu12",
+    "nvidia-cuda-nvrtc-cu13",
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cuda-runtime-cu13",
+    "sgl-deep-gemm",
+    "sglang",
+    "sglang-kernel",
+    "torch",
+    "triton",
+    "xgrammar",
+)
+_KERNEL_CACHE_DIRS = {
+    "CUDA_CACHE_PATH": "cuda",
+    "CUTE_DSL_CACHE_DIR": "cutlass",
+    "FLASHINFER_WORKSPACE_BASE": "flashinfer",
+    "SGLANG_CACHE_DIR": "sglang",
+    "SGLANG_DG_CACHE_DIR": "deep-gemm",
+    "TORCHINDUCTOR_CACHE_DIR": "torchinductor",
+    "TRITON_CACHE_DIR": "triton",
+    "XDG_CACHE_HOME": "xdg",
+}
+
+
+def _installed_jit_abi_key() -> str:
+    components = [f"python={sys.version_info.major}.{sys.version_info.minor}"]
+    for package in _JIT_ABI_PACKAGES:
+        try:
+            version = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            version = "missing"
+        components.append(f"{package}={version}")
+    return hashlib.sha256("\n".join(components).encode()).hexdigest()[:20]
+
+
+def _gpu_cache_key(device_index: int) -> str | None:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],  # noqa: S607
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=5,
+        )
+        device_names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        device_name = device_names[device_index]
+    except (FileNotFoundError, IndexError, OSError, subprocess.SubprocessError) as exc:
+        logger.warning(
+            "SGLang kernel cache disabled: could not identify cuda:%d without CUDA init: %s", device_index, exc
+        )
+        return None
+
+    device_digest = hashlib.sha256(device_name.encode()).hexdigest()[:12]
+    return f"gpu-{device_digest}"
+
+
+def _kernel_cache_env(env: dict[str, str], *, device_index: int) -> dict[str, str]:
+    """Return missing upstream cache variables for one persistent cache root.
+
+    Cache namespaces include the installed JIT ABI and exact GPU product name. This
+    prevents a retained local/PVC cache from serving artifacts compiled by a
+    different SGLang/Torch/CUDA closure or GPU class. Explicit upstream cache
+    variables always win, and any cache setup failure falls back to SGLang's
+    ordinary container-local compilation path.
+    """
+    raw_root = env.get(KERNEL_CACHE_ROOT_ENV_VAR, "").strip()
+    if not raw_root:
+        return {}
+
+    root = Path(raw_root).expanduser()
+    if not root.is_absolute():
+        logger.warning("SGLang kernel cache disabled: %s must be an absolute path", KERNEL_CACHE_ROOT_ENV_VAR)
+        return {}
+
+    gpu_key = _gpu_cache_key(device_index)
+    if gpu_key is None:
+        return {}
+
+    namespace = root / _KERNEL_CACHE_LAYOUT_VERSION / _installed_jit_abi_key() / gpu_key / f"device-{device_index}"
+    defaults = {name: str(namespace / suffix) for name, suffix in _KERNEL_CACHE_DIRS.items() if not env.get(name)}
+    if not defaults:
+        return {}
+    try:
+        for path in defaults.values():
+            Path(path).mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=namespace, prefix=".sie-write-probe-"):
+            pass
+    except OSError as exc:
+        logger.warning("SGLang kernel cache disabled: cannot prepare %s: %s", namespace, exc)
+        return {}
+    logger.info("SGLang kernel cache enabled at %s", namespace)
+    return defaults
 
 
 def _resolve_liveness_budget() -> float | None:
@@ -133,9 +236,11 @@ def find_free_port(start_port: int = BASE_PORT) -> int:
     the same port in the same order. The race against *external* processes
     (outside this interpreter) remains inherent — there is no way to
     atomically reserve a TCP port without holding it open — but the common
-    in-process collision is closed. Reserved ports leak intentionally:
-    once handed out a port stays excluded for the process lifetime (the
-    range is 100 ports; a worker hosts a handful of SGLang servers).
+    in-process collision is closed. Callers must return the port via
+    :func:`release_port` once the child no longer owns it (unload or a
+    failed launch); otherwise the 100-port span exhausts under the
+    registry's LRU eviction→reload churn and every subsequent load fails
+    until the process restarts.
     """
     span = 100
     offset = random.randrange(span)  # noqa: S311 — port selection, not crypto
@@ -153,6 +258,20 @@ def find_free_port(start_port: int = BASE_PORT) -> int:
             return port
     msg = f"Could not find free port in range {start_port}-{start_port + span - 1}"
     raise RuntimeError(msg)
+
+
+def release_port(port: int | None) -> None:
+    """Return a port handed out by :func:`find_free_port` to the pool.
+
+    Adapters call this from every teardown seam — ``unload()`` and the
+    failed-load abort paths — once the SGLang child no longer owns the port.
+    Idempotent and tolerant: releasing ``None`` or a never-reserved port is
+    a no-op, so teardown paths can call it unconditionally.
+    """
+    if port is None:
+        return
+    with _RESERVED_PORTS_LOCK:
+        _RESERVED_PORTS.discard(port)
 
 
 def parse_device_index(device: str) -> int:
@@ -203,6 +322,8 @@ def launch_sglang_server(
     env["CUDA_VISIBLE_DEVICES"] = str(device_index)
     if extra_env:
         env.update(extra_env)
+    for name, value in _kernel_cache_env(env, device_index=device_index).items():
+        env.setdefault(name, value)
     logger.info("SGLang subprocess output will be logged to: %s", output_file.name)
     return subprocess.Popen(  # noqa: S603 — intentional subprocess call
         cmd,
@@ -276,12 +397,24 @@ def read_subprocess_output_tail(output_file: tempfile._TemporaryFileWrapper | No
         return f"<failed to read SGLang log: {exc}>"
 
 
-def startup_failure_error(output_file: tempfile._TemporaryFileWrapper | None) -> RuntimeError:
+def startup_failure_error(
+    output_file: tempfile._TemporaryFileWrapper | None,
+    crash_exit_code: int | None = None,
+) -> RuntimeError:
+    """Build the startup-failure error, keeping crash and timeout distinct.
+
+    A child process that died must not be reported as a timeout: the loader
+    reclassifies timeout-shaped messages as ModelLoadTimeoutError stamped with
+    the elapsed time, so a 16.5s engine crash surfaces as "configured=16s"
+    while the real budget was 1800s (run 32945082497) and every triage starts
+    from a fictional number. Callers pass the pre-terminate ``poll()`` result
+    as ``crash_exit_code``; None means the health poll genuinely timed out.
+    """
+    prefix = f"{ERR_SERVER_CRASH} (exit code {crash_exit_code})" if crash_exit_code is not None else ERR_SERVER_STARTUP
     output = read_subprocess_output_tail(output_file).strip()
-    if output:
-        if is_oom_error(RuntimeError(output)):
-            return RuntimeError(f"{ERR_SERVER_STARTUP}: out of memory detected in startup log")
-    return RuntimeError(ERR_SERVER_STARTUP)
+    if output and is_oom_error(RuntimeError(output)):
+        return RuntimeError(f"{prefix}: out of memory detected in startup log")
+    return RuntimeError(prefix)
 
 
 def estimate_load_required_memory_bytes(

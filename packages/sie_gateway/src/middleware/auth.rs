@@ -15,13 +15,13 @@ use crate::config::Config;
 
 /// Probe paths shared by every gateway surface (auth exemption here,
 /// audit classification in `middleware::audit`, OpenAPI security
-/// patching in `openapi`, and the managed cloud gateway's key auth /
-/// route classifier). Kubernetes liveness/readiness probes carry no
+/// patching in `openapi`, and downstream key-auth route classifiers).
+/// Kubernetes liveness/readiness probes carry no
 /// credentials; gating them would take the pod out of rotation during
 /// an auth misconfiguration. `/health` (rich status JSON with worker
 /// URLs, bundle assignments, queue depth, GPU inventory) is
 /// intentionally NOT in this list — see `EXEMPT_OPERATIONAL_PATHS`.
-/// `/livez` (#1025) is a server-side probe, not a gateway route, so it
+/// `/livez` is a server-side probe, not a gateway route, so it
 /// is deliberately absent. Consumers with deliberate extras compose
 /// them explicitly instead of re-declaring this pair.
 pub const PROBE_PATHS: &[&str] = &["/healthz", "/readyz"];
@@ -195,7 +195,7 @@ fn is_admin_endpoint(method: &Method, path: &str) -> bool {
 /// `Bearer <token>` (case-insensitive prefix) or a raw token value.
 ///
 /// Canonical shared implementation: also consumed by `handlers::proxy`
-/// and the managed cloud gateway (`sie_gateway_cloud::key_auth`).
+/// and downstream authentication layers.
 pub fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
     let header = headers
         .get("authorization")?
@@ -442,12 +442,17 @@ mod tests {
             multi_router: false,
             request_timeout: 0.0,
             max_stream_pending: 0,
+            max_lane_in_flight_items: 0,
+            lane_backpressure_enforce: false,
             stream_max_age_s: 0,
+            stream_storage: crate::config::StreamStorage::Memory,
+            stream_num_replicas: 1,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
             configured_physical_lanes: Default::default(),
             static_queue_pools: Vec::new(),
             model_aliases: HashMap::new(),
+            published_model_aliases: Default::default(),
             bundles_dir: String::new(),
             models_dir: String::new(),
             config_service_url: None,

@@ -391,3 +391,26 @@ class TestGroundingDINOIntegration:
             assert "bbox" in obj
             if obj["bbox"]:
                 assert len(obj["bbox"]) == 4
+
+
+def test_extract_image_rejects_undecodable_bytes_with_typed_error() -> None:
+    """Non-image bytes are a typed InvalidMediaError (-> 400), not a PIL OSError 500."""
+    from sie_server.types.inputs import InvalidMediaError
+
+    adapter = GroundingDINOAdapter("IDEA-Research/grounding-dino-tiny")
+
+    with pytest.raises(InvalidMediaError, match="image data is not a decodable image"):
+        adapter._extract_image(Item(images=[ImageInput(data=b"valid base64, not an image", format="jpeg")]))
+
+
+def test_extract_fallback_names_the_offending_item_index() -> None:
+    """The inline-decode fallback loop passes each item's request-local index."""
+    from sie_server.types.inputs import InvalidMediaError
+
+    adapter = GroundingDINOAdapter("IDEA-Research/grounding-dino-tiny")
+    adapter._model = MagicMock()
+    adapter._processor = MagicMock()
+    items = [Item(), Item(), Item(images=[ImageInput(data=b"valid base64, not an image", format="png")])]
+
+    with pytest.raises(InvalidMediaError, match=r"at `\$\.items\[2\]\.images\[0\]\.data`"):
+        adapter.extract(items, labels=["cat"])
